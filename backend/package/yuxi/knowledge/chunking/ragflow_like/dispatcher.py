@@ -4,6 +4,9 @@ from typing import Any
 
 from yuxi.knowledge.chunking.ragflow_like.parsers import book, general, laws, qa, semantic, separator
 from yuxi.knowledge.chunking.ragflow_like.presets import map_to_internal_parser_id, normalize_chunk_preset_id
+from yuxi.knowledge.power_spec.ingestion import parse_power_spec_text
+
+MAX_MILVUS_CONTENT_CHARS = 60000
 
 
 def _build_chunk_records(
@@ -16,32 +19,37 @@ def _build_chunk_records(
         text = (chunk_content or "").strip()
         if not text:
             continue
+        pieces = [
+            text[index : index + MAX_MILVUS_CONTENT_CHARS]
+            for index in range(0, len(text), MAX_MILVUS_CONTENT_CHARS)
+        ]
+        for piece_index, piece in enumerate(pieces):
+            start_char_pos = None
+            end_char_pos = None
+            if source_text:
+                found_at = source_text.find(piece, search_from)
+                if found_at >= 0:
+                    start_char_pos = found_at
+                    end_char_pos = found_at + len(piece)
+                    search_from = end_char_pos
 
-        start_char_pos = None
-        end_char_pos = None
-        if source_text:
-            found_at = source_text.find(text, search_from)
-            if found_at >= 0:
-                start_char_pos = found_at
-                end_char_pos = found_at + len(text)
-                search_from = end_char_pos
-
-        records.append(
-            {
-                "id": f"{file_id}_chunk_{idx}",
-                "content": text,
-                "file_id": file_id,
-                "filename": filename,
-                "chunk_index": idx,
-                "source": filename,
-                "chunk_id": f"{file_id}_chunk_{idx}",
-                "start_char_pos": start_char_pos,
-                "end_char_pos": end_char_pos,
-                "start_token_pos": None,
-                "end_token_pos": None,
-                "extraction_result": None,
-            }
-        )
+            chunk_index = idx if len(pieces) == 1 else idx * 1000 + piece_index
+            records.append(
+                {
+                    "id": f"{file_id}_chunk_{chunk_index}",
+                    "content": piece,
+                    "file_id": file_id,
+                    "filename": filename,
+                    "chunk_index": chunk_index,
+                    "source": filename,
+                    "chunk_id": f"{file_id}_chunk_{chunk_index}",
+                    "start_char_pos": start_char_pos,
+                    "end_char_pos": end_char_pos,
+                    "start_token_pos": None,
+                    "end_token_pos": None,
+                    "extraction_result": None,
+                }
+            )
 
     return records
 
@@ -63,6 +71,9 @@ def _dispatch_markdown_parser(
         return semantic.chunk_markdown(markdown_content, parser_config)
     if parser_id == "separator":
         return separator.chunk_markdown(markdown_content, parser_config)
+    if parser_id == "power_spec":
+        document = parse_power_spec_text(markdown_content, document_id="chunking", source_file=filename)
+        return [f"{clause.clause_no} {clause.clause_title}\n{clause.clause_body}" for clause in document.clauses]
 
     return general.chunk_markdown(markdown_content, parser_config)
 

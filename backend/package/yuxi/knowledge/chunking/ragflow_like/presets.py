@@ -24,6 +24,10 @@ CHUNK_PRESETS: dict[str, dict[str, str]] = {
         "label": "Laws",
         "description": "法规分块：按法条层级组织与合并，适合法律法规、制度规范类文本。",
     },
+    "power_spec": {
+        "label": "电力规范条款",
+        "description": "条款分块：按电力规范章节切分并保留条款边界，适合电力标准、规程和规范 PDF。",
+    },
     "semantic": {
         "label": "Semantic",
         "description": "语义分块：利用嵌入和聚类算法进行语义切分，并自动增强标题上下文。",

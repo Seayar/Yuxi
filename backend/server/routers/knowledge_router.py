@@ -17,6 +17,10 @@ from yuxi.knowledge.graphs.milvus_graph_service import GRAPH_TASK_TYPE, MilvusGr
 from yuxi.knowledge.read_models import KnowledgeBaseDetail
 from yuxi.knowledge.parser.unified import SUPPORTED_FILE_EXTENSIONS, is_supported_file_extension
 from yuxi.knowledge.runtime import knowledge_base
+from yuxi.knowledge.power_spec import PowerSpecRebuildFile, PowerSpecRebuildService
+from yuxi.knowledge.power_spec.ingestion import PostgresPowerSpecExtractionStore
+from yuxi.repositories.power_spec_repository import PowerSpecRepository
+from yuxi.storage.postgres.manager import pg_manager
 from yuxi.knowledge.utils import calculate_content_hash, is_minio_url, parse_minio_url
 from yuxi.knowledge.utils.mindmap_utils import (
     batch_remove_files_from_mindmap,
@@ -1068,6 +1072,8 @@ async def _run_parse_file_ids(
 
         try:
             result = await knowledge_base.parse_file(kb_id, file_id, operator_id=operator_id)
+            if await _is_power_spec_mode(kb_id):
+                result["power_spec"] = await _rebuild_power_spec_file(kb_id, file_id)
             processed_items.append(result)
         except Exception as e:
             logger.error(f"Parse failed for {file_id}: {e}")
@@ -1079,6 +1085,44 @@ async def _run_parse_file_ids(
     await context.set_result(result_payload)
     await context.set_progress(100.0, message)
     return result_payload
+
+
+async def _is_power_spec_mode(kb_id: str) -> bool:
+    database = await knowledge_base.get_database_info(kb_id)
+    params = (database.additional_params or {}) if database else {}
+    return bool(params.get("power_spec_mode") or params.get("chunk_preset_id") == "power_spec")
+
+
+async def _read_power_spec_source(kb_id: str, file_id: str) -> str:
+    """分页读全解析后的 Markdown，避免单次窗口上限截断条款提取。"""
+
+    lines: list[str] = []
+    offset = 0
+    while True:
+        window = await knowledge_base.open_file_content(kb_id, file_id, offset=offset, limit=2000)
+        lines.extend(line.split("\t", 1)[-1] for line in str(window.get("content") or "").splitlines())
+        next_offset = window.get("next_offset")
+        if not window.get("has_more_after") or next_offset is None or int(next_offset) <= offset:
+            break
+        offset = int(next_offset)
+    return "\n".join(lines)
+
+
+async def _rebuild_power_spec_file(kb_id: str, file_id: str) -> dict:
+    """在页面解析任务中自动执行电力规范条款提取和质量门。"""
+
+    async def source(_file):
+        return await _read_power_spec_source(kb_id, file_id)
+
+    async with pg_manager.get_async_session_context() as db:
+        repository = PowerSpecRepository()
+        file_name = await repository.get_file_name(db, kb_id=kb_id, file_id=file_id)
+        file = PowerSpecRebuildFile(kb_id=kb_id, file_id=file_id, source_file=file_name)
+        report = await PowerSpecRebuildService(PostgresPowerSpecExtractionStore(db)).rebuild(
+            [file], source=source, dry_run=False
+        )
+    item = report.items[0]
+    return item.model_dump(mode="json")
 
 
 async def _run_index_file_ids(
