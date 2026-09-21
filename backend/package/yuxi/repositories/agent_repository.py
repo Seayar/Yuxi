@@ -53,6 +53,28 @@ DEEP_RESEARCH_AGENT_NAME = "深度研究"
 DEEP_RESEARCH_AGENT_DESCRIPTION = (
     "面向多来源、需事实核查的深度研究任务：规划拆解、并行调度调研子智能体、核验并综合成带引用的结构化报告。"
 )
+POWER_SPEC_AGENT_SLUG = "power-spec-agent"
+POWER_SPEC_AGENT_NAME = "电力规范检索"
+POWER_SPEC_AGENT_DESCRIPTION = "基于电力规范知识库、知识图谱和条款证据检索现行电力规范。"
+POWER_SPEC_SYSTEM_PROMPT = """你是「电力规范检索」智能体，专注于基于已启用的电力规范知识库回答问题。
+
+工作要求：
+1. 任何电力规范问题，在调用 search_power_spec 并收到结果前，禁止输出解释、结论、规范内容或模型记忆。
+2. 第一次调用 search_power_spec 必须使用 confirmed_intent=false；
+工具会直接展示完整意图计划并中断等待确认，不要另行调用 ask_user_question。
+3. 用户在确认卡片中选择“正确，继续检索”后，工具会在恢复的同一次调用中继续检索；
+不要重新调用 search_power_spec，也不要把确认值当作新的查询参数。
+4. 每个用户问题最多执行一次真实检索；工具返回后立即停止调用任何工具。
+    严禁调用 execute、read_file 或其他工具读取、解析、重组 search_power_spec 的返回。
+5. 规范卡片由系统直接渲染，不要在回复里复述卡片内容。
+不要输出规范名称、标准编号、条款编号、条款标题、条款正文、适用范围、相关度、页码或引用标记。
+6. 工具返回后只用一句话简短说明结果，例如“已检索到 3 条相关条款，详见下方规范卡片。”
+不要复制、改写或摘要条款内容，整理与核验由子智能体完成。
+7. 如果工具返回“未检索到资料”或“电力规范知识库尚未完成条款级重建”，
+只能原样输出工具返回的整句文本，不得补充任何规范知识、推测、建议或替代答案。
+8. 如果工具返回 clarification，只能向用户询问缺失的设备类型、电压等级或查询意图。
+9. 不要把未验证的页码、相关度或废止规范当作事实。
+"""
 DEEP_RESEARCH_SYSTEM_PROMPT = """你是「深度研究」智能体，负责一项深度研究任务的整体把控与子智能体调度。
 
 你的核心定位是编排者，而不是亲自完成所有检索：把繁重、可独立、可并行的调研与核验工作派发给子智能体，自己专注于规划、调度与最终综合。
@@ -103,6 +125,51 @@ FACT_VERIFIER_SYSTEM_PROMPT = """你是「事实核查员」子智能体，专�
 - 关键依据后使用 <cite source="$URL" type="url">$INDEX</cite> 标注来源，$INDEX 从 1 开始递增。
 - 明确标注无法查证或来源相互冲突的论断。
 - 不要编造来源或链接。"""
+
+POWER_SPEC_ORGANIZER_AGENT_SLUG = "power-spec-organizer"
+POWER_SPEC_ORGANIZER_AGENT_NAME = "电力规范内容整理"
+POWER_SPEC_ORGANIZER_AGENT_DESCRIPTION = "把检索到的规范条款整理成面向用户问题的简洁结论，保留可回溯引用。"
+POWER_SPEC_ORGANIZER_SYSTEM_PROMPT = """你是「电力规范内容整理」子智能体。
+调用方会把用户问题和检索到的规范条款原文交给你。
+
+你的职责：只依据给定原文，整理出用户真正需要的内容。
+
+工作方式：
+1. 先判断用户问的是哪个维度（数值、周期、条件、判据等），只保留与该维度有关的原文内容。
+2. 丢弃与问题无关的表格行、相邻章节和重复表述。原文表格很长时，只保留用户问题涉及的项目行与表头。
+3. 可以改写、合并、分条和重新组织语言，使结论简短易读；但不允许改变数值、单位、条件、期限和判据的含义。
+4. 每条结论必须能回溯到具体条款，用 [source:document_id#clause_no] 标注。
+
+输出要求：
+- 先用一句话直接回答用户问题；证据不足时明确说明证据没有覆盖什么，不要给出推测。
+- 然后用分条列表给出支撑结论，每条后面标注引用。
+- 不要输出整段原始条款正文，不要复制大段表格。
+- 不要新增原文没有的数字、单位、页码或结论。
+- 只输出整理后的内容，不要输出解释你如何整理的过程。"""
+
+POWER_SPEC_REVIEWER_AGENT_SLUG = "power-spec-reviewer"
+POWER_SPEC_REVIEWER_AGENT_NAME = "电力规范内容审查"
+POWER_SPEC_REVIEWER_AGENT_DESCRIPTION = "对抗式审查整理后的规范结论是否存在编造、遗漏与事实错误，并给出结构化判定。"
+POWER_SPEC_REVIEWER_SYSTEM_PROMPT = """你是「电力规范内容审查」子智能体，
+负责对抗式审查另一智能体整理的规范结论。调用方会同时给你原始条款原文和待审结论。
+
+你的职责：默认怀疑待审结论，逐条与原文比对，找出编造、遗漏和事实错误。
+
+审查项：
+1. 编造：结论中的数字、单位、条件、期限、判据、条款号是否在原文中出现。原文没有依据的一律判定失败。
+2. 事实错误：结论是否改变了原文含义，例如把上限说成下限、把条件当成结论、把可选说成必须、混淆电压等级或设备类型。
+3. 遗漏：原文中直接回答用户问题的关键信息是否被漏掉或被弱化。
+4. 引用：每条结论的 [source:document_id#clause_no] 是否指向真实存在的原文条款。
+
+输出要求：只输出一个 JSON 对象，不要输出 Markdown 或解释。
+{"verdict":"pass" 或 "fail","issues":[{"kind":"编造|事实错误|遗漏|引用",
+"detail":"具体问题与涉及的文字","citation":"相关条款号"}]}
+
+判定规则：
+- 结论忠实、没有漏掉直接回答问题的关键信息时 verdict 为 pass，此时 issues 为空数组。
+- 只要有编造或事实错误，verdict 必须为 fail。
+- 遗漏只有在关键信息确实存在于原文、且用户问题直接需要它时才判定 fail。
+- 不确定时按 fail 处理，并在 detail 说明不确定的原因。"""
 
 ADMIN_ROLES = {"admin", "superadmin"}
 
@@ -235,6 +302,80 @@ class AgentRepository:
             is_subagent=True,
             created_by=created_by,
         )
+
+    async def ensure_power_spec_agent(self, *, created_by: str | None = None) -> Agent:
+        """确保前端可选择的电力规范主 Agent 存在。"""
+
+        existing = await self.get_by_slug(POWER_SPEC_AGENT_SLUG)
+        if existing:
+            context = dict((existing.config_json or {}).get("context") or {})
+            skills = list(context.get("skills") or [])
+            if "power-spec" not in skills:
+                skills.append("power-spec")
+            preload_skills = list(context.get("preload_skills") or [])
+            if "power-spec" not in preload_skills:
+                preload_skills.append("power-spec")
+            repaired_empty_knowledges = context.get("knowledges") == []
+            if repaired_empty_knowledges:
+                context["knowledges"] = None
+            changed = (
+                context.get("system_prompt") != POWER_SPEC_SYSTEM_PROMPT
+                or context.get("skills") != skills
+                or context.get("preload_skills") != preload_skills
+                or repaired_empty_knowledges
+                or context.get("max_execution_steps") != 300
+            )
+            context["system_prompt"] = POWER_SPEC_SYSTEM_PROMPT
+            context["max_execution_steps"] = 300
+            if changed:
+                existing.config_json = {
+                    **(existing.config_json or {}),
+                    "context": {**context, "skills": skills, "preload_skills": preload_skills},
+                }
+                existing.updated_by = created_by or "system"
+                existing.updated_at = utc_now_naive()
+                await self.db.commit()
+                await self.db.refresh(existing)
+            return existing
+
+        return await self._ensure_builtin_agent(
+            slug=POWER_SPEC_AGENT_SLUG,
+            backend_id=DEFAULT_AGENT_BACKEND_ID,
+            name=POWER_SPEC_AGENT_NAME,
+            description=POWER_SPEC_AGENT_DESCRIPTION,
+            config_context={
+                "system_prompt": POWER_SPEC_SYSTEM_PROMPT,
+                "skills": ["knowledge-base", "power-spec"],
+                "preload_skills": ["power-spec"],
+                "max_execution_steps": 300,
+            },
+            is_subagent=False,
+            created_by=created_by,
+        )
+
+    async def ensure_power_spec_answer_subagents(self, *, created_by: str | None = None) -> list[Agent]:
+        """确保电力规范答案整理与审查两个子智能体存在。"""
+
+        return [
+            await self._ensure_builtin_agent(
+                slug=POWER_SPEC_ORGANIZER_AGENT_SLUG,
+                backend_id=SUB_AGENT_BACKEND_ID,
+                name=POWER_SPEC_ORGANIZER_AGENT_NAME,
+                description=POWER_SPEC_ORGANIZER_AGENT_DESCRIPTION,
+                config_context={"system_prompt": POWER_SPEC_ORGANIZER_SYSTEM_PROMPT},
+                is_subagent=True,
+                created_by=created_by,
+            ),
+            await self._ensure_builtin_agent(
+                slug=POWER_SPEC_REVIEWER_AGENT_SLUG,
+                backend_id=SUB_AGENT_BACKEND_ID,
+                name=POWER_SPEC_REVIEWER_AGENT_NAME,
+                description=POWER_SPEC_REVIEWER_AGENT_DESCRIPTION,
+                config_context={"system_prompt": POWER_SPEC_REVIEWER_SYSTEM_PROMPT},
+                is_subagent=True,
+                created_by=created_by,
+            ),
+        ]
 
     async def _ensure_builtin_agent(
         self,

@@ -64,6 +64,15 @@ if knowledge_capability_enabled():
             ),
         )
     )
+    BUILTIN_SKILLS.append(
+        BuiltinSkillSpec(
+            slug="power-spec",
+            source_dir=_SKILLS_ROOT / "power-spec",
+            description="基于知识图谱和向量 rerank 检索现行电力规范条款。",
+            version="2026.09.10",
+            tool_dependencies=("search_power_spec",),
+        )
+    )
 
 BUILTIN_SKILLS.append(
     BuiltinSkillSpec(

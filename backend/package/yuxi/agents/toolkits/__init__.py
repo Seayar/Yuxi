@@ -23,6 +23,7 @@ if not knowledge_capability_enabled():
 
 else:
     from .kbs import get_common_kb_tools
+    from yuxi.knowledge.power_spec import tool as _power_spec_tool  # noqa: F401
 
 __all__ = [
     "get_extra_metadata",

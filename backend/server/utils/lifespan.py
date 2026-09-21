@@ -113,6 +113,8 @@ async def _startup(app: FastAPI) -> None:
             await repository.ensure_general_purpose_subagent()
             await repository.ensure_web_search_subagent()
             await repository.ensure_deep_research_agents()
+            await repository.ensure_power_spec_agent()
+            await repository.ensure_power_spec_answer_subagents()
 
     await _initialize_startup_component(
         app,
