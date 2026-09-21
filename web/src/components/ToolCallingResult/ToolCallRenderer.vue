@@ -25,6 +25,7 @@ import GetMindmapTool from './tools/GetMindmapTool.vue'
 import QueryKbTool from './tools/QueryKbTool.vue'
 import FindKbDocumentTool from './tools/FindKbDocumentTool.vue'
 import OpenKbDocumentTool from './tools/OpenKbDocumentTool.vue'
+import SearchPowerSpecTool from './tools/SearchPowerSpecTool.vue'
 import CalculatorTool from './tools/CalculatorTool.vue'
 import TodoListTool from './tools/TodoListTool.vue'
 import TaskTool from './tools/TaskTool.vue'
@@ -90,6 +91,7 @@ const TOOL_RENDERERS = {
   run_shell_command: ExecuteTool,
   search_file: SearchFileTool,
   search_file_content: SearchFileContentTool,
+  search_power_spec: SearchPowerSpecTool,
   subagent_await: SubagentLifecycleTool,
   subagent_cancel: SubagentLifecycleTool,
   subagent_events: SubagentLifecycleTool,
