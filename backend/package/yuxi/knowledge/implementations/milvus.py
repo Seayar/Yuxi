@@ -547,6 +547,18 @@ class MilvusKB(KnowledgeBase):
         if not chunks:
             return
 
+        max_content_bytes = max(
+            len(str(chunk.get("content") or "").encode("utf-8")) for chunk in chunks
+        )
+        logger.info(
+            f"Preparing chunk insert for {file_id}: count={len(chunks)} "
+            f"max_content_bytes={max_content_bytes}"
+        )
+        if max_content_bytes > 65535:
+            raise ValueError(
+                f"Chunk content exceeds Milvus byte limit before insert: {max_content_bytes}"
+            )
+
         entities = [
             [chunk["id"] for chunk in chunks],
             [chunk["content"] for chunk in chunks],
@@ -591,6 +603,38 @@ class MilvusKB(KnowledgeBase):
         """对 chunks 进行分批嵌入并存储到 Milvus 和 PostgreSQL"""
         if not chunks:
             return
+
+        bounded_chunks: list[dict] = []
+        for chunk in chunks:
+            content = str(chunk.get("content") or "")
+            if len(content.encode("utf-8")) <= 60000:
+                bounded_chunks.append(chunk)
+                continue
+
+            part_index = 0
+            part_number = 0
+            while part_index < len(content):
+                byte_count = 0
+                end_index = part_index
+                while end_index < len(content):
+                    char_bytes = len(content[end_index].encode("utf-8"))
+                    if byte_count + char_bytes > 60000:
+                        break
+                    byte_count += char_bytes
+                    end_index += 1
+
+                part = dict(chunk)
+                part_content = content[part_index:end_index]
+                part["content"] = part_content
+                part["chunk_index"] = int(chunk.get("chunk_index", 0)) * 1000 + part_number
+                part["chunk_id"] = f"{chunk.get('chunk_id')}_part_{part_number}"
+                part["id"] = f"{chunk.get('id')}_part_{part_number}"
+                bounded_chunks.append(part)
+                part_index = end_index
+                part_number += 1
+        if len(bounded_chunks) != len(chunks):
+            logger.warning("Split oversized chunks before embedding: %d -> %d", len(chunks), len(bounded_chunks))
+        chunks = bounded_chunks
 
         chunk_batch_size = max(int(chunk_batch_size), 1)
         for start in range(0, len(chunks), chunk_batch_size):
