@@ -13,7 +13,8 @@ from yuxi.utils import get_docker_safe_url, hashstr, logger
 EMBEDDING_RATE_LIMIT_MAX_RETRIES = 10
 EMBEDDING_TRANSIENT_MAX_RETRIES = 2
 EMBEDDING_RETRY_MAX_DELAY_SECONDS = 10.0
-EMBEDDING_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+EMBEDDING_RETRYABLE_STATUS_CODES = {424, 429, 500, 502, 503, 504}
+EMBEDDING_MAX_SPLIT_DEPTH = 8
 
 
 def sigmoid(x):
@@ -30,14 +31,14 @@ class BaseEmbeddingModel(ABC):
         base_url=None,
         api_key=None,
         model_id=None,
-        batch_size=40,
+        batch_size=10,
     ):
         base_url = base_url or url
         self.model = model or name or model_id
         self.dimension = dimension
         self.base_url = get_docker_safe_url(base_url)
         self.api_key = os.getenv(api_key, api_key)
-        self.batch_size = int(batch_size or 40)
+        self.batch_size = int(batch_size or 10)
         self.embed_state = {}
 
     @abstractmethod
@@ -86,7 +87,7 @@ class BaseEmbeddingModel(ABC):
         for i in range(0, len(messages), batch_size):
             group_msg = messages[i : i + batch_size]
             logger.info(f"Async encoding [{i}/{len(messages)}] messages (bsz={batch_size})")
-            res = await self.aencode(group_msg)
+            res = await self._aencode_resilient(group_msg)
             data.extend(res)
             if task_id:
                 self.embed_state[task_id]["progress"] = i + len(group_msg)
@@ -95,6 +96,41 @@ class BaseEmbeddingModel(ABC):
             self.embed_state[task_id]["status"] = "completed"
 
         return data
+
+    async def _aencode_resilient(self, messages: list[str], depth: int = 0) -> list[list[float]]:
+        """对 413 payload 自适应拆批；单条超长文本以分片向量均值保持一对一输出。"""
+
+        try:
+            return await self.aencode(messages)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code not in {413, 424} or depth >= EMBEDDING_MAX_SPLIT_DEPTH:
+                raise
+            if len(messages) > 1:
+                midpoint = max(len(messages) // 2, 1)
+                logger.warning(
+                    "Embedding payload too large; splitting batch: count=%d -> %d+%d",
+                    len(messages),
+                    midpoint,
+                    len(messages) - midpoint,
+                )
+                left, right = await asyncio.gather(
+                    self._aencode_resilient(messages[:midpoint], depth + 1),
+                    self._aencode_resilient(messages[midpoint:], depth + 1),
+                )
+                return left + right
+
+            text = messages[0]
+            if len(text) < 2:
+                raise
+            midpoint = max(len(text) // 2, 1)
+            logger.warning("Embedding single text too large; averaging two text-slice vectors: chars=%d", len(text))
+            parts = await self._aencode_resilient([text[:midpoint]], depth + 1)
+            parts.extend(await self._aencode_resilient([text[midpoint:]], depth + 1))
+            vector = np.mean(np.asarray(parts, dtype=np.float32), axis=0)
+            norm = np.linalg.norm(vector)
+            if norm:
+                vector = vector / norm
+            return [vector.tolist()]
 
     async def test_connection(self) -> tuple[bool, str]:
         try:
@@ -119,62 +155,6 @@ class OtherEmbedding(BaseEmbeddingModel):
 
     def build_payload(self, message: list[str] | str) -> dict:
         return {"model": self.model, "input": message}
-
-    def encode(self, message: list[str] | str) -> list[list[float]]:
-        payload = self.build_payload(message)
-        retry_index = 0
-
-        self._log_long_inputs(message)
-
-        while True:
-            try:
-                response = requests.post(self.base_url, json=payload, headers=self.headers, timeout=60)
-                response.raise_for_status()
-                return self._extract_embeddings(response.json())
-            except requests.RequestException as e:
-                retry = self._prepare_retry(
-                    message,
-                    retry_index=retry_index,
-                    response=getattr(e, "response", None),
-                    error=e,
-                )
-                if retry:
-                    retry_index, delay = retry
-                    time.sleep(delay)
-                    continue
-
-                logger.error(f"Embedding request failed: {e}, {payload}")
-                raise ValueError(f"Embedding request failed: {e}")
-
-    async def aencode(self, message: list[str] | str) -> list[list[float]]:
-        payload = self.build_payload(message)
-        self._log_long_inputs(message)
-        async with httpx.AsyncClient() as client:
-            retry_index = 0
-            while True:
-                try:
-                    response = await client.post(self.base_url, json=payload, headers=self.headers, timeout=60)
-                    response.raise_for_status()
-                    return self._extract_embeddings(response.json())
-                except httpx.HTTPStatusError as e:
-                    retry = self._prepare_retry(
-                        message,
-                        retry_index=retry_index,
-                        response=e.response,
-                        error=e,
-                    )
-                    if retry:
-                        retry_index, delay = retry
-                        await asyncio.sleep(delay)
-                        continue
-                    raise
-                except httpx.RequestError as e:
-                    retry = self._prepare_retry(message, retry_index=retry_index, error=e)
-                    if retry:
-                        retry_index, delay = retry
-                        await asyncio.sleep(delay)
-                        continue
-                    raise ValueError(f"Embedding async request failed: {e}, {payload}, {self.base_url=}")
 
     @staticmethod
     def _retry_delay_seconds(retry_index: int, retry_after: str | None = None) -> float:
@@ -231,13 +211,57 @@ class OtherEmbedding(BaseEmbeddingModel):
             raise ValueError(f"Embedding failed: Invalid response format {result}")
         return [item["embedding"] for item in result["data"]]
 
-    @staticmethod
-    def _log_long_inputs(message: list[str] | str, threshold: int = 4000) -> None:
-        """调试辅助：记录超过字符阈值的 embedding 输入位置与长度，不输出内容以免泄露用户数据。"""
-        messages = [message] if isinstance(message, str) else message
-        for idx, text in enumerate(messages):
-            if text and len(text) > threshold:
-                logger.warning(f"超长 embedding 输入 index={idx}, len={len(text)}")
+    def encode(self, message: list[str] | str) -> list[list[float]]:
+        payload = self.build_payload(message)
+        retry_index = 0
+        while True:
+            try:
+                response = requests.post(self.base_url, json=payload, headers=self.headers, timeout=300)
+                response.raise_for_status()
+                return self._extract_embeddings(response.json())
+            except requests.RequestException as e:
+                retry = self._prepare_retry(
+                    message,
+                    retry_index=retry_index,
+                    response=getattr(e, "response", None),
+                    error=e,
+                )
+                if retry:
+                    retry_index, delay = retry
+                    time.sleep(delay)
+                    continue
+
+                logger.error(f"Embedding request failed: {e}, {payload}")
+                raise ValueError(f"Embedding request failed: {e}")
+
+    async def aencode(self, message: list[str] | str) -> list[list[float]]:
+        payload = self.build_payload(message)
+        async with httpx.AsyncClient() as client:
+            retry_index = 0
+            while True:
+                try:
+                    response = await client.post(self.base_url, json=payload, headers=self.headers, timeout=300)
+                    response.raise_for_status()
+                    return self._extract_embeddings(response.json())
+                except httpx.HTTPStatusError as e:
+                    retry = self._prepare_retry(
+                        message,
+                        retry_index=retry_index,
+                        response=e.response,
+                        error=e,
+                    )
+                    if retry:
+                        retry_index, delay = retry
+                        await asyncio.sleep(delay)
+                        continue
+                    raise
+                except httpx.RequestError as e:
+                    retry = self._prepare_retry(message, retry_index=retry_index, error=e)
+                    if retry:
+                        retry_index, delay = retry
+                        await asyncio.sleep(delay)
+                        continue
+                    raise ValueError(f"Embedding async request failed: {e}, {payload}, {self.base_url=}")
 
 
 def get_embedding_model_info_by_id(model_id: str) -> dict:
