@@ -76,6 +76,7 @@ notebooks
 graphrag
 docker/volumes
 docs/vibe
+srs/
 .cursorrules
 
 /models
