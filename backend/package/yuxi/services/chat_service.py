@@ -486,6 +486,29 @@ async def _save_ai_message(
 
     return ai_msg
 
+def _is_power_spec_context(context) -> bool:
+    return "power-spec" in set(getattr(context, "skills", []) or [])
+
+def _resolve_power_spec_output(messages, fallback_content: str) -> str:
+    """发布前优先采用检索 Tool 的固定格式，阻止模型改写卡片结构。"""
+
+    for message in reversed(messages or []):
+        if getattr(message, "type", None) != "tool":
+            continue
+        content = getattr(message, "content", "")
+        if not isinstance(content, str):
+            continue
+        try:
+            payload = json.loads(content)
+        except (TypeError, json.JSONDecodeError):
+            return content if content in {"未检索到资料", "电力规范知识库尚未完成条款级重建"} else fallback_content
+        if isinstance(payload, dict) and isinstance(payload.get("answer_markdown"), str):
+            return payload["answer_markdown"]
+        if isinstance(payload, str):
+            return payload
+    return fallback_content
+
+
 
 async def _save_tool_message(conv_repo: ConversationRepository, msg_dict: dict, *, commit: bool = True) -> None:
     tool_call_id = msg_dict.get("tool_call_id")
@@ -664,6 +687,9 @@ async def save_messages_from_langgraph_state(
                 continue
 
             if msg_type == "ai":
+                if _is_power_spec_context(context):
+                    msg_dict = dict(msg_dict)
+                    msg_dict["content"] = _resolve_power_spec_output(messages, msg_dict.get("content", ""))
                 last_ai_message = await _save_ai_message(
                     conv_repo,
                     thread_id,
