@@ -3,6 +3,10 @@ FROM node:24-alpine AS development
 WORKDIR /app
 ENV TZ=Asia/Shanghai
 
+RUN npm config set registry https://registry.npmmirror.com --global \
+    && npm config set fetch-retry-maxtimeout 600000 --global \
+    && npm cache clean --force
+
 # 安装 pnpm（版本与 package.json 的 packageManager 字段对齐，避免 pnpm@latest 与旧 lockfile 不兼容）
 RUN npm install -g pnpm@11.24.0
 
