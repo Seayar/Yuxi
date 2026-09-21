@@ -1,8 +1,4 @@
-"""
-DeepSeek OCR Parser
-
-Uses DeepSeek-OCR via SiliconFlow API for document parsing and OCR.
-"""
+"""使用本地 vLLM OpenAI Vision 接口的 PDF/图片 OCR 解析器。"""
 
 import base64
 import io
@@ -20,7 +16,7 @@ from yuxi.utils import logger
 
 
 class DeepSeekOCRParser(BaseDocumentProcessor):
-    """DeepSeek OCR Parser using SiliconFlow API"""
+    """保留 deepseek_ocr 引擎 ID，实际调用本地 PaddleOCR-VL。"""
 
     service_name = "deepseek_ocr"
     display_name = "DeepSeek OCR"
@@ -36,38 +32,40 @@ class DeepSeekOCRParser(BaseDocumentProcessor):
         ".webp": "image/webp",
     }
 
-    def __init__(self, api_key: str | None = None, api_url: str | None = None):
-        """使用配置中心传入的 SiliconFlow 凭证和固定服务端点初始化解析器。"""
+    def __init__(self, api_key: str | None = None, api_url: str | None = None, model: str = "PaddleOCR-VL"):
+        """使用本地 vLLM 的 OpenAI-compatible Vision 端点初始化解析器。"""
 
-        self.api_key = api_key or os.getenv("SILICONFLOW_API_KEY")
-        if not self.api_key:
-            raise DocumentParserException(
-                "SILICONFLOW_API_KEY environment variable not set", "deepseek_ocr", "missing_api_key"
-            )
+        self.api_key = api_key or ""
+        self.api_url = api_url
+        if not self.api_url:
+            raise DocumentParserException("api_url is required for local OCR", "deepseek_ocr", "missing_api_url")
+        self.model = model
 
-        self.api_url = api_url or "https://api.siliconflow.cn/v1/chat/completions"
-        self.model = "deepseek-ai/DeepSeek-OCR"
-
-        self.headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}",
-        }
+        self.headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            self.headers["Authorization"] = f"Bearer {self.api_key}"
 
     def check_health(self) -> dict[str, Any]:
-        """Check API availability and key validity"""
+        """检查本地 vLLM 模型是否已加载。"""
         try:
             # We can't easily "ping" without cost, but we can check if the model list is accessible
             models_url = self.api_url.rsplit("/chat/completions", 1)[0] + "/models"
             response = requests.get(models_url, headers=self.headers, timeout=10)
 
             if response.status_code == 200:
+                models = response.json().get("data") or []
+                loaded_models = {str(item.get("id")) for item in models if isinstance(item, dict)}
+                if self.model not in loaded_models:
+                    return {
+                        "status": "unhealthy",
+                        "message": f"OCR 模型未加载: {self.model}",
+                        "details": {"api_url": self.api_url, "models": sorted(loaded_models)},
+                    }
                 return {
                     "status": "healthy",
-                    "message": "DeepSeek OCR (SiliconFlow) is available",
-                    "details": {"api_url": self.api_url},
+                    "message": "本地 PaddleOCR-VL 已加载",
+                    "details": {"api_url": self.api_url, "model": self.model},
                 }
-            elif response.status_code == 401:
-                return {"status": "unhealthy", "message": "Invalid API Key", "details": {"error_code": "401"}}
             else:
                 return {
                     "status": "unhealthy",
@@ -79,7 +77,7 @@ class DeepSeekOCRParser(BaseDocumentProcessor):
 
     def process_file(self, file_path: str, params: dict[str, Any] | None = None) -> str:
         """
-        Process file using DeepSeek OCR via SiliconFlow
+        Process file using local PaddleOCR-VL via vLLM
         """
         if not os.path.exists(file_path):
             raise DocumentParserException(f"File not found: {file_path}", self.get_service_name(), "file_not_found")
@@ -148,7 +146,7 @@ class DeepSeekOCRParser(BaseDocumentProcessor):
         return self._call_api(file_content, mime_type, params)
 
     def _call_api(self, data_bytes: bytes, mime_type: str, params: dict[str, Any]) -> str:
-        """Call SiliconFlow API"""
+        """调用 OpenAI-compatible vLLM Chat Completions 接口。"""
         encoded_string = base64.b64encode(data_bytes).decode("utf-8")
         data_url = f"data:{mime_type};base64,{encoded_string}"
 
@@ -157,7 +155,7 @@ class DeepSeekOCRParser(BaseDocumentProcessor):
                 "role": "user",
                 "content": [
                     {"type": "image_url", "image_url": {"url": data_url}},
-                    {"type": "text", "text": "<image>\n<|grounding|>Convert the document to markdown. "},
+                    {"type": "text", "text": "请将此页面识别为Markdown，保留标题、表格和段落。"},
                 ],
             }
         ]

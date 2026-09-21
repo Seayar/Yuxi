@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 from typing import Any
 
@@ -143,13 +144,19 @@ async def _build_processor_kwargs(db: AsyncSession, engine_id: str) -> dict[str,
         opts = await pp_structure_v3_ocr_host_opts.get(db)
         return {"server_url": opts["server_url"]} if opts["server_url"] else {}
     if engine_id == "deepseek_ocr":
-        provider = await get_model_provider_by_id(db, "siliconflow-cn")
-        api_key = resolve_api_key(provider) if provider and provider.is_enabled else None
-        if not api_key:
-            raise ValueError("siliconflow-cn 模型供应商凭证不可用")
+        provider = await get_model_provider_by_id(db, "local")
+        if not provider or not provider.is_enabled:
+            raise ValueError("未找到已启用的本地模型供应商，无法使用 PaddleOCR-VL")
+        extra = provider.extra_json if isinstance(provider.extra_json, dict) else {}
+        vision_base_url = str(
+            extra.get("ocr_vision_base_url")
+            or os.getenv("PADDLEOCR_VL_BASE_URL")
+            or "http://192.168.138.10:8006/v1"
+        ).rstrip("/")
         return {
-            "api_key": api_key,
-            "api_url": f"{provider.base_url.rstrip('/')}/chat/completions",
+            "api_key": resolve_api_key(provider) or "",
+            "api_url": f"{vision_base_url}/chat/completions",
+            "model": "PaddleOCR-VL",
         }
     if engine_id in {"paddleocr_vl_1_6", "paddleocr_pp_ocrv6"}:
         opts = await paddleocr_api_opts.get(db)

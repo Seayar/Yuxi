@@ -50,17 +50,18 @@ async def test_ocr_options_use_parser_metadata(db_session, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_deepseek_uses_provider_credentials_without_chat_models(db_session):
+async def test_deepseek_uses_local_vision_provider(db_session):
     provider = ModelProvider(
-        provider_id="siliconflow-cn",
-        display_name="SiliconFlow",
+        provider_id="local",
+        display_name="Local vLLM",
         provider_type="openai",
-        base_url="https://provider.example/v1",
+        base_url="http://chat.example/v1",
+        extra_json={"ocr_vision_base_url": "http://ocr.example/v1"},
         is_enabled=True,
-        api_key="provider-secret",
+        api_key=None,
         api_key_env=None,
-        capabilities=["embedding"],
-        enabled_models=[{"id": "BAAI/bge-m3", "type": "embedding"}],
+        capabilities=["chat"],
+        enabled_models=[{"id": "PaddleOCR-VL", "type": "chat"}],
     )
     db_session.add(provider)
     await db_session.flush()
@@ -68,8 +69,9 @@ async def test_deepseek_uses_provider_credentials_without_chat_models(db_session
     resolved = await ocr_service.resolve_ocr_task_params({"ocr_engine": "deepseek_ocr"}, db_session)
 
     assert resolved["_ocr_processor_kwargs"] == {
-        "api_key": "provider-secret",
-        "api_url": "https://provider.example/v1/chat/completions",
+        "api_key": "",
+        "api_url": "http://ocr.example/v1/chat/completions",
+        "model": "PaddleOCR-VL",
     }
 
 

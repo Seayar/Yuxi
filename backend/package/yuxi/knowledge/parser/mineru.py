@@ -23,8 +23,19 @@ class MinerUParser(BaseDocumentProcessor):
     display_name = "MinerU OCR"
     supported_extensions = [".pdf", ".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"]
 
-    def __init__(self, server_url: str | None = None):
+    def __init__(
+        self,
+        server_url: str | None = None,
+        backend: str | None = None,
+        vlm_server_url: str | None = None,
+    ):
         self.server_url = (server_url or os.getenv("MINERU_API_URI") or "http://localhost:30001").rstrip("/")
+        self.backend = (
+            backend or os.getenv("MINERU_API_BACKEND") or "hybrid-auto-engine"
+        ).strip()
+        self.vlm_server_url = (
+            vlm_server_url or os.getenv("MINERU_VLM_SERVER_URL") or ""
+        ).rstrip("/")
         self.parse_endpoint = f"{self.server_url}/file_parse"
 
     def check_health(self) -> dict:
@@ -95,7 +106,7 @@ class MinerUParser(BaseDocumentProcessor):
             file_path: 文件路径
             params: 处理参数
                 - lang_list: 语言列表 (默认: ["ch"])
-                - backend: 后端类型 (默认: "hybrid-auto-engine")
+                - backend: 后端类型 (默认读取 MINERU_API_BACKEND)
                 - parse_method: 解析方法 (默认: "auto")
                 - start_page_id: 起始页码 (默认: 0)
                 - end_page_id: 结束页码 (默认: 99999)
@@ -103,6 +114,7 @@ class MinerUParser(BaseDocumentProcessor):
                 - table_enable: 启用表格解析 (默认: True)
                 - image_analysis: 启用图像/图表解析 (默认: True)
                 - server_url: OpenAI 兼容服务地址 (*-http-client 后端时可选)
+                - vlm_server_url: OpenAI 兼容服务地址（优先于环境变量）
 
         Returns:
             str: 提取的 Markdown 文本
@@ -121,7 +133,7 @@ class MinerUParser(BaseDocumentProcessor):
 
         data = {
             "lang_list": params.get("lang_list", ["ch"]),
-            "backend": params.get("backend", "hybrid-auto-engine"),
+            "backend": params.get("backend") or self.backend,
             "parse_method": params.get("parse_method", "auto"),
             "formula_enable": params.get("formula_enable", True),
             "table_enable": params.get("table_enable", True),
@@ -133,7 +145,11 @@ class MinerUParser(BaseDocumentProcessor):
             "return_images": True,
         }
 
-        server_url = params.get("server_url")
+        server_url = (
+            params.get("vlm_server_url")
+            or params.get("server_url")
+            or self.vlm_server_url
+        )
         if server_url:
             data["server_url"] = server_url
 
