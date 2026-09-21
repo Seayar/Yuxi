@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import json_repair
@@ -49,7 +50,7 @@ class LLMGraphExtractor(GraphExtractor):
         self.validate_options()
         model = select_model(
             model_spec=self.options["model_spec"],
-            timeout=60.0,
+            timeout=float(os.getenv("LLM_TIMEOUT", "300")),
             model_params=self.options.get("model_params") or {},
         )
         prompt = self._build_prompt(text)

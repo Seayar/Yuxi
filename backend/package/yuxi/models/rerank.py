@@ -142,7 +142,6 @@ class OpenAIReranker(BaseReranker):
             "model": self.model,
             "query": query,
             "documents": documents,
-            "max_chunks_per_doc": max_length,
         }
 
     def _extract_results(self, result: dict[str, Any]) -> list[dict[str, Any]]:
