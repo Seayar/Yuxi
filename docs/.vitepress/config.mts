@@ -80,7 +80,8 @@ export default defineConfig({
           { text: 'Agent 运行时上下文', link: '/mechanisms/agent-runtime' },
           { text: '沙盒与文件系统', link: '/mechanisms/sandbox' },
           { text: '上下文压缩', link: '/mechanisms/context-compression' },
-          { text: '知识库', link: '/mechanisms/knowledge-base' }
+          { text: '知识库', link: '/mechanisms/knowledge-base' },
+          { text: '电力规范检索', link: '/mechanisms/power-spec-retrieval' }
         ]
       },
       {

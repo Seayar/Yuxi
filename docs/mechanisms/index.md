@@ -19,5 +19,6 @@
 | [沙盒与文件系统](./sandbox.md) | runtime identity、挂载、路径权限和回收怎样协作？ | [沙盒配置与运维](../agents/sandbox-architecture.md) |
 | [上下文压缩](./context-compression.md) | L1/L2 何时触发，摘要和历史文件由谁保存？ | [中间件](../agents/middleware.md)、[智能体配置](../agents/agents-config.md) |
 | [知识库](./knowledge-base.md) | 文件状态、存储、权限和 Agent 检索怎样连接？ | [知识库教程](../intro/knowledge-base.md)、[文档处理](../advanced/document-processing.md) |
+| [电力规范检索](./power-spec-retrieval.md) | 条款证据怎样从 PDF 变成带引用的规范卡片？ | [文档处理](../advanced/document-processing.md)、[配置和开发智能体](../agents/agents-config.md) |
 
 只有当主题有稳定的 Owner、真实 consumer 和可验证链路时，才新增机制页。未来设计放入 roadmap 或 proposed decision，不画进当前运行图。
