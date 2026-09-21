@@ -130,23 +130,6 @@ validate_security_env() {
     }
 }
 
-ensure_required_api_env() {
-    if grep -Eq '^SILICONFLOW_API_KEY=.+' .env; then
-        return
-    fi
-
-    echo "SILICONFLOW_API_KEY is missing in .env."
-    while true; do
-        read -s -p "Please enter your SILICONFLOW_API_KEY: " SILICONFLOW_API_KEY
-        echo ""
-        if [ -n "$SILICONFLOW_API_KEY" ]; then
-            break
-        fi
-        echo "❌ API Key cannot be empty. Please try again."
-    done
-    set_env_value "SILICONFLOW_API_KEY" "$SILICONFLOW_API_KEY"
-}
-
 ensure_jwt_env() {
     ensure_security_secret "JWT_SECRET_KEY"
     ensure_security_secret "API_KEY_DERIVATION_SECRET" "JWT_SECRET_KEY"
@@ -193,7 +176,6 @@ echo "=================================="
 # Check if .env file exists
 if [ -f ".env" ]; then
     echo "✅ .env file already exists. Checking required settings."
-    ensure_required_api_env
     ensure_jwt_env
     ensure_sandbox_env
     validate_security_env
@@ -201,19 +183,6 @@ if [ -f ".env" ]; then
 else
     echo "📝 .env file not found. Let's set up your environment variables."
     echo ""
-
-    # Get SILICONFLOW_API_KEY
-    echo "🔑 SiliconFlow API Key required"
-    echo "Get your API key from: https://cloud.siliconflow.cn/i/Eo5yTHGJ"
-    while true; do
-        read -s -p "Please enter your SILICONFLOW_API_KEY: " SILICONFLOW_API_KEY
-        echo ""
-        if [ -z "$SILICONFLOW_API_KEY" ]; then
-            echo "❌ API Key cannot be empty. Please try again."
-        else
-            break
-        fi
-    done
 
     # Get Web Search Provider and API Key (optional)
     echo ""
@@ -257,9 +226,6 @@ else
 
     # Create .env file
     cat > .env << EOF
-# SiliconFlow API Key (required)
-SILICONFLOW_API_KEY=${SILICONFLOW_API_KEY}
-
 # Web Search Provider settings
 EOF
 
