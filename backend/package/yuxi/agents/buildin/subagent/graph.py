@@ -3,10 +3,11 @@ from typing import Any
 
 from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
 from langchain.agents import create_agent
-from langchain.agents.middleware import ModelRetryMiddleware, TodoListMiddleware
+from langchain.agents.middleware import TodoListMiddleware
 from langchain.agents.middleware.types import AgentMiddleware
+from langchain_core.messages import ToolMessage
 
-from yuxi.agents import BaseAgent, BaseState, load_chat_model, resolve_chat_model_spec
+from yuxi.agents import BaseAgent, BaseState
 from yuxi.agents.backends import (
     create_agent_composite_backend,
     create_agent_filesystem_middleware,
@@ -15,22 +16,18 @@ from yuxi.agents.backends import (
 from yuxi.agents.buildin.chatbot.prompt import TODO_MID_PROMPT, build_prompt_with_context
 from yuxi.agents.buildin.subagent.context import SubAgentContext
 from yuxi.agents.context import (
-    DEFAULT_SUMMARY_KEEP_MESSAGES,
-    DEFAULT_SUMMARY_L2_TRIGGER_RATIO,
-    DEFAULT_SUMMARY_THRESHOLD_K,
-    DEFAULT_SUMMARY_TOOL_RESULT_TOKEN_LIMIT,
     DEFAULT_TOOL_RESULT_EVICTION_K_TOKENS,
-    DEFAULT_YUXI_SUMMARY_PROMPT,
-    prepare_agent_runtime_context,
 )
 from yuxi.agents.middlewares import (
     ImageInputCompatibilityMiddleware,
+    NetworkRetryMiddleware,
     TokenUsageMiddleware,
-    create_summary_middleware,
+    create_summary_middleware_from_context,
 )
 from yuxi.agents.middlewares.skills import SkillsMiddleware
 from yuxi.agents.tool_approval import SENSITIVE_BACKEND_TOOLS, normalize_tool_approval_mode
 from yuxi.agents.toolkits.service import resolve_configured_runtime_tools
+from yuxi.models.chat import load_chat_model, resolve_chat_model_spec
 
 _SUBAGENT_DISABLED_TOOLS = frozenset({"present_artifacts", "ask_user_question", "install_skill"})
 # 默认审批模式额外隐藏敏感 backend 工具，避免子智能体绕过主线程逐项审批。
@@ -55,12 +52,6 @@ def _disabled_tools_for(mode: str) -> frozenset[str]:
     return _SUBAGENT_DISABLED_TOOLS_DEFAULT_MODE
 
 
-def _load_subagent_model(model_spec: str):
-    """构造子智能体模型实例；子任务不需要长推理，统一关闭思考以降低端到端延迟。"""
-
-    return load_chat_model(fully_specified_name=model_spec, disable_thinking=SUBAGENT_DISABLE_THINKING)
-
-
 def _filter_disabled_tools(tools, disabled_tools: frozenset[str]):
     return [tool for tool in tools if _tool_name(tool) not in disabled_tools]
 
@@ -75,42 +66,45 @@ class _SubAgentToolFilterMiddleware(AgentMiddleware[Any, Any, Any]):
     async def awrap_model_call(self, request, handler):
         return await handler(request.override(tools=_filter_disabled_tools(request.tools or [], self.disabled_tools)))
 
+    # 工具列表隐藏不构成执行边界；显式传入的禁用工具调用也必须拒绝。
+    def wrap_tool_call(self, request, handler):
+        denial = self._denied_tool_message(request)
+        return denial if denial is not None else handler(request)
+
+    async def awrap_tool_call(self, request, handler):
+        denial = self._denied_tool_message(request)
+        return denial if denial is not None else await handler(request)
+
+    def _denied_tool_message(self, request) -> ToolMessage | None:
+        """为禁用调用生成与原 tool call 绑定的拒绝结果。"""
+        name = _tool_name(request.tool_call)
+        if name not in self.disabled_tools:
+            return None
+        return ToolMessage(
+            content=(
+                f"工具 {name} 在当前审批模式下对子智能体不可用；请把结果交回主智能体，由主线程按审批流程执行该操作。"
+            ),
+            tool_call_id=request.tool_call.get("id") or "",
+            name=name,
+            status="error",
+        )
+
 
 async def _build_middlewares(context, backend, tool_approval_mode: str):
     # tool_approval_mode is normalized once by the caller (get_graph / SubAgentBackend.get_graph).
-
-    summary_trigger_tokens = getattr(context, "summary_threshold", DEFAULT_SUMMARY_THRESHOLD_K) * 1024
-    summary_keep_messages = getattr(context, "summary_keep_messages", DEFAULT_SUMMARY_KEEP_MESSAGES)
-    summary_prompt = getattr(context, "summary_prompt", None) or DEFAULT_YUXI_SUMMARY_PROMPT
-    summary_tool_result_token_limit = getattr(
-        context,
-        "summary_tool_result_token_limit",
-        DEFAULT_SUMMARY_TOOL_RESULT_TOKEN_LIMIT,
-    )
-    summary_l2_trigger_ratio = getattr(context, "summary_l2_trigger_ratio", DEFAULT_SUMMARY_L2_TRIGGER_RATIO)
-    model_spec = resolve_chat_model_spec(context.model)
-    summary_middleware = create_summary_middleware(
-        model=_load_subagent_model(model_spec),
-        backend=backend,
-        trigger=("tokens", summary_trigger_tokens),
-        keep=("messages", summary_keep_messages),
-        summary_prompt=summary_prompt,
-        trim_tokens_to_summarize=summary_trigger_tokens,
-        tool_result_offload_token_limit=summary_tool_result_token_limit,
-        l1_l2_trigger_ratio=summary_l2_trigger_ratio,
-    )
 
     return [
         create_agent_filesystem_middleware(
             getattr(context, "tool_token_limit", DEFAULT_TOOL_RESULT_EVICTION_K_TOKENS) * 1024,
             backend=backend,
+            disabled_tools=_disabled_tools_for(tool_approval_mode),
         ),
         SkillsMiddleware(),
-        summary_middleware,
+        create_summary_middleware_from_context(context, backend=backend),
         TodoListMiddleware(system_prompt=TODO_MID_PROMPT),
         PatchToolCallsMiddleware(),
         _SubAgentToolFilterMiddleware(tool_approval_mode),
-        ModelRetryMiddleware(),
+        NetworkRetryMiddleware(),
         ImageInputCompatibilityMiddleware(),
         TokenUsageMiddleware(),
     ]
@@ -118,7 +112,7 @@ async def _build_middlewares(context, backend, tool_approval_mode: str):
 
 class SubAgentBackend(BaseAgent):
     name = "子智能体"
-    description = "用于被主智能体通过 task 工具调用的专用智能体后端。"
+    description = "用于被主智能体通过 subagent_start 工具调用的专用智能体后端。"
     capabilities = ["file_upload", "files"]
     context_schema = SubAgentContext
 
@@ -144,11 +138,10 @@ class SubAgentBackend(BaseAgent):
             ]
         return info
 
-    async def get_graph(self, context=None, **kwargs):
-        context = await prepare_agent_runtime_context(
-            context or self.context_schema(),
-            context_schema=self.context_schema,
-        )
+    async def get_graph(self, *, context, **kwargs):
+        """从显式准备的 Context 构建执行图。"""
+        if not getattr(context, "_runtime_prepared", False):
+            raise ValueError("构图需要已准备的 Context")
         await sync_agent_context_skills(context)
         model_spec = resolve_chat_model_spec(context.model)
         tool_approval_mode = normalize_tool_approval_mode(getattr(context, "tool_approval_mode", "default"))
@@ -156,7 +149,11 @@ class SubAgentBackend(BaseAgent):
         backend = create_agent_composite_backend(context)
 
         return create_agent(
-            model=_load_subagent_model(model_spec),
+            model=load_chat_model(
+                fully_specified_name=model_spec,
+                session_id=context.thread_id,
+                disable_thinking=SUBAGENT_DISABLE_THINKING,
+            ),
             tools=_filter_disabled_tools(await resolve_configured_runtime_tools(context), disabled_tools),
             system_prompt=build_prompt_with_context(context),
             middleware=await _build_middlewares(context, backend, tool_approval_mode),

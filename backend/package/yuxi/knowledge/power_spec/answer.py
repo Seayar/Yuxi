@@ -433,9 +433,6 @@ def build_subagent_caller(context: Any) -> SubagentCaller:
             repository = AgentRepository(db)
             agent_item = await repository.get_by_slug(slug)
             if agent_item is None:
-                await repository.ensure_power_spec_answer_subagents()
-                agent_item = await repository.get_by_slug(slug)
-            if agent_item is None:
                 logger.warning(f"电力规范子智能体 {slug} 不存在，跳过整理")
                 return SubagentReply(output="")
             started = await SubagentRunService(db).start(

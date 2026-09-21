@@ -5,10 +5,11 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
-from langchain.messages import AIMessage, HumanMessage
+from langchain.messages import AIMessage, HumanMessage, ToolMessage
 
 from yuxi.agents import context as agent_context
 from yuxi.workspace import paths as workspace_paths
+from test.unit.agent_context_fixtures import prepared_execution
 from yuxi.services import chat_service as svc
 
 
@@ -26,11 +27,9 @@ async def _resolve_test_workdir(**_kwargs):
     return "projects/11111111-1111-4111-8111-111111111111"
 
 
-def test_build_agent_context_applies_runtime_input_to_declared_fields() -> None:
-    agent = SimpleNamespace(context_schema=agent_context.BaseContext)
-
-    context = svc._build_agent_context(
-        agent,
+def test_context_update_applies_only_declared_runtime_fields() -> None:
+    context = agent_context.BaseContext()
+    context.update(
         {
             "thread_id": "thread-1",
             "uid": "user-1",
@@ -48,7 +47,16 @@ def test_build_agent_context_applies_runtime_input_to_declared_fields() -> None:
 
 
 @pytest.mark.asyncio
-async def test_resolve_agent_runtime_includes_subagents_only_when_requested(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        prepared_execution(backend_id="SubAgentBackend"),
+        prepared_execution(backend_id="SubAgentBackend", system_prompt="manifest"),
+    ],
+)
+async def test_resolve_agent_runtime_includes_subagents_only_when_requested(
+    monkeypatch: pytest.MonkeyPatch, snapshot
+) -> None:
     calls: list[str] = []
 
     class FakeAgentRepository:
@@ -79,11 +87,15 @@ async def test_resolve_agent_runtime_includes_subagents_only_when_requested(monk
     monkeypatch.setattr(svc, "AgentRepository", FakeAgentRepository)
     monkeypatch.setattr(svc, "ConversationRepository", FakeConversationRepository)
     monkeypatch.setattr(svc, "resolve_conversation_workdir_path", _resolve_test_workdir)
-    monkeypatch.setattr(svc, "ensure_bound_user_workdir", lambda _uid, _path: None)
-    monkeypatch.setattr(svc, "normalize_agent_context_config", _fake_normalize_agent_context_config)
+
+    async def normalize(context, **kwargs):
+        """有 manifest 快照时重复解析应使回归失败。"""
+        pytest.fail("manifest 后不应重新解析配置")
+
+    monkeypatch.setattr(agent_context, "normalize_agent_context_config", normalize)
     monkeypatch.setattr(
-        svc.agent_manager,
-        "get_agent",
+        svc,
+        "get_agent_backend",
         lambda backend_id: SimpleNamespace(context_schema=None) if backend_id == "SubAgentBackend" else None,
     )
 
@@ -95,6 +107,7 @@ async def test_resolve_agent_runtime_includes_subagents_only_when_requested(monk
             user=user,
             requested_agent_slug="worker",
             thread_id="child-thread",
+            prepared_execution=snapshot,
         )
 
     agent_item, backend, agent_config, conversation = await svc._resolve_agent_runtime(
@@ -103,13 +116,30 @@ async def test_resolve_agent_runtime_includes_subagents_only_when_requested(monk
         requested_agent_slug="worker",
         thread_id="child-thread",
         agent_kind="subagent",
+        prepared_execution=snapshot,
     )
 
     assert calls == ["main", "subagent"]
     assert agent_item.slug == "worker"
     assert backend.context_schema is None
-    assert agent_config == {}
+    assert agent_config is snapshot.context
     assert conversation.thread_id == "child-thread"
+
+
+class _EmptyModelAuditRepo:
+    def __init__(self, _db):
+        pass
+
+    async def list_for_run(self, _run_id: str):
+        return []
+
+
+class _EmptyToolAuditRepo:
+    def __init__(self, _db):
+        pass
+
+    async def list_for_run(self, _run_id: str):
+        return []
 
 
 class _FakeConvRepo:
@@ -118,6 +148,8 @@ class _FakeConvRepo:
         self.saved_messages: list[dict] = []
         self.tool_calls: list[dict] = []
         self.conversations: dict[str, SimpleNamespace] = {}
+        self.source_ids: set[str] = set()
+        self.published_message_ids: list[int] = []
 
     def _conversation(self, thread_id: str) -> SimpleNamespace:
         return self.conversations.setdefault(
@@ -158,13 +190,25 @@ class _FakeConvRepo:
                 "commit": commit,
             }
         )
-        return SimpleNamespace(id=1)
+        return SimpleNamespace(
+            id=1,
+            conversation_id=1,
+            message_type=message_type,
+            extra_metadata=extra_metadata or {},
+        )
 
     async def get_conversation_by_thread_id(self, thread_id: str):
         return self._conversation(thread_id)
 
     async def get_messages_by_thread_id(self, _thread_id: str):
         return []
+
+    async def get_message_source_ids_by_thread_id(self, _thread_id: str):
+        return set(self.source_ids)
+
+    async def publish_assistant_output(self, message) -> None:
+        message.message_type = "text"
+        self.published_message_ids.append(message.id)
 
     async def add_tool_call(
         self,
@@ -230,20 +274,12 @@ async def test_save_messages_from_langgraph_state_handles_dict_tool_call_blocks(
                 }
             )
 
-    class FakeAgent:
-        async def get_graph(self, *, context):
-            assert context is fake_context
-            return FakeGraph()
-
     conv_repo = _FakeConvRepo(None)
-    fake_context = object()
 
     await svc.save_messages_from_langgraph_state(
-        agent_instance=FakeAgent(),
+        state=await FakeGraph().aget_state({}),
         thread_id="thread-1",
         conv_repo=conv_repo,
-        config_dict={"configurable": {"thread_id": "thread-1", "uid": "user-1"}},
-        context=fake_context,
         trace_info=None,
     )
 
@@ -278,14 +314,8 @@ async def test_save_messages_from_langgraph_state_backfills_run_output_message(m
         async def aget_state(self, _config):
             return SimpleNamespace(values={"messages": [HumanMessage(content="question"), AIMessage(content="answer")]})
 
-    class FakeAgent:
-        async def get_graph(self, *, context):
-            assert context is fake_context
-            return FakeGraph()
-
     fake_db = FakeDB()
     conv_repo = _FakeConvRepo(fake_db)
-    fake_context = object()
     captured: dict[str, object] = {}
 
     class FakeRunRepo:
@@ -310,13 +340,13 @@ async def test_save_messages_from_langgraph_state_backfills_run_output_message(m
             return object()
 
     monkeypatch.setattr(svc, "AgentRunRepository", FakeRunRepo)
+    monkeypatch.setattr(svc, "ModelMessageAuditRepository", _EmptyModelAuditRepo)
+    monkeypatch.setattr(svc, "ToolMessageAuditRepository", _EmptyToolAuditRepo)
 
     await svc.save_messages_from_langgraph_state(
-        agent_instance=FakeAgent(),
+        state=await FakeGraph().aget_state({}),
         thread_id="thread-1",
         conv_repo=conv_repo,
-        config_dict={"configurable": {"thread_id": "thread-1", "uid": "user-1"}},
-        context=fake_context,
         trace_info={"langfuse_trace_id": "trace-1"},
         run_id="run-1",
         request_id="req-1",
@@ -338,6 +368,495 @@ async def test_save_messages_from_langgraph_state_backfills_run_output_message(m
 
 
 @pytest.mark.asyncio
+async def test_state_fallback_does_not_rebind_hidden_message_from_previous_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeDB:
+        async def commit(self):
+            pass
+
+        async def rollback(self):
+            pass
+
+    class FakeGraph:
+        async def aget_state(self, _config):
+            return SimpleNamespace(
+                values={
+                    "messages": [
+                        AIMessage(content="old intermediate", id="old-model-audit"),
+                        AIMessage(content="current answer", id="current-final"),
+                    ]
+                }
+            )
+
+    captured: dict[str, int] = {}
+
+    class FakeRunRepo:
+        def __init__(self, _db):
+            pass
+
+        async def lock_output_persistence(self, *_args, **_kwargs):
+            return object()
+
+        async def set_output_message(self, _run_id, message_id, *, worker_id):
+            captured[worker_id] = message_id
+
+    fake_db = FakeDB()
+    conv_repo = _FakeConvRepo(fake_db)
+    conv_repo.source_ids.add("old-model-audit")
+    monkeypatch.setattr(svc, "AgentRunRepository", FakeRunRepo)
+    monkeypatch.setattr(svc, "ModelMessageAuditRepository", _EmptyModelAuditRepo)
+    monkeypatch.setattr(svc, "ToolMessageAuditRepository", _EmptyToolAuditRepo)
+
+    await svc.save_messages_from_langgraph_state(
+        state=await FakeGraph().aget_state({}),
+        thread_id="thread-1",
+        conv_repo=conv_repo,
+        run_id="run-current",
+        request_id="request-current",
+        worker_id="worker-current",
+    )
+
+    assert [message["content"] for message in conv_repo.saved_messages] == ["current answer"]
+    assert captured == {"worker-current": 1}
+
+
+def test_root_tool_audit_event_rejects_unrouted_subagent_namespace() -> None:
+    assert svc._is_root_tool_audit_event(
+        {"method": "tools", "namespace": [], "data": {}},
+        "root-thread",
+    )
+    assert not svc._is_root_tool_audit_event(
+        {"method": "tools", "namespace": ["child:task"], "data": {}},
+        "root-thread",
+    )
+    assert not svc._is_root_tool_audit_event(
+        {
+            "method": "tools",
+            "namespace": ["child:task"],
+            "thread_id": "child-thread",
+            "data": {},
+        },
+        "root-thread",
+    )
+
+
+def test_tool_state_only_enriches_running_error_awaiting_terminal() -> None:
+    running = SimpleNamespace(execution_status="running", extra_metadata={})
+    awaiting_error = SimpleNamespace(
+        execution_status="running",
+        extra_metadata={"awaiting_run_terminal": True},
+    )
+    completed = SimpleNamespace(execution_status="completed", extra_metadata={})
+
+    assert not svc._should_reconcile_tool_state(running, {"status": "success"})
+    assert not svc._should_reconcile_tool_state(awaiting_error, {"status": "success"})
+    assert svc._should_reconcile_tool_state(awaiting_error, {"status": "error"})
+    assert not svc._should_reconcile_tool_state(completed, {"status": "success"})
+    assert not svc._should_reconcile_tool_state(
+        completed,
+        {"status": "success", "content": "Tool result too large, saved in the filesystem"},
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("interrupt_run", "expected"), [(False, ["current error"]), (True, [])])
+async def test_state_reconcile_uses_latest_error_unless_run_is_interrupted(
+    monkeypatch: pytest.MonkeyPatch,
+    interrupt_run: bool,
+    expected: list[str],
+) -> None:
+    """只用最后一条错误补全审计，中断则保留 pending ToolCall 供恢复。"""
+
+    class FakeDB:
+        async def commit(self):
+            pass
+
+        async def rollback(self):
+            pass
+
+    class FakeGraph:
+        async def aget_state(self, _config):
+            return SimpleNamespace(
+                values={
+                    "messages": [
+                        ToolMessage(content="old error", tool_call_id="shared-call", status="error"),
+                        ToolMessage(content="current error", tool_call_id="shared-call", status="error"),
+                    ]
+                }
+            )
+
+    class FakeRunRepo:
+        def __init__(self, _db):
+            pass
+
+        async def lock_output_persistence(self, *_args, **_kwargs):
+            return SimpleNamespace(conversation_id=1)
+
+        async def set_terminal_status(self, *_args, **_kwargs):
+            return SimpleNamespace(status="interrupted"), True
+
+        async def cancel_active_execution_tree_descendants(self, _run):
+            return []
+
+    class FakeToolAuditRepo:
+        def __init__(self, _db):
+            pass
+
+        async def list_for_run(self, _run_id):
+            return [
+                SimpleNamespace(
+                    operation_id="shared-call",
+                    execution_status="running",
+                    extra_metadata={"awaiting_run_terminal": True},
+                )
+            ]
+
+    reconciled: list[str] = []
+
+    async def reconcile_tool(_conv_repo, **kwargs):
+        reconciled.append(kwargs["msg_dict"]["content"])
+
+    fake_db = FakeDB()
+    monkeypatch.setattr(svc, "AgentRunRepository", FakeRunRepo)
+    monkeypatch.setattr(svc, "ModelMessageAuditRepository", _EmptyModelAuditRepo)
+    monkeypatch.setattr(svc, "ToolMessageAuditRepository", FakeToolAuditRepo)
+    monkeypatch.setattr(svc, "_reconcile_tool_error_from_state", reconcile_tool)
+
+    await svc.save_messages_from_langgraph_state(
+        state=await FakeGraph().aget_state({}),
+        thread_id="thread-1",
+        conv_repo=_FakeConvRepo(fake_db),
+        run_id="run-current",
+        request_id="request-current",
+        worker_id="worker-current",
+        interrupt_run=interrupt_run,
+    )
+
+    assert reconciled == expected
+
+
+@pytest.mark.asyncio
+async def test_model_state_reconcile_uses_latest_message_when_operation_id_is_reused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """跨 Run 复用 Model operation_id 时不得投影同线程历史 ToolCall。"""
+
+    audit = SimpleNamespace(
+        id=11,
+        operation_id="shared-model",
+        content="",
+        extra_metadata={},
+        execution_status="running",
+        message_type="model_audit",
+    )
+
+    class FakeDB:
+        async def commit(self):
+            pass
+
+        async def rollback(self):
+            pass
+
+        async def flush(self):
+            pass
+
+    class FakeGraph:
+        async def aget_state(self, _config):
+            return SimpleNamespace(
+                values={
+                    "messages": [
+                        AIMessage(
+                            content="historical",
+                            id="shared-model",
+                            tool_calls=[{"id": "old-call", "name": "search", "args": {}}],
+                        ),
+                        AIMessage(content="current", id="shared-model"),
+                    ]
+                }
+            )
+
+    class FakeModelAuditRepo:
+        def __init__(self, _db):
+            pass
+
+        async def list_for_run(self, _run_id):
+            return [audit]
+
+        async def get(self, *, run_id, operation_id):
+            assert (run_id, operation_id) == ("run-current", "shared-model")
+            return audit
+
+    class FakeRunRepo:
+        def __init__(self, _db):
+            pass
+
+        async def lock_output_persistence(self, *_args, **_kwargs):
+            return object()
+
+        async def set_output_message(self, *_args, **_kwargs):
+            pass
+
+    conv_repo = _FakeConvRepo(FakeDB())
+    monkeypatch.setattr(svc, "AgentRunRepository", FakeRunRepo)
+    monkeypatch.setattr(svc, "ModelMessageAuditRepository", FakeModelAuditRepo)
+    monkeypatch.setattr(svc, "ToolMessageAuditRepository", _EmptyToolAuditRepo)
+
+    await svc.save_messages_from_langgraph_state(
+        state=await FakeGraph().aget_state({}),
+        thread_id="thread-1",
+        conv_repo=conv_repo,
+        run_id="run-current",
+        request_id="request-current",
+        worker_id="worker-current",
+    )
+
+    assert audit.content == "current"
+    assert audit.extra_metadata["tool_calls"] == []
+    assert conv_repo.tool_calls == []
+
+
+@pytest.mark.asyncio
+async def test_completed_run_rejects_unmatched_final_state_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    audit_message = SimpleNamespace(
+        id=9,
+        operation_id="known-intermediate",
+        content="",
+        extra_metadata={},
+        execution_status="completed",
+        message_type="model_audit",
+        conversation_id=1,
+    )
+
+    class FakeDB:
+        async def commit(self):
+            pass
+
+        async def rollback(self):
+            pass
+
+        async def flush(self):
+            pass
+
+    class FakeGraph:
+        async def aget_state(self, _config):
+            return SimpleNamespace(
+                values={
+                    "messages": [
+                        AIMessage(content="known", id="known-intermediate"),
+                        AIMessage(content="unmatched final", id="missing-final"),
+                    ]
+                }
+            )
+
+    class FakeAuditRepo:
+        def __init__(self, _db):
+            pass
+
+        async def list_for_run(self, _run_id):
+            return [audit_message]
+
+        async def get(self, *, run_id, operation_id):
+            assert run_id == "run-1"
+            return audit_message if operation_id == "known-intermediate" else None
+
+    class FakeRunRepo:
+        def __init__(self, _db):
+            pass
+
+        async def lock_output_persistence(self, *_args, **_kwargs):
+            return object()
+
+    fake_db = FakeDB()
+    monkeypatch.setattr(svc, "AgentRunRepository", FakeRunRepo)
+    monkeypatch.setattr(svc, "ModelMessageAuditRepository", FakeAuditRepo)
+    monkeypatch.setattr(svc, "ToolMessageAuditRepository", _EmptyToolAuditRepo)
+
+    with pytest.raises(ValueError, match="最终 State AIMessage"):
+        await svc.save_messages_from_langgraph_state(
+            state=await FakeGraph().aget_state({}),
+            thread_id="thread-1",
+            conv_repo=_FakeConvRepo(fake_db),
+            run_id="run-1",
+            request_id="request-1",
+            worker_id="worker-1",
+            complete_run=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_interrupted_run_does_not_bind_older_reconciled_model_audit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """State 最后一条 AIMessage 未证明时不得绑定更早审计行。"""
+    older_audit = SimpleNamespace(
+        id=9,
+        operation_id="known-older",
+        content="",
+        extra_metadata={},
+        execution_status="completed",
+        message_type="model_audit",
+        conversation_id=1,
+    )
+
+    class FakeDB:
+        async def commit(self):
+            pass
+
+        async def rollback(self):
+            pass
+
+        async def flush(self):
+            pass
+
+    class FakeGraph:
+        async def aget_state(self, _config):
+            return SimpleNamespace(
+                values={
+                    "messages": [
+                        AIMessage(content="older", id="known-older"),
+                        AIMessage(content="unmatched interrupt", id="missing-current"),
+                    ]
+                }
+            )
+
+    class FakeAuditRepo:
+        def __init__(self, _db):
+            pass
+
+        async def list_for_run(self, _run_id):
+            return [older_audit]
+
+        async def get(self, *, run_id, operation_id):
+            assert run_id == "run-1"
+            return older_audit if operation_id == "known-older" else None
+
+    output_ids: list[int] = []
+
+    class FakeRunRepo:
+        def __init__(self, _db):
+            pass
+
+        async def lock_output_persistence(self, *_args, **_kwargs):
+            return object()
+
+        async def set_output_message(self, _run_id, message_id, *, worker_id):
+            output_ids.append(message_id)
+
+        async def set_terminal_status(self, *_args, **_kwargs):
+            return SimpleNamespace(status="interrupted"), True
+
+        async def cancel_active_execution_tree_descendants(self, _run):
+            return []
+
+    fake_db = FakeDB()
+    conv_repo = _FakeConvRepo(fake_db)
+    monkeypatch.setattr(svc, "AgentRunRepository", FakeRunRepo)
+    monkeypatch.setattr(svc, "ModelMessageAuditRepository", FakeAuditRepo)
+    monkeypatch.setattr(svc, "ToolMessageAuditRepository", _EmptyToolAuditRepo)
+
+    committed = await svc.save_messages_from_langgraph_state(
+        state=await FakeGraph().aget_state({}),
+        thread_id="thread-1",
+        conv_repo=conv_repo,
+        run_id="run-1",
+        request_id="request-1",
+        worker_id="worker-1",
+        interrupt_run=True,
+    )
+
+    assert committed is True
+    assert output_ids == []
+    assert conv_repo.published_message_ids == []
+
+
+@pytest.mark.asyncio
+async def test_tool_call_interrupt_ignores_historical_same_id_tool_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    audit_message = SimpleNamespace(
+        id=12,
+        operation_id="tool-model",
+        content="",
+        extra_metadata={},
+        execution_status="completed",
+        message_type="model_audit",
+        conversation_id=1,
+    )
+
+    class FakeDB:
+        async def commit(self):
+            pass
+
+        async def rollback(self):
+            pass
+
+        async def flush(self):
+            pass
+
+    class FakeGraph:
+        async def aget_state(self, _config):
+            return SimpleNamespace(
+                values={
+                    "messages": [
+                        ToolMessage(content="historical output", tool_call_id="call-1"),
+                        AIMessage(
+                            content="",
+                            id="tool-model",
+                            tool_calls=[{"id": "call-1", "name": "search", "args": {}}],
+                        ),
+                    ]
+                }
+            )
+
+    class FakeAuditRepo:
+        def __init__(self, _db):
+            pass
+
+        async def list_for_run(self, _run_id):
+            return [audit_message]
+
+        async def get(self, *, run_id, operation_id):
+            return audit_message
+
+    output_ids: list[int] = []
+
+    class FakeRunRepo:
+        def __init__(self, _db):
+            pass
+
+        async def lock_output_persistence(self, *_args, **_kwargs):
+            return object()
+
+        async def set_output_message(self, _run_id, message_id, *, worker_id):
+            output_ids.append(message_id)
+
+        async def set_terminal_status(self, *_args, **_kwargs):
+            return SimpleNamespace(status="interrupted"), True
+
+        async def cancel_active_execution_tree_descendants(self, _run):
+            return []
+
+    fake_db = FakeDB()
+    conv_repo = _FakeConvRepo(fake_db)
+    monkeypatch.setattr(svc, "AgentRunRepository", FakeRunRepo)
+    monkeypatch.setattr(svc, "ModelMessageAuditRepository", FakeAuditRepo)
+    monkeypatch.setattr(svc, "ToolMessageAuditRepository", _EmptyToolAuditRepo)
+
+    committed = await svc.save_messages_from_langgraph_state(
+        state=await FakeGraph().aget_state({}),
+        thread_id="thread-1",
+        conv_repo=conv_repo,
+        run_id="run-1",
+        request_id="request-1",
+        worker_id="worker-1",
+        interrupt_run=True,
+    )
+
+    assert committed is True
+    assert output_ids == [audit_message.id]
+    assert audit_message.message_type == "model_audit"
+    assert audit_message.extra_metadata["state_reconciled"] is True
+    assert conv_repo.published_message_ids == []
+
+
+@pytest.mark.asyncio
 async def test_interrupt_persists_message_and_terminal_status_in_one_commit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -353,10 +872,6 @@ async def test_interrupt_persists_message_and_terminal_status_in_one_commit(
     class FakeGraph:
         async def aget_state(self, _config):
             return SimpleNamespace(values={"messages": [AIMessage(content="waiting")]})
-
-    class FakeAgent:
-        async def get_graph(self, *, context):
-            return FakeGraph()
 
     class FakeRunRepo:
         def __init__(self, _db):
@@ -379,13 +894,13 @@ async def test_interrupt_persists_message_and_terminal_status_in_one_commit(
 
     fake_db = FakeDB()
     monkeypatch.setattr(svc, "AgentRunRepository", FakeRunRepo)
+    monkeypatch.setattr(svc, "ModelMessageAuditRepository", _EmptyModelAuditRepo)
+    monkeypatch.setattr(svc, "ToolMessageAuditRepository", _EmptyToolAuditRepo)
 
     terminal_committed = await svc.save_messages_from_langgraph_state(
-        agent_instance=FakeAgent(),
+        state=await FakeGraph().aget_state({}),
         thread_id="thread-1",
         conv_repo=_FakeConvRepo(fake_db),
-        config_dict={},
-        context=object(),
         run_id="run-1",
         request_id="request-1",
         worker_id="worker-1",
@@ -406,7 +921,7 @@ async def test_interrupt_persists_message_and_terminal_status_in_one_commit(
 
 
 @pytest.mark.asyncio
-async def test_build_agent_input_context_excludes_memory_from_shared_context(
+async def test_workspace_prompt_excludes_memory_from_shared_context(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -417,16 +932,19 @@ async def test_build_agent_input_context_excludes_memory_from_shared_context(
     (agents_dir / "USER.md").write_text("用户信息", encoding="utf-8")
     (agents_dir / "MEMORY.md").write_text("长期记忆", encoding="utf-8")
 
-    context = await agent_context.build_agent_input_context({}, thread_id="thread-1", uid="user-1")
+    context = agent_context.BaseContext(thread_id="thread-1", uid="user-1")
+    context.update_config({})
+    await agent_context._append_workspace_agent_prompt(context)
 
-    assert context["system_prompt"] == (
+    assert context.system_prompt == (
+        "You are a helpful assistant.\n\n"
         "用户工作区 agents/AGENTS.md 内容：\n行为约束\n\n用户工作区 agents/USER.md 内容：\n用户信息"
     )
-    assert "长期记忆" not in context["system_prompt"]
+    assert "长期记忆" not in context.system_prompt
 
 
 @pytest.mark.asyncio
-async def test_build_agent_input_context_merges_workspace_agent_context(monkeypatch: pytest.MonkeyPatch):
+async def test_workspace_prompt_merges_workspace_agent_context(monkeypatch: pytest.MonkeyPatch):
     def fake_agent_context(_uid: str) -> str:
         return (
             "用户工作区 agents/AGENTS.md 内容：\n回答前先读取 AGENTS.md\n\n"
@@ -435,20 +953,17 @@ async def test_build_agent_input_context_merges_workspace_agent_context(monkeypa
 
     monkeypatch.setattr(agent_context, "_load_workspace_agent_context", fake_agent_context)
 
-    context = await agent_context.build_agent_input_context(
-        {"system_prompt": "原始系统提示词", "temperature": 0.1},
-        thread_id="thread-1",
-        uid="user-1",
-    )
+    context = agent_context.BaseContext(thread_id="thread-1", uid="user-1")
+    context.update_config({"system_prompt": "原始系统提示词", "temperature": 0.1})
+    await agent_context._append_workspace_agent_prompt(context)
 
-    assert context["system_prompt"] == (
+    assert context.system_prompt == (
         "原始系统提示词\n\n"
         "用户工作区 agents/AGENTS.md 内容：\n回答前先读取 AGENTS.md\n\n"
         "用户工作区 agents/USER.md 内容：\n用户偏好中文"
     )
-    assert context["temperature"] == 0.1
-    assert context["thread_id"] == "thread-1"
-    assert context["uid"] == "user-1"
+    assert context.thread_id == "thread-1"
+    assert context.uid == "user-1"
 
 
 @pytest.mark.asyncio
@@ -458,16 +973,15 @@ async def test_manifest_snapshot_prompt_keeps_workspace_agent_context(monkeypatc
         return "用户工作区 agents/AGENTS.md 内容：\nWORKSPACE-MARKER"
 
     monkeypatch.setattr(agent_context.asyncio, "to_thread", fake_to_thread)
-    config = svc._runtime_agent_config(
-        {"system_prompt": "CURRENT-CONFIG"},
-        {"normalized_context": {"system_prompt": "MANIFEST-CONFIG"}},
-    )
+    config = {"system_prompt": "MANIFEST-CONFIG"}
 
-    context = await agent_context.build_agent_input_context(config, thread_id="thread-1", uid="user-1")
+    context = agent_context.BaseContext(thread_id="thread-1", uid="user-1")
+    context.update_config(config)
+    await agent_context._append_workspace_agent_prompt(context)
 
-    assert context["system_prompt"] == "MANIFEST-CONFIG\n\n用户工作区 agents/AGENTS.md 内容：\nWORKSPACE-MARKER"
-    assert context["thread_id"] == "thread-1"
-    assert context["uid"] == "user-1"
+    assert context.system_prompt == "MANIFEST-CONFIG\n\n用户工作区 agents/AGENTS.md 内容：\nWORKSPACE-MARKER"
+    assert context.thread_id == "thread-1"
+    assert context.uid == "user-1"
 
 
 @pytest.mark.asyncio
@@ -539,14 +1053,6 @@ async def test_get_agent_state_view_returns_interrupted_checkpoint_payload(monke
                 extra_metadata={"model_spec": "provider:conversation-model"},
             )
 
-    class AgentRepo:
-        def __init__(self, _db):
-            pass
-
-        async def get_by_slug(self, slug: str):
-            assert slug == "main"
-            return SimpleNamespace(backend_id="ChatBot", config_json={"context": {}})
-
     class ThreadRepo:
         def __init__(self, _db):
             pass
@@ -557,6 +1063,9 @@ async def test_get_agent_state_view_returns_interrupted_checkpoint_payload(monke
             return None
 
     class RunRepo:
+        async def list_subagent_runs_for_conversation(self, conversation_id, uid):
+            return []
+
         def __init__(self, _db):
             pass
 
@@ -569,55 +1078,21 @@ async def test_get_agent_state_view_returns_interrupted_checkpoint_payload(monke
                 input_payload={"model_spec": "provider:stale-run-model"},
             )
 
-    class Context:
-        def __init__(self, *, thread_id="", uid=""):
-            self.thread_id = thread_id
-            self.uid = uid
-
-        def update(self, data: dict):
-            for key, value in data.items():
-                setattr(self, key, value)
-
-    class Agent:
-        context_schema = Context
-
-        async def get_graph(self, *, context):
-            assert context.thread_id == thread_id
-            return SimpleNamespace(
-                aget_state=lambda _config: None,
-            )
-
-    checkpoint_state = SimpleNamespace(
-        values={},
-        tasks=[
-            SimpleNamespace(
-                interrupts=[
-                    SimpleNamespace(
-                        value={
-                            "action_requests": [{"name": "execute", "args": {"command": "pytest -q"}}],
-                            "review_configs": [{"action_name": "execute", "allowed_decisions": ["approve", "reject"]}],
-                        }
-                    )
-                ]
-            )
-        ],
-    )
-
-    async def read_checkpoint_state(*_args, context, **_kwargs):
-        assert context.runtime_scope_id == thread_id
-        assert context.model == "provider:conversation-model"
-        assert context.workdir_relative_path == "projects/11111111-1111-4111-8111-111111111111"
-        assert context.workdir_path == "/home/gem/user-data/projects/11111111-1111-4111-8111-111111111111"
-        return checkpoint_state
+    async def read_checkpoint_state(*, uid, thread_id):
+        assert uid == "user-1"
+        assert thread_id == "thread-1"
+        return {}, SimpleNamespace(
+            value={
+                "action_requests": [{"name": "execute", "args": {"command": "pytest -q"}}],
+                "review_configs": [{"action_name": "execute", "allowed_decisions": ["approve", "reject"]}],
+            }
+        )
 
     monkeypatch.setattr(svc, "ConversationRepository", ConvRepo)
     monkeypatch.setattr(svc, "resolve_conversation_workdir_path", _resolve_test_workdir)
-    monkeypatch.setattr(svc, "AgentRepository", AgentRepo)
     monkeypatch.setattr(svc, "SubagentThreadRepository", ThreadRepo)
     monkeypatch.setattr(svc, "AgentRunRepository", RunRepo)
-    monkeypatch.setattr(svc, "normalize_agent_context_config", _fake_normalize_agent_context_config)
     monkeypatch.setattr(svc, "_read_checkpoint_state", read_checkpoint_state)
-    monkeypatch.setattr(svc.agent_manager, "get_agent", lambda backend_id: Agent())
 
     result = await svc.get_agent_state_view(
         thread_id=thread_id,
@@ -646,15 +1121,10 @@ async def test_get_agent_state_view_rejects_conversation_without_workdir(monkeyp
                 project_id="missing-project",
             )
 
-    class AgentRepo:
-        def __init__(self, _db):
-            pass
-
-        async def get_by_slug(self, slug: str):
-            assert slug == "main"
-            return SimpleNamespace(backend_id="ChatBot", config_json={"context": {}})
-
     class RunRepo:
+        async def list_subagent_runs_for_conversation(self, conversation_id, uid):
+            return []
+
         def __init__(self, _db):
             pass
 
@@ -662,18 +1132,6 @@ async def test_get_agent_state_view_rejects_conversation_without_workdir(monkeyp
             assert thread_id == "thread-1"
             assert uid == "user-1"
             return None
-
-    class Context:
-        def __init__(self, *, thread_id="", uid=""):
-            self.thread_id = thread_id
-            self.uid = uid
-
-        def update(self, data: dict):
-            for key, value in data.items():
-                setattr(self, key, value)
-
-    class Agent:
-        context_schema = Context
 
     async def unexpected_checkpoint_read(*_args, **_kwargs):
         raise AssertionError("缺少 Workdir 时不得读取 checkpoint")
@@ -683,11 +1141,8 @@ async def test_get_agent_state_view_rejects_conversation_without_workdir(monkeyp
 
     monkeypatch.setattr(svc, "ConversationRepository", ConvRepo)
     monkeypatch.setattr(svc, "resolve_conversation_workdir_path", missing_workdir)
-    monkeypatch.setattr(svc, "AgentRepository", AgentRepo)
     monkeypatch.setattr(svc, "AgentRunRepository", RunRepo)
-    monkeypatch.setattr(svc, "normalize_agent_context_config", _fake_normalize_agent_context_config)
     monkeypatch.setattr(svc, "_read_checkpoint_state", unexpected_checkpoint_read)
-    monkeypatch.setattr(svc.agent_manager, "get_agent", lambda backend_id: Agent())
 
     with pytest.raises(RuntimeError, match="Project 不存在"):
         await svc.get_agent_state_view(
@@ -720,17 +1175,6 @@ async def test_get_agent_state_view_includes_subagent_thread_relation(monkeypatc
             assert conversation_id == 11
             return SimpleNamespace(id=11, thread_id="parent-thread", uid="user-1", status="active")
 
-    class AgentRepo:
-        def __init__(self, _db):
-            pass
-
-        async def get_by_slug(self, slug: str):
-            assert slug == "worker"
-            return SimpleNamespace(
-                backend_id="SubAgentBackend",
-                config_json={"context": {}},
-            )
-
     class ThreadRepo:
         def __init__(self, _db):
             pass
@@ -754,6 +1198,9 @@ async def test_get_agent_state_view_includes_subagent_thread_relation(monkeypatc
             )
 
     class RunRepo:
+        async def list_subagent_runs_for_conversation(self, conversation_id, uid):
+            return []
+
         def __init__(self, _db):
             pass
 
@@ -790,45 +1237,19 @@ async def test_get_agent_state_view_includes_subagent_thread_relation(monkeypatc
                 to_dict=lambda: {"created_at": "2026-06-21T01:00:00Z", "finished_at": None},
             )
 
-    class Graph:
-        async def aget_state(self, config):
-            assert config["configurable"]["thread_id"] == child_thread_id
-            return SimpleNamespace(
-                values={
-                    "messages": [HumanMessage(content="do work"), AIMessage(content="working")],
-                    "artifacts": ["out.txt"],
-                }
-            )
+    async def read_checkpoint_state(*, uid, thread_id):
+        assert thread_id == child_thread_id
+        assert uid == "user-1"
+        return {
+            "messages": [HumanMessage(content="do work"), AIMessage(content="working")],
+            "artifacts": ["out.txt"],
+        }, None
 
-    class Context:
-        def __init__(self, *, thread_id="", uid=""):
-            self.thread_id = thread_id
-            self.uid = uid
-            self.model = ""
-
-        def update(self, data: dict):
-            for key, value in data.items():
-                setattr(self, key, value)
-
-    class Agent:
-        context_schema = Context
-
-        async def get_graph(self, *, context):
-            assert context.thread_id == child_thread_id
-            assert context.uid == "user-1"
-            assert context.model == "provider:run-model"
-            assert context.runtime_scope_id == "parent-thread"
-            assert context.workdir_relative_path == "projects/11111111-1111-4111-8111-111111111111"
-            assert context.workdir_path == "/home/gem/user-data/projects/11111111-1111-4111-8111-111111111111"
-            return Graph()
-
+    monkeypatch.setattr(svc, "_read_checkpoint_state", read_checkpoint_state)
     monkeypatch.setattr(svc, "ConversationRepository", ConvRepo)
     monkeypatch.setattr(svc, "resolve_conversation_workdir_path", _resolve_test_workdir)
-    monkeypatch.setattr(svc, "AgentRepository", AgentRepo)
     monkeypatch.setattr(svc, "SubagentThreadRepository", ThreadRepo)
     monkeypatch.setattr(svc, "AgentRunRepository", RunRepo)
-    monkeypatch.setattr(svc, "normalize_agent_context_config", _fake_normalize_agent_context_config)
-    monkeypatch.setattr(svc.agent_manager, "get_agent", lambda backend_id: Agent())
 
     result = await svc.get_agent_state_view(
         thread_id=child_thread_id,
@@ -868,14 +1289,6 @@ async def test_get_agent_state_view_reports_malformed_subagent_run_as_server_err
             assert conversation_id == 11
             return SimpleNamespace(id=11, thread_id="parent-thread", uid="user-1", status="active")
 
-    class AgentRepo:
-        def __init__(self, _db):
-            pass
-
-        async def get_by_slug(self, slug: str):
-            assert slug == "worker"
-            return SimpleNamespace(backend_id="SubAgentBackend", config_json={"context": {}})
-
     class ThreadRepo:
         def __init__(self, _db):
             pass
@@ -890,6 +1303,9 @@ async def test_get_agent_state_view_reports_malformed_subagent_run_as_server_err
             )
 
     class RunRepo:
+        async def list_subagent_runs_for_conversation(self, conversation_id, uid):
+            return []
+
         def __init__(self, _db):
             pass
 
@@ -909,34 +1325,14 @@ async def test_get_agent_state_view_reports_malformed_subagent_run_as_server_err
                 input_payload={"runtime": {}},
             )
 
-    class Graph:
-        async def aget_state(self, _config):
-            return SimpleNamespace(values={})
+    async def read_checkpoint_state(*, uid, thread_id):
+        return {}, None
 
-    class Context:
-        def __init__(self, *, thread_id="", uid=""):
-            self.thread_id = thread_id
-            self.uid = uid
-
-        def update(self, data: dict):
-            for key, value in data.items():
-                setattr(self, key, value)
-
-    class Agent:
-        context_schema = Context
-
-        async def get_graph(self, *, context):
-            assert context.thread_id == child_thread_id
-            assert context.uid == "user-1"
-            return Graph()
-
+    monkeypatch.setattr(svc, "_read_checkpoint_state", read_checkpoint_state)
     monkeypatch.setattr(svc, "ConversationRepository", ConvRepo)
     monkeypatch.setattr(svc, "resolve_conversation_workdir_path", _resolve_test_workdir)
-    monkeypatch.setattr(svc, "AgentRepository", AgentRepo)
     monkeypatch.setattr(svc, "SubagentThreadRepository", ThreadRepo)
     monkeypatch.setattr(svc, "AgentRunRepository", RunRepo)
-    monkeypatch.setattr(svc, "normalize_agent_context_config", _fake_normalize_agent_context_config)
-    monkeypatch.setattr(svc.agent_manager, "get_agent", lambda _backend_id: Agent())
 
     with pytest.raises(HTTPException) as exc:
         await svc.get_agent_state_view(
@@ -950,15 +1346,74 @@ async def test_get_agent_state_view_reports_malformed_subagent_run_as_server_err
 
 
 @pytest.mark.asyncio
-async def test_build_agent_input_context_keeps_prompt_when_workspace_agent_context_empty(
+async def test_workspace_prompt_keeps_prompt_when_workspace_agent_context_empty(
     monkeypatch: pytest.MonkeyPatch,
 ):
     monkeypatch.setattr(agent_context, "_load_workspace_agent_context", _empty_agent_context)
 
-    context = await agent_context.build_agent_input_context(
-        {"system_prompt": "原始系统提示词"},
-        thread_id="thread-1",
-        uid="user-1",
-    )
+    context = agent_context.BaseContext(thread_id="thread-1", uid="user-1")
+    context.update_config({"system_prompt": "原始系统提示词"})
+    await agent_context._append_workspace_agent_prompt(context)
 
-    assert context["system_prompt"] == "原始系统提示词"
+    assert context.system_prompt == "原始系统提示词"
+
+
+@pytest.mark.parametrize(
+    ("conversation", "requested_agent", "error"),
+    [
+        (None, "worker", "对话线程不存在"),
+        (SimpleNamespace(uid="user-1", agent_id="worker", status="deleted"), "worker", "对话线程不存在"),
+        (SimpleNamespace(uid="other-user", agent_id="worker", status="active"), "worker", "对话线程不存在"),
+        (SimpleNamespace(uid="user-1", agent_id="worker", status="active"), "other-agent", "不能切换"),
+    ],
+)
+async def test_execution_requires_existing_authorized_conversation(monkeypatch, conversation, requested_agent, error):
+    """缺失或越权线程不能在执行层补建，也不能借已有快照绕过绑定校验。"""
+    from unittest.mock import AsyncMock
+
+    repository = SimpleNamespace(get_conversation_by_thread_id=AsyncMock(return_value=conversation))
+    monkeypatch.setattr(svc, "ConversationRepository", lambda _db: repository)
+    with pytest.raises(ValueError, match=error):
+        await svc._resolve_agent_runtime(
+            db=object(),
+            user=SimpleNamespace(uid="user-1"),
+            requested_agent_slug=requested_agent,
+            thread_id="thread-1",
+            prepared_execution=prepared_execution(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("snapshot", "error", "message"),
+    [
+        ({}, AttributeError, "context|backend_id"),
+        (prepared_execution(backend_id="changed"), ValueError, "后端在执行准备后发生变化"),
+    ],
+)
+async def test_execution_does_not_rebuild_missing_snapshot_context(monkeypatch, snapshot, error, message):
+    """错误快照显式失败，不回退到数据库配置。"""
+    from unittest.mock import AsyncMock
+
+    conversation = SimpleNamespace(uid="user-1", agent_id="worker", status="active")
+    agent = SimpleNamespace(slug="worker", backend_id="ChatbotAgent", config_json={"context": {"system_prompt": "new"}})
+    monkeypatch.setattr(
+        svc,
+        "ConversationRepository",
+        lambda _db: SimpleNamespace(get_conversation_by_thread_id=AsyncMock(return_value=conversation)),
+    )
+    monkeypatch.setattr(
+        svc, "AgentRepository", lambda _db: SimpleNamespace(get_visible_by_slug=AsyncMock(return_value=agent))
+    )
+    monkeypatch.setattr(svc, "get_agent_backend", lambda _backend: object())
+    monkeypatch.setattr(svc, "resolve_conversation_workdir_path", _resolve_test_workdir)
+    monkeypatch.setattr(
+        agent_context, "normalize_agent_context_config", AsyncMock(side_effect=AssertionError("不得重新解析配置"))
+    )
+    with pytest.raises(error, match=message):
+        await svc._resolve_agent_runtime(
+            db=object(),
+            user=SimpleNamespace(uid="user-1"),
+            requested_agent_slug="worker",
+            thread_id="thread-1",
+            prepared_execution=snapshot,
+        )

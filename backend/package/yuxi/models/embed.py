@@ -17,10 +17,6 @@ EMBEDDING_RETRYABLE_STATUS_CODES = {424, 429, 500, 502, 503, 504}
 EMBEDDING_MAX_SPLIT_DEPTH = 8
 
 
-def sigmoid(x):
-    return 1 / (1 + np.exp(-x))
-
-
 class BaseEmbeddingModel(ABC):
     def __init__(
         self,
@@ -299,17 +295,3 @@ def select_embedding_model(model_id: str):
         dimension=info.dimension,
         batch_size=info.batch_size,
     )
-
-
-async def test_embedding_model_status_by_spec(spec: str) -> dict:
-    try:
-        model = select_embedding_model(spec)
-        success, message = await model.test_connection()
-        return {
-            "spec": spec,
-            "status": "available" if success else "unavailable",
-            "message": "连接正常" if success else message,
-        }
-    except Exception as e:
-        logger.warning(f"测试 Embedding 模型状态失败 {spec}: {e}")
-        return {"spec": spec, "status": "error", "message": str(e)}

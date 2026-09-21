@@ -541,21 +541,22 @@ def test_parse_skill_markdown_requires_frontmatter():
         svc._parse_skill_markdown("# missing")
 
 
-def test_image_gen_builtin_skill_spec():
-    specs = {spec["slug"]: spec for spec in svc.list_builtin_skill_specs()}
+@pytest.fixture
+def builtin_skill_specs():
+    return {spec["slug"]: spec for spec in svc.list_builtin_skill_specs()}
 
-    assert "image-gen" in specs
-    image_gen = specs["image-gen"]
+
+def test_image_gen_builtin_skill_spec(builtin_skill_specs):
+    assert "image-gen" in builtin_skill_specs
+    image_gen = builtin_skill_specs["image-gen"]
     assert image_gen["name"] == "image-gen"
     assert image_gen["tool_dependencies"] == ["present_artifacts"]
     assert (image_gen["source_dir"] / "SKILL.md").exists()
 
 
-def test_html_preview_builtin_skill_spec():
-    specs = {spec["slug"]: spec for spec in svc.list_builtin_skill_specs()}
-
-    assert "html-preview" in specs
-    html_preview = specs["html-preview"]
+def test_html_preview_builtin_skill_spec(builtin_skill_specs):
+    assert "html-preview" in builtin_skill_specs
+    html_preview = builtin_skill_specs["html-preview"]
     assert html_preview["name"] == "html-preview"
     assert html_preview["tool_dependencies"] == []
     assert html_preview["mcp_dependencies"] == []
@@ -567,17 +568,13 @@ def test_html_preview_builtin_skill_spec():
     assert "普通 `html` 代码块" in content
 
 
-def test_deep_research_builtin_skill_includes_html_preview_dependency():
-    specs = {spec["slug"]: spec for spec in svc.list_builtin_skill_specs()}
-
-    assert specs["deep-research"]["skill_dependencies"] == ["html-preview"]
+def test_deep_research_builtin_skill_has_no_html_preview_dependency(builtin_skill_specs):
+    assert builtin_skill_specs["deep-research"]["skill_dependencies"] == []
 
 
-def test_knowledge_base_builtin_skill_spec():
-    specs = {spec["slug"]: spec for spec in svc.list_builtin_skill_specs()}
-
-    assert "knowledge-base" in specs
-    knowledge_base = specs["knowledge-base"]
+def test_knowledge_base_builtin_skill_spec(builtin_skill_specs):
+    assert "knowledge-base" in builtin_skill_specs
+    knowledge_base = builtin_skill_specs["knowledge-base"]
     assert knowledge_base["name"] == "knowledge-base"
     assert knowledge_base["tool_dependencies"] == [
         "list_kbs",
@@ -591,16 +588,14 @@ def test_knowledge_base_builtin_skill_spec():
     assert (knowledge_base["source_dir"] / "SKILL.md").exists()
 
 
-def test_mysql_reporter_builtin_skill_spec_replaces_reporter_and_deep_reporter():
-    specs = {spec["slug"]: spec for spec in svc.list_builtin_skill_specs()}
-
-    assert "reporter" not in specs
-    assert "deep-reporter" not in specs
-    assert "mysql-reporter" in specs
-    mysql_reporter = specs["mysql-reporter"]
+def test_mysql_reporter_builtin_skill_spec_replaces_reporter_and_deep_reporter(builtin_skill_specs):
+    assert "reporter" not in builtin_skill_specs
+    assert "deep-reporter" not in builtin_skill_specs
+    assert "mysql-reporter" in builtin_skill_specs
+    mysql_reporter = builtin_skill_specs["mysql-reporter"]
     assert mysql_reporter["name"] == "mysql reporter"
     assert mysql_reporter["tool_dependencies"] == []
-    assert mysql_reporter["mcp_dependencies"] == ["mcp-server-chart"]
+    assert mysql_reporter["mcp_dependencies"] == []
     assert (mysql_reporter["source_dir"] / "SKILL.md").exists()
     for script_name in ("list_tables.py", "describe_table.py", "query.py"):
         script_path = mysql_reporter["source_dir"] / "scripts" / script_name
@@ -673,6 +668,52 @@ def test_sync_user_accessible_skills(
             assert (entry / "SKILL.md").read_text(encoding="utf-8") == content
 
 
+def test_unchanged_skill_projection_does_not_create_staging(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """重复刷新直接保留既有文件，不再复制内容相同的 staging。"""
+    source = tmp_path / "sources/demo"
+    source.mkdir(parents=True)
+    (source / "SKILL.md").write_text("# unchanged\n", encoding="utf-8")
+    projection = svc.sync_user_accessible_skills("user-1", {"demo": source})
+    projected_file = projection / "demo/SKILL.md"
+    original_inode = projected_file.stat().st_ino
+
+    def refuse_staging(*args, **kwargs):
+        raise AssertionError("未变化的投影不应创建 staging")
+
+    monkeypatch.setattr(svc, "copy_skill_tree_no_symlinks", refuse_staging)
+    svc.sync_user_accessible_skills("user-1", {"demo": source})
+
+    assert projected_file.read_text(encoding="utf-8") == "# unchanged\n"
+    assert projected_file.stat().st_ino == original_inode
+    assert sorted(path.name for path in projection.iterdir()) == ["demo"]
+
+
+@pytest.mark.parametrize("linked_side", ["source", "projection"])
+def test_projection_comparison_does_not_accept_equal_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, linked_side: str
+):
+    """字节相同的链接不能通过未变化判定；非法来源撤下旧投影。"""
+    source = tmp_path / "sources/demo"
+    source.mkdir(parents=True)
+    (source / "SKILL.md").write_text("# identical\n", encoding="utf-8")
+    projection = svc.sync_user_accessible_skills("user-1", {"demo": source})
+    outside = tmp_path / "outside.md"
+    outside.write_text("# identical\n", encoding="utf-8")
+    linked_file = (source if linked_side == "source" else projection / "demo") / "SKILL.md"
+    linked_file.unlink()
+    linked_file.symlink_to(outside)
+
+    if linked_side == "source":
+        with pytest.raises(PermissionError, match="symlink"):
+            svc.sync_user_accessible_skills("user-1", {"demo": source})
+        assert not (projection / "demo").exists()
+    else:
+        svc.sync_user_accessible_skills("user-1", {"demo": source})
+        assert not linked_file.is_symlink()
+        assert linked_file.read_text(encoding="utf-8") == "# identical\n"
+    assert outside.read_text(encoding="utf-8") == "# identical\n"
+
+
 @pytest.mark.asyncio
 async def test_sync_user_accessible_skills_async_runs_in_thread(monkeypatch: pytest.MonkeyPatch):
     """异步同步入口必须把目录扫描和复制下沉到工作线程。"""
@@ -697,6 +738,45 @@ async def test_sync_user_accessible_skills_async_runs_in_thread(monkeypatch: pyt
             ("user-1", {"alpha": "/tmp/alpha"}),
         )
     ]
+
+
+@pytest.mark.parametrize("component", ["root", "ancestor"])
+def test_projection_comparison_rejects_symlinked_source_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, component: str
+):
+    """投影快路径逐层校验来源根和祖先，不读取链接后的目录。"""
+    source = tmp_path / "sources/demo"
+    source.mkdir(parents=True)
+    (source / "SKILL.md").write_text("# same\n", encoding="utf-8")
+    projection = svc.sync_user_accessible_skills("user-1", {"demo": source})
+    linked = tmp_path / "linked"
+    linked.symlink_to(source if component == "root" else source.parent, target_is_directory=True)
+    with pytest.raises(OSError):
+        svc.sync_user_accessible_skills("user-1", {"demo": linked if component == "root" else linked / "demo"})
+    assert not (projection / "demo").exists()
+
+
+def test_projection_comparison_rejects_file_replaced_after_stat(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """文件在检查后变成链接时，真正打开的 fd 仍拒绝它。"""
+    source = tmp_path / "sources/demo"
+    source.mkdir(parents=True)
+    source_file = source / "SKILL.md"
+    source_file.write_text("# same\n", encoding="utf-8")
+    projection = svc.sync_user_accessible_skills("user-1", {"demo": source})
+    outside = tmp_path / "outside.md"
+    outside.write_text("# same\n", encoding="utf-8")
+    original_open = svc.open_regular_file_fd
+
+    def swap_before_open(*args, **kwargs):
+        source_file.unlink()
+        source_file.symlink_to(outside)
+        return original_open(*args, **kwargs)
+
+    monkeypatch.setattr(svc, "open_regular_file_fd", swap_before_open)
+    with pytest.raises(PermissionError, match="symlink"):
+        svc.sync_user_accessible_skills("user-1", {"demo": source})
+    assert not (projection / "demo").exists()
+    assert outside.read_text(encoding="utf-8") == "# same\n"
 
 
 @pytest.mark.asyncio
@@ -1524,24 +1604,21 @@ def test_owner_only_skill_can_depend_on_visible_skill():
     assert svc.can_skill_depend_on(parent, dependency) is True
 
 
-def test_list_builtin_skill_specs_rejects_missing_required_directory(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-):
-    missing_dir = tmp_path / "buildin" / "deep-research"
-    monkeypatch.setattr(
-        svc,
-        "get_builtin_skill_specs",
-        lambda: [
-            SimpleNamespace(
-                slug="deep-research",
-                source_dir=missing_dir,
-                description="required builtin skill",
-            )
-        ],
-    )
+def test_list_builtin_skill_specs_rejects_missing_skill_file(tmp_path, monkeypatch):
+    """发现的目录必须包含 Skill 定义，不能静默漏装。"""
+    (tmp_path / "incomplete").mkdir()
+    monkeypatch.setattr(svc, "BUILTIN_SKILLS_DIR", tmp_path)
+    with pytest.raises(ValueError, match="内置 skill 缺少 SKILL.md"):
+        svc.list_builtin_skill_specs()
 
-    with pytest.raises(ValueError, match="内置 skill 目录不存在"):
+
+def test_list_builtin_skill_specs_rejects_mismatched_slug(tmp_path, monkeypatch):
+    """目录名与声明标识不一致时拒绝加载。"""
+    source = tmp_path / "expected"
+    source.mkdir()
+    (source / "SKILL.md").write_text("---\nname: other\ndescription: test\n---\n")
+    monkeypatch.setattr(svc, "BUILTIN_SKILLS_DIR", tmp_path)
+    with pytest.raises(ValueError, match="frontmatter.slug 必须等于 slug"):
         svc.list_builtin_skill_specs()
 
 
@@ -1551,26 +1628,15 @@ async def test_init_builtin_skills_create_missing(tmp_path: Path, monkeypatch: p
     source_dir = tmp_path / "builtin-skills" / "reporter"
     source_dir.mkdir(parents=True, exist_ok=True)
     (source_dir / "SKILL.md").write_text(
-        "---\nname: reporter\ndescription: SQL report\n---\n# SQL Reporter\n",
+        "---\nname: reporter\ndescription: SQL report from markdown\n"
+        "tool_dependencies: [mysql_query]\nmcp_dependencies: [charts]\n"
+        "skill_dependencies: [common-report]\n---\n# SQL Reporter\n",
         encoding="utf-8",
     )
     (source_dir / "prompts").mkdir(parents=True, exist_ok=True)
     (source_dir / "prompts" / "system.md").write_text("prompt", encoding="utf-8")
 
-    monkeypatch.setattr(
-        svc,
-        "get_builtin_skill_specs",
-        lambda: [
-            SimpleNamespace(
-                slug="reporter",
-                source_dir=source_dir,
-                description="SQL report from python",
-                tool_dependencies=("mysql_query",),
-                mcp_dependencies=("charts",),
-                skill_dependencies=("common-report",),
-            )
-        ],
-    )
+    monkeypatch.setattr(svc, "BUILTIN_SKILLS_DIR", source_dir.parent)
 
     class FakeRepo:
         created_payload: dict | None = None
@@ -1613,7 +1679,8 @@ async def test_init_builtin_skills_updates_existing_record_and_preserves_disable
     source_dir = tmp_path / "builtin-skills" / "reporter"
     source_dir.mkdir(parents=True, exist_ok=True)
     (source_dir / "SKILL.md").write_text(
-        "---\nname: reporter\ndescription: new markdown description\n---\n# SQL Reporter\n",
+        "---\nname: reporter\ndescription: new description\nversion: 1.0.1\n"
+        "tool_dependencies: [mysql_query]\nmcp_dependencies: [charts]\n---\n# SQL Reporter\n",
         encoding="utf-8",
     )
     (source_dir / "prompt.md").write_text("new builtin content", encoding="utf-8")
@@ -1622,21 +1689,7 @@ async def test_init_builtin_skills_updates_existing_record_and_preserves_disable
     target_dir.mkdir(parents=True, exist_ok=True)
     (target_dir / "prompt.md").write_text("old content", encoding="utf-8")
 
-    monkeypatch.setattr(
-        svc,
-        "get_builtin_skill_specs",
-        lambda: [
-            SimpleNamespace(
-                slug="reporter",
-                source_dir=source_dir,
-                description="new description",
-                version="1.0.1",
-                tool_dependencies=("mysql_query",),
-                mcp_dependencies=("charts",),
-                skill_dependencies=(),
-            )
-        ],
-    )
+    monkeypatch.setattr(svc, "BUILTIN_SKILLS_DIR", source_dir.parent)
 
     existing_item = Skill(
         slug="reporter",
@@ -2137,3 +2190,25 @@ async def test_confirm_personal_skill_draft_uses_original_slug_without_database(
     assert results[0]["requested_slug"] == "demo-v2"
     assert (personal_root / "demo" / "SKILL.md").exists()
     assert not draft_dir.exists()
+
+
+def test_resolved_shared_skill_captures_original_version_and_hash(monkeypatch, tmp_path):
+    """数据库行后续改变不能改写首次适配得到的 Skill 元数据。"""
+    row = Skill(
+        id=1,
+        slug="versioned",
+        name="Versioned",
+        description="skill",
+        source_type="local",
+        enabled=True,
+        created_by="user",
+        share_config={"version": 2, "read_scope": None, "manage_scope": None},
+        version="v1",
+        content_hash="hash-v1",
+    )
+    monkeypatch.setattr(svc, "_resolve_skill_dir", lambda item: tmp_path)
+    resolved = svc._resolved_shared_skill(row)
+    row.version, row.content_hash = "v2", "hash-v2"
+    assert resolved.version == "v1"
+    assert resolved.content_hash == "hash-v1"
+    assert resolved.source_scope == "shared"

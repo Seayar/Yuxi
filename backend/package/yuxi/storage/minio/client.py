@@ -25,10 +25,6 @@ class StorageError(Exception):
     pass
 
 
-class StorageUploadError(StorageError):
-    """存储相关异常基类"""
-
-
 class UploadResult:
     """简化的上传结果"""
 
@@ -304,7 +300,7 @@ class MinIOClient:
                     deleted_count += 1
             except S3Error as e:
                 if e.code == "NoSuchBucket":
-                    logger.warning(f"bucket 不存在，跳过删除: {bucket_name}/{prefix}")
+                    logger.warning(f"待清理的存储桶 '{bucket_name}' 不存在")
                     return
                 raise StorageError(f"删除对象前缀失败: {bucket_name}/{prefix}: {e}") from e
 

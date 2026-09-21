@@ -134,18 +134,17 @@ def test_slot_isolation_guard_rejects_fixed_host_resources() -> None:
     } <= _slot_isolation_violations(compose)
 
 
-def test_production_compose_keeps_existing_deployment_image_identity() -> None:
-    """开发槽位参数化不得改变生产 Compose 的镜像身份。"""
+def test_production_compose_scopes_images_by_project_with_legacy_default() -> None:
+    """生产镜像按项目隔离，未配置项目名时仍使用 yuxi 前缀。"""
     compose = _load_compose("docker-compose.prod.yml")
 
-    assert compose["services"]["api"]["image"].startswith("yuxi-api:${YUXI_VERSION:-")
-    assert compose["services"]["web"]["image"].startswith("yuxi-web:${YUXI_VERSION:-")
-    assert "COMPOSE_PROJECT_NAME" not in compose["services"]["api"]["image"]
+    assert compose["services"]["api"]["image"].startswith("${COMPOSE_PROJECT_NAME:-yuxi}-api:${YUXI_VERSION:-")
+    assert compose["services"]["web"]["image"].startswith("${COMPOSE_PROJECT_NAME:-yuxi}-web:${YUXI_VERSION:-")
 
 
 def test_host_test_runner_probes_current_compose_slot() -> None:
-    """测试运行器必须通过 Compose service 探测当前槽位。"""
+    """测试运行器必须通过 Compose service 探测当前槽位的 readiness。"""
     source = (_project_root() / "backend/test/run_tests.sh").read_text()
 
-    assert "docker compose exec -T api curl -fsS http://localhost:5050/api/system/health" in source
-    assert "if curl -s http://localhost:5050/api/system/health" not in source
+    assert "docker compose exec -T api curl -fsS http://localhost:5050/api/system/ready" in source
+    assert "docker compose exec -T api curl -fsS http://localhost:5050/api/system/health" not in source

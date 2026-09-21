@@ -11,7 +11,6 @@ from sqlalchemy import text
 
 from yuxi.config import get_legacy_storage_dir
 from yuxi.config.options import ensure_options_in_db
-from yuxi.config.runtime import lite_mode_enabled
 from yuxi.repositories.agent_run_repository import AgentRunRepository
 from yuxi.storage.postgres.manager import (
     BUSINESS_SCHEMA_VERSION,
@@ -126,10 +125,15 @@ async def main() -> None:
                 "business",
                 business_version,
                 BUSINESS_SCHEMA_VERSION,
+                upgrade_from=(2,),
+            )
+            knowledge_version = versions.get("knowledge")
+            _require_supported_version(
+                "knowledge",
+                knowledge_version,
+                KNOWLEDGE_SCHEMA_VERSION,
                 upgrade_from=(1,),
             )
-            if not lite_mode_enabled():
-                _require_supported_version("knowledge", versions.get("knowledge"), KNOWLEDGE_SCHEMA_VERSION)
 
             if business_version is None:
                 await pg_manager.create_business_tables()
@@ -141,15 +145,18 @@ async def main() -> None:
                     await rewrite_v071_workdir_paths(session)
                     await verify_workdir_bindings(session)
                     await session.commit()
-            if business_version is None or business_version < BUSINESS_SCHEMA_VERSION:
+            if business_version in {None, 2}:
                 await pg_manager.ensure_business_schema()
                 if business_version is None:
                     await pg_manager.setup_langgraph_checkpointer()
                 await pg_manager.record_schema_version("business", BUSINESS_SCHEMA_VERSION)
 
-            if not lite_mode_enabled() and versions.get("knowledge") is None:
+            if knowledge_version is None:
                 await pg_manager.create_knowledge_tables()
                 await pg_manager.ensure_knowledge_schema()
+                await pg_manager.record_schema_version("knowledge", KNOWLEDGE_SCHEMA_VERSION)
+            elif knowledge_version == 1:
+                await pg_manager.upgrade_knowledge_schema_v1_to_v2()
                 await pg_manager.record_schema_version("knowledge", KNOWLEDGE_SCHEMA_VERSION)
 
             await _converge_database_state(fail_nonterminal_runs=requires_quiescence)

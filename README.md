@@ -1,6 +1,9 @@
 ![Yuxi：可私有部署的多租户知识智能体平台](https://xerrors.oss-cn-shanghai.aliyuncs.com/posts/2026/08/20260818-151118-mac-1787037059154-8c08f48c.png)
 
-Yuxi 是一个可私有部署的多租户知识智能体平台。它把知识库检索、知识图谱、LangGraph 多智能体编排、MCP/Skills、沙盒工具和权限管理放进同一个工作区。
+**Yuxi = Cloud Agents + Knowledge RAG**，Yuxi 是一个可私有部署的多租户知识智能体平台。自定义智能体，权限可控，沉淀企业轨迹。它把知识库检索、知识图谱、LangGraph 多智能体编排、MCP/Skills、沙盒工具和权限管理放进同一个工作区。让每个用户都拥有一个云端 Codex。
+
+[项目主页](https://xerrors.github.io/Yuxi/) · [快速开始](https://xerrors.github.io/Yuxi/intro/quick-start) · [演示视频](https://www.bilibili.com/video/BV1erE26iEgv/) · [版本记录](https://github.com/xerrors/Yuxi/releases) · [English](README.en.md)
+
 
 [![Docker](https://img.shields.io/badge/Docker-2496ED?style=flat&logo=docker&logoColor=ffffff)](https://github.com/xerrors/Yuxi/blob/main/docker-compose.yml)
 [![Release](https://img.shields.io/github/v/release/xerrors/Yuxi?color=046A82)](https://github.com/xerrors/Yuxi/releases/latest)
@@ -10,39 +13,36 @@ Yuxi 是一个可私有部署的多租户知识智能体平台。它把知识库
 
 <a href="https://trendshift.io/repositories/24335" target="_blank"><img src="https://trendshift.io/api/badge/repositories/24335" alt="xerrors%2FYuxi | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
 
-[项目主页](https://xerrors.github.io/Yuxi/) · [快速开始](https://xerrors.github.io/Yuxi/intro/quick-start) · [演示视频](https://www.bilibili.com/video/BV1erE26iEgv/) · [版本记录](https://github.com/xerrors/Yuxi/releases) · [English](README.en.md)
-
 ## Yuxi 能做什么
 
-Yuxi 面向需要自己掌握数据、模型和权限的团队：
+Yuxi 是面向需要企业自部署的多用户 Agent 产品，且需要自己掌握数据、模型和权限的团队：
 
-- **构建知识问答**：上传文档，经过解析、分块和向量索引后，让智能体返回带来源的答案。
+- **Harness**：功能完善的云端多用户 Harness，自定义智能体，沉淀企业轨迹。
+- **Knowledge**： 高效、精准的 Agentic RAG 套件，上传文档，解析、分块和向量索引。
 - **执行多步骤任务**：组合工具、MCP、Skills、子智能体和沙盒，产出可预览、可下载的文件。
 - **连接知识图谱**：从 Milvus 知识库的文档块中抽取实体和关系，写入 Neo4j 并参与检索。
 - **管理团队使用范围**：按用户、部门和共享范围管理知识库、智能体、Skills 和模型。
 - **对比运行质量**：评估知识库的检索结果，也可以用 Langfuse Dataset 评估完整智能体任务。
 
-## 技术栈
 
+## 赞助商
 
-| 层       | 技术                                            |
-| ---------- | ------------------------------------------------- |
-| 前端     | Vue 3 · Vite · Ant Design· G6                |
-| 后端     | FastAPI · LangGraph · ARQ worker              |
-| 存储     | PostgreSQL · Redis · MinIO · Milvus · Neo4j |
-| 文档处理 | MinerU · PaddleX · RapidOCR                   |
-| 部署     | Docker Compose                                  |
+| 赞助商 | 介绍 |
+| :---: | :--- |
+| <img src="https://xerrors.oss-cn-shanghai.aliyuncs.com/github/%E4%B8%8B%E8%BD%BD.jpeg" alt="Fluxion AI LOGO" width="180" /> | Fluxion AI面向个人开发者、技术团队与企业，通过统一API接入并管理全球主流AI模型；通过多线路动态调度提升可用性，模型表现、响应时间与费用透明可查。根据不同模型与线路，API调用成本较官方或基准价格可降低40%—98%。专属链接[注册](https://fluxionai.space/register?source=github&campaign=yuxi&promo=YUXI) 获 $7 API 额度 |
 
 ## 快速启动
 
+语析（Yuxi）完全基于 Docker 启动，服务和中间件主要包括：LangGraph、Vue、FastAPI、Milvus、Neo4j、PostgreSQL、MinerU、PaddleOCR。
+
 ### 前置条件
 
-安装 [Docker Engine](https://docs.docker.com/get-docker/) 和 Docker Compose，并准备一个可用的大模型 API。当前仓库默认配置对应 `v0.7.2`，仍处于 Beta 阶段。
+安装 [Docker Engine](https://docs.docker.com/get-docker/) 和 Docker Compose，并准备一个可用的大模型 API。当前仓库默认配置对应 `v0.7.3`。
 
 ### 1. 获取代码并初始化
 
 ```bash
-git clone --branch v0.7.2 --depth 1 https://github.com/xerrors/Yuxi.git
+git clone --branch v0.7.3 --depth 1 https://github.com/xerrors/Yuxi.git
 cd Yuxi
 
 # Linux/macOS
@@ -69,13 +69,7 @@ curl --fail http://localhost:5050/api/system/ready
 
 返回的 `status` 为 `ready` 后，打开 [http://localhost:5173](http://localhost:5173)，按页面提示初始化超级管理员并登录。API 文档位于 [http://localhost:5050/docs](http://localhost:5050/docs)。
 
-不需要知识库、知识图谱和评估时，可以使用轻量模式：
-
-```bash
-make up-lite
-```
-
-从 v0.7.1 升级到当前版本时，不能直接执行 `docker compose up`。请先阅读[生产部署与升级](docs/advanced/deployment.md)，在停机窗口完成备份和迁移。
+从 v0.7.1 或 v0.7.2 升级到当前版本时，不能直接执行 `docker compose up`。请先阅读[生产部署与升级](docs/advanced/deployment.md)，在停机窗口完成备份和迁移。
 
 ## 文档导航
 
@@ -94,8 +88,8 @@ Yuxi 把知识进入系统、Agent 执行任务和团队治理放在一条完整
 
 | 模块               | 解决的问题                           | 代表能力                                             |
 | -------------------- | -------------------------------------- | ------------------------------------------------------ |
-| 统一智能体工作台   | 在一个界面完成提问、执行与交付       | 多轮对话、知识引用、任务状态、人工审批               |
-| 知识库与可追溯 RAG | 让回答有可核查的知识依据             | 多格式入库、Embedding/Rerank、检索测试、RAG 评估     |
+| 统一智能体工作台   | 在一个界面完成提问、执行与交付       | 多轮对话、知识库检索、任务状态、人工审批               |
+| 知识库与 RAG | 为回答提供检索内容             | 多格式入库、Embedding/Rerank、检索测试、RAG 评估     |
 | 知识图谱与知识导图 | 发现实体关系并浏览知识库文件结构     | 图谱构建、子图浏览、节点详情、文件元数据导图         |
 | 多智能体与扩展生态 | 把复杂任务拆给不同角色和工具         | SubAgents、Skills、MCP、Tools、Agent 配置            |
 | 沙盒工作区与产物   | 把对话结果变成可继续使用的文件       | 隔离文件系统、文件生成、在线预览、下载               |
@@ -103,11 +97,11 @@ Yuxi 把知识进入系统、Agent 执行任务和团队治理放在一条完整
 
 ### 01 · 统一智能体工作台
 
-用户可以在同一个对话界面里引用知识库文档、个人文件或扩展 Skill；实时观察任务执行的每一步，并在对话中直接拿到带精准来源引用或完整交付文件的回答。
+用户可以在同一个对话界面里引用知识库文档、个人文件或扩展 Skill；查看任务执行状态，并在对话中获取回答或生成的文件。
 
 - 支持使用 `@` 快速引入知识库、文件与特定 Skill。
-- 全程可视化展示任务拆解步骤、工具调用状态与上下文 Token 消耗。
-- 支持在回答中随时点击来源溯源核对，或直接预览和下载生成的文件产物。
+- 展示任务拆解步骤、工具调用状态与上下文 Token 消耗。
+- 支持预览和下载生成的文件产物。
 
 ![Yuxi 统一智能体工作台](https://xerrors.oss-cn-shanghai.aliyuncs.com/github/image-20260825145022410.png)
 
@@ -128,9 +122,9 @@ Yuxi 把知识进入系统、Agent 执行任务和团队治理放在一条完整
 
 </details>
 
-### 02 · 知识库与可追溯 RAG
+### 02 · 知识库与 RAG
 
-支持将团队各类资料集中管理并解析为结构化知识库。Agent 检索时不仅能召回相关内容，更能精确定位到具体的原文件和切片段落，彻底告别“凭空捏造”。
+支持将团队各类资料集中管理并解析为结构化知识库。Agent 可以检索相关文档片段，作为回答问题的上下文。
 
 - 集中管理文件与目录结构，实时查看解析进度、Chunk 切片与 Token 统计。
 - 支持配置 Embedding 与 Rerank 算法，并在后台直接进行多路召回测试与调优。
@@ -143,13 +137,13 @@ Yuxi 把知识进入系统、Agent 执行任务和团队治理放在一条完整
 
 **文档解析与切片管理**
 
-支持 PDF、Word、PPT、Excel、Markdown 等多种常见文档格式。内置 MinerU、PaddleX、RapidOCR 等深度解析引擎，精准提取图文、表格并自动切分为高质量 Chunk，生成向量索引供检索使用。
+支持 PDF、Word、PPT、Excel、Markdown 等多种常见文档格式。内置 MinerU、PaddleX、RapidOCR 等解析引擎，提取文本、图片和表格内容并切分为 Chunk，生成向量索引供检索使用。
 
 ![文档入库与解析状态](https://xerrors.oss-cn-shanghai.aliyuncs.com/github/image-20260825155256725.png)
 
 **知识库类型与外部数据源**
 
-除了开箱即用的本地向量知识库，系统还支持直接连接 Dify、Notion 等外部知识库服务，由统一检索器桥接供 Agent 无缝调用，免去二次数据迁移。
+除了开箱即用的本地向量知识库，系统还支持直接连接 Dify、Notion 等外部知识库服务，通过统一检索器供 Agent 调用。
 
 ![知识库类型](https://xerrors.oss-cn-shanghai.aliyuncs.com/github/image-20260825155356171.png)
 
@@ -177,11 +171,11 @@ Yuxi 把知识进入系统、Agent 执行任务和团队治理放在一条完整
 
 ### 03 · 知识图谱与知识导图
 
-将非结构化文档深层提炼为“实体-关系”图谱网络。既支持在交互式拓扑图谱中探索实体关联，也支持根据文件层级和主题元数据自动生成清晰的知识导图。
+从非结构化文档中抽取实体与关系，构建知识图谱。既支持在交互式拓扑图谱中探索实体关联，也支持根据文件层级和主题元数据自动生成清晰的知识导图。
 
 - 从知识库中自动抽取实体与关系，在 Milvus/Neo4j 中构建知识图谱索引。
 - 支持按关键词搜索实体、点击节点查看属性详情，并高亮探索关联子图。
-- 结合知识库文件元数据自动生成多层级知识导图，快速纵览业务领域全景。
+- 结合知识库文件元数据自动生成多层级知识导图，浏览知识库结构。
 
 ![image-20260830145027082](https://xerrors.oss-cn-shanghai.aliyuncs.com/github/image-20260830145027082.png)
 
@@ -204,7 +198,7 @@ Yuxi 把知识进入系统、Agent 执行任务和团队治理放在一条完整
 
 ### 04 · 多智能体与扩展生态
 
-一个 Agent 可以灵活组合模型、提示词、知识库、外部工具与专用子智能体。面对复杂任务，主智能体负责规划拆解，多个 SubAgents 分头异步并行执行，Skills 与 MCP 协议提供源源不断的能力扩展。
+一个 Agent 可以灵活组合模型、提示词、知识库、外部工具与专用子智能体。面对复杂任务，主智能体负责规划拆解，多个 SubAgents 分头异步并行执行，Skills 与 MCP 协议提供能力扩展。
 
 - 自由配置 Agent 的基座模型、知识挂载、工具调用与系统提示词。
 - 支持多个 SubAgents 异步并行执行深度调研、数据分析或内容生成。
@@ -223,7 +217,7 @@ Yuxi 把知识进入系统、Agent 执行任务和团队治理放在一条完整
 
 **子智能体并行执行**
 
-支持主智能体将复杂的多步骤任务拆解后，派出多个专属 SubAgent 异步并行跑任务（例如分头检索不同领域的法规、分别撰写报告不同章节），全程互不阻塞，执行完毕后自动归拢汇总。
+支持主智能体将复杂的多步骤任务拆解后，派出多个专属 SubAgent 异步并行跑任务（例如分头检索不同领域的法规、分别撰写报告不同章节），执行完毕后汇总结果。
 
 ![子智能体并行执行](https://xerrors.oss-cn-shanghai.aliyuncs.com/github/image-20260825151559976.png)
 
@@ -249,11 +243,11 @@ Yuxi 把知识进入系统、Agent 执行任务和团队治理放在一条完整
 
 ### 05 · 沙盒工作区与文件产物
 
-每个任务都在安全隔离的沙盒文件系统中进行读写操作。智能体不仅能在对话中回答问题，还能把分析研究成果沉淀为 Markdown 文档、数据表格、HTML 页面或可执行代码，并在工作区中随时查看与下载。
+智能体可以通过沙盒工具读写文件。智能体不仅能在对话中回答问题，还能把分析研究成果沉淀为 Markdown 文档、数据表格、HTML 页面或可执行代码，并在工作区中随时查看与下载。
 
-- 任务在独立的沙盒目录中运行，保障文件与数据安全隔离。
-- 支持一键生成图文报告、数据分析图表、Web 页面等多种格式产物。
-- 浏览器内原生支持各类文件在线交互预览，支持一键打包下载。
+- 通过沙盒限制工具可访问的文件范围。
+- 支持生成图文报告、数据分析图表、Web 页面等多种格式产物。
+- 在浏览器中预览受支持的文件格式，并打包下载。
 
 ![Yuxi 沙盒工作区与文件产物](https://xerrors.oss-cn-shanghai.aliyuncs.com/github/image-20260825152123583.png)
 
@@ -262,7 +256,7 @@ Yuxi 把知识进入系统、Agent 执行任务和团队治理放在一条完整
 
 **工作区文件管理**
 
-可视化管理任务运行过程中读取与产生的所有文件，清晰展示目录层级、文件类型与体积大小，方便在会话之间复用中间产物。
+可视化管理任务在工作区中读取与产生的文件，清晰展示目录层级、文件类型与体积大小，方便在会话之间复用中间产物。
 
 ![image-20260826201931458](https://xerrors.oss-cn-shanghai.aliyuncs.com/github/image-20260826201931458.png)
 
@@ -285,11 +279,11 @@ Yuxi 把知识进入系统、Agent 执行任务和团队治理放在一条完整
 
 ### 06 · 团队治理与运行管理
 
-专为企业和团队多人协作打造。管理员可以集中管理成员与部门组织架构、统一配置模型接入凭据与 API Key，并通过监控看板全面掌握平台的运行状况与调用指标。
+专为企业和团队多人协作打造。管理员可以集中管理成员与部门组织架构、统一配置模型接入凭据与 API Key，并通过监控看板查看平台的运行状况与调用指标。
 
 - 支持按租户、用户与部门配置知识库、Agent 以及功能的读写权限。
 - 集中配置和调度多供应商的大模型能力，统一管理 API Key 凭据。
-- 实时统计分析使用量、请求趋势与资源负载，保障服务稳定运行。
+- 实时统计分析使用量、请求趋势与资源负载，辅助运行维护。
 
 ![image-20260826201755760](https://xerrors.oss-cn-shanghai.aliyuncs.com/github/image-20260826201755760.png)
 
@@ -331,6 +325,10 @@ Yuxi 把知识进入系统、Agent 执行任务和团队治理放在一条完整
 
 ---
 
+## 许可证
+
+Yuxi 本体采用 MIT License，详见 [LICENSE](LICENSE)。Docker Compose 引入的第三方组件遵循各自的许可证；再分发和商业部署前，请按实际镜像版本核对上游许可和源码义务，相关边界见[生产部署指南](docs/advanced/deployment.md)。
+
 Yuxi 的实现和文档参考了以下优秀的开源项目：
 
 - [LightRAG](https://github.com/HKUDS/LightRAG)：早期图谱构建和检索思路；
@@ -340,8 +338,15 @@ Yuxi 的实现和文档参考了以下优秀的开源项目：
 - [LangGraph](https://github.com/langchain-ai/langgraph)：智能体编排基础；
 - [QwenPaw](https://github.com/agentscope-ai/QwenPaw)：模型配置和个人文件区域设计。
 
-## 许可证
+## Star History
 
-Yuxi 本体采用 MIT License，详见 [LICENSE](LICENSE)。Docker Compose 引入的第三方组件遵循各自的许可证；再分发和商业部署前，请按实际镜像版本核对上游许可和源码义务，相关边界见[生产部署指南](docs/advanced/deployment.md)。
+<a href="https://www.star-history.com/?repos=xerrors%2Fyuxi&type=date&legend=bottom-right">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=xerrors/yuxi&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=xerrors/yuxi&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=xerrors/yuxi&type=date&legend=top-left" />
+ </picture>
+</a>
+
 
 [![给 Yuxi 一个 Star](https://xerrors.oss-cn-shanghai.aliyuncs.com/posts/2026/08/20260818-184409-image-da91658b.png)](https://github.com/xerrors/Yuxi)

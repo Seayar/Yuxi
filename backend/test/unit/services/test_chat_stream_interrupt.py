@@ -1,13 +1,9 @@
 """测试 chat_service 中的 interrupt 相关函数"""
 
 import json
-import sys
-import os
 from types import SimpleNamespace
 
 import pytest
-
-sys.path.insert(0, os.getcwd())
 
 from yuxi.services.chat_service import (
     _build_ask_user_question_payload,
@@ -15,6 +11,7 @@ from yuxi.services.chat_service import (
     _normalize_interrupt_questions,
     stream_agent_resume,
 )
+from test.unit.agent_context_fixtures import prepared_execution
 from yuxi.services import chat_service as svc
 from yuxi.utils.question_utils import normalize_options
 
@@ -193,7 +190,6 @@ class TestBuildAskUserQuestionPayload:
         info = {"questions": [{"question": "测试？"}]}
         result = _build_ask_user_question_payload(info, "thread-id")
 
-        assert result["questions"][0]["question_id"] != ""
         assert len(result["questions"][0]["question_id"]) > 0
 
 
@@ -225,6 +221,7 @@ class TestNormalizeInterruptQuestions:
 @pytest.mark.asyncio
 async def test_stream_agent_resume_init_does_not_render_resume_input():
     stream = stream_agent_resume(
+        prepared_execution=prepared_execution(),
         thread_id="thread-1",
         resume_input={"language": "python"},
         meta={"request_id": "req-1"},
@@ -243,6 +240,7 @@ async def test_stream_agent_resume_init_does_not_render_resume_input():
 @pytest.mark.asyncio
 async def test_stream_agent_resume_commits_before_stream_and_routes_subagent_chunks(monkeypatch):
     db = _FakeSession()
+    lifecycle: list[str] = []
 
     class FakeContext:
         def __init__(self):
@@ -260,7 +258,10 @@ async def test_stream_agent_resume_commits_before_stream_and_routes_subagent_chu
         context_schema = FakeContext
 
         async def stream_resume_with_state(self, resume_command, input_context=None, **kwargs):
+            await kwargs.pop("on_prepared")()
             assert db.commit_count == 1
+            assert lifecycle[-1] == "prepared"
+            lifecycle.append("streaming")
             yield (
                 "messages",
                 (
@@ -268,6 +269,7 @@ async def test_stream_agent_resume_commits_before_stream_and_routes_subagent_chu
                     {"namespace": ["task:1"], "thread_id": "child-thread"},
                 ),
             )
+            yield "checkpoint", SimpleNamespace(values={})
 
         async def get_graph(self, context=None):
             class FakeGraph:
@@ -280,7 +282,7 @@ async def test_stream_agent_resume_commits_before_stream_and_routes_subagent_chu
         return (
             SimpleNamespace(slug="main-agent", backend_id="ChatbotAgent"),
             FakeAgent(),
-            {},
+            prepared_execution().context,
             SimpleNamespace(
                 id=1,
                 uid="user-1",
@@ -297,16 +299,12 @@ async def test_stream_agent_resume_commits_before_stream_and_routes_subagent_chu
         if False:
             yield None
 
-    async def fake_build_agent_input_context(*_args, **_kwargs):
-        return {"thread_id": "parent-thread", "uid": "user-1"}
-
     monkeypatch.setattr(svc, "_resolve_agent_runtime", fake_resolve_agent_runtime)
     monkeypatch.setattr(svc, "resolve_conversation_workdir_path", _resolve_test_workdir)
-    monkeypatch.setattr(svc, "build_agent_input_context", fake_build_agent_input_context)
     monkeypatch.setattr(
         svc,
         "_build_langfuse_run_context",
-        lambda **_kwargs: SimpleNamespace(callbacks=[], metadata={}, tags=[]),
+        lambda **_kwargs: SimpleNamespace(callbacks=[], metadata={}, tags=[], trace_id=None),
     )
     monkeypatch.setattr(svc, "check_and_handle_interrupts", fake_check_and_handle_interrupts)
     monkeypatch.setattr(svc, "save_messages_from_langgraph_state", fake_save_messages_from_langgraph_state)
@@ -329,22 +327,34 @@ async def test_stream_agent_resume_commits_before_stream_and_routes_subagent_chu
 
     monkeypatch.setattr(svc, "ConversationRepository", FakeConversationRepository)
 
-    class FakeSandboxBackend:
+    class UnexpectedSandboxBackend:
         def __init__(self, **_kwargs):
-            pass
+            raise AssertionError("Resume 流不应在执行前构造 Sandbox Backend")
 
         def ensure_available(self):
-            return "sandbox-1"
+            raise AssertionError("Resume 流不应预创建 Sandbox")
 
-    monkeypatch.setattr(svc, "ProvisionerSandboxBackend", FakeSandboxBackend)
+    monkeypatch.setattr(svc, "ProvisionerSandboxBackend", UnexpectedSandboxBackend, raising=False)
+    monkeypatch.setattr(
+        svc,
+        "get_user_skills_root_dir",
+        lambda _uid: (_ for _ in ()).throw(AssertionError("Resume 流不应物化 Skill 投影根")),
+        raising=False,
+    )
     monkeypatch.setattr(svc, "flush_langfuse", lambda: None)
 
+    async def on_prepared() -> None:
+        assert db.commit_count == 1
+        lifecycle.append("prepared")
+
     stream = stream_agent_resume(
+        prepared_execution=prepared_execution(),
         thread_id="parent-thread",
         resume_input={"ok": True},
         meta={"request_id": "req-1"},
         current_user=SimpleNamespace(uid="user-1"),
         db=db,
+        on_prepared=on_prepared,
     )
 
     chunks = []
@@ -366,6 +376,7 @@ async def test_stream_agent_resume_commits_before_stream_and_routes_subagent_chu
     assert finished["status"] == "finished"
     assert finished["meta"]["agent_slug"] == "main-agent"
     assert "agent_id" not in finished["meta"]
+    assert lifecycle == ["prepared", "streaming"]
 
     async def fail_output_persistence(**_kwargs):
         raise ValueError("output binding rejected")
@@ -374,6 +385,7 @@ async def test_stream_agent_resume_commits_before_stream_and_routes_subagent_chu
     monkeypatch.setattr(svc, "save_messages_from_langgraph_state", fail_output_persistence)
     failing_chunks = []
     async for raw in stream_agent_resume(
+        prepared_execution=prepared_execution(),
         thread_id="parent-thread",
         resume_input={"ok": True},
         meta={
@@ -383,6 +395,7 @@ async def test_stream_agent_resume_commits_before_stream_and_routes_subagent_chu
         },
         current_user=SimpleNamespace(uid="user-1"),
         db=db,
+        on_prepared=on_prepared,
     ):
         failing_chunks.append(json.loads(raw.decode("utf-8")))
 

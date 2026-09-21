@@ -152,13 +152,60 @@ export const isSubagentToolCall = (toolCall) => SUBAGENT_TOOL_IDS.includes(getTo
 
 export const parseToolCallResult = (toolCall) => {
   const content = toolCall?.tool_call_result?.content ?? toolCall?.result
-  if (!content) return null
+  if (content == null || content === '') return null
   if (typeof content === 'object') return content
   try {
     return JSON.parse(content)
   } catch {
     return null
   }
+}
+
+/** 以调用、ToolMessage 和结果顶层的错误状态优先决定工具展示状态。 */
+export const getToolCallStatus = (toolCall) => {
+  const statuses = [
+    toolCall?.status,
+    toolCall?.tool_call_result?.status,
+    parseToolCallResult(toolCall)?.status
+  ]
+  if (statuses.some((status) => status === 'error' || status === 'failed')) return 'error'
+  if (
+    toolCall?.tool_call_result != null ||
+    toolCall?.result != null ||
+    toolCall?.status === 'success' ||
+    toolCall?.status === 'completed'
+  )
+    return 'completed'
+  return 'running'
+}
+
+/** 子智能体结果与补充运行信息中的状态，供详情和分组共同展示。 */
+export const getSubagentRunStatus = (toolCall) => {
+  if (getToolCallStatus(toolCall) === 'error') return 'error'
+  const result = parseToolCallResult(toolCall)
+  return (
+    toolCall?.subagent_run?.status ||
+    result?.run_status ||
+    result?.active_run_status ||
+    result?.status ||
+    ''
+  )
+}
+
+/** 统一工具行与分组的展示状态，保留子智能体特有的运行态。 */
+export const getToolCallDisplayStatus = (toolCall, activeSubagentToolCallIds) => {
+  const status = getToolCallStatus(toolCall)
+  if (status === 'error' || !isSubagentToolCall(toolCall)) return status
+  const runStatus = getSubagentRunStatus(toolCall)
+  if (['error', 'failed', 'cancelled', 'interrupted'].includes(runStatus)) return 'error'
+  if (getToolCallId(toolCall) === 'task') {
+    if (status === 'completed') return 'completed'
+    return activeSubagentToolCallIds?.has(String(toolCall.id)) ? 'running' : 'completed'
+  }
+  if (['failed', 'cancelled', 'interrupted'].includes(runStatus)) return 'error'
+  if (status === 'completed' || runStatus === 'completed' || parseToolCallResult(toolCall)?.status)
+    return 'completed'
+  return 'running'
 }
 
 export const enrichSubagentToolCall = (
@@ -172,6 +219,7 @@ export const enrichSubagentToolCall = (
   const subagentRun =
     (toolCall.id ? subagentRunById?.get?.(String(toolCall.id)) : null) ||
     (result?.run_id ? subagentRunById?.get?.(String(result.run_id)) : null) ||
+    (args.run_id ? subagentRunById?.get?.(String(args.run_id)) : null) ||
     (args.thread_id ? subagentRunByThreadId?.get?.(String(args.thread_id)) : null) ||
     (result?.thread_id ? subagentRunByThreadId?.get?.(String(result.thread_id)) : null)
   const subagentOption = args.subagent_slug

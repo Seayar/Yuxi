@@ -8,14 +8,9 @@ import pytest
 
 import yuxi.services.agent_run_service as agent_run_service
 from yuxi.services.input_message_service import (
-    build_chat_input_message,
     build_chat_input_message_from_openai_content,
     restore_chat_input_message,
 )
-
-
-def _chat_input(content: str, image_content: str | None = None):
-    return build_chat_input_message(content, image_content)
 
 
 def _sse_data(chunk: str) -> dict:
@@ -23,6 +18,52 @@ def _sse_data(chunk: str) -> dict:
         if line.startswith("data: "):
             return json.loads(line.removeprefix("data: "))
     raise AssertionError(f"SSE chunk has no data line: {chunk}")
+
+
+def _run_state(status: str = "running", *, cleanup_pending: bool = False):
+    return SimpleNamespace(
+        status=status,
+        conversation_thread_id="thread-1",
+        request_id="req-1",
+        runtime_cleanup_pending=cleanup_pending,
+    )
+
+
+def _run_stream_event(seq: str, event_type: str, payload: dict) -> dict:
+    return {
+        "seq": seq,
+        "event_type": event_type,
+        "payload": {
+            "schema_version": 1,
+            "run_id": "run-1",
+            "thread_id": "thread-1",
+            "event": event_type,
+            "payload": payload,
+            "created_at": "2026-09-04T00:00:00+00:00",
+        },
+        "ts": int(seq.partition("-")[0]),
+    }
+
+
+def test_run_sse_poll_interval_caps_short_and_long_idle_periods():
+    interval = agent_run_service.RUN_SSE_ACTIVE_POLL_SECONDS
+    short_idle_intervals = []
+    for _ in range(6):
+        interval = agent_run_service._next_run_sse_poll_interval(interval, idle_seconds=30)
+        short_idle_intervals.append(interval)
+
+    assert short_idle_intervals == [0.2, 0.4, 0.8, 1.0, 1.0, 1.0]
+    assert agent_run_service._next_run_sse_poll_interval(1.0, idle_seconds=120) == 2.0
+    assert agent_run_service._next_run_sse_poll_interval(2.0, idle_seconds=120) == 4.0
+    assert agent_run_service._next_run_sse_poll_interval(4.0, idle_seconds=120) == 4.0
+
+
+def test_run_sse_poll_jitter_stays_within_twenty_percent(monkeypatch: pytest.MonkeyPatch):
+    multipliers = iter([0.8, 1.2])
+    monkeypatch.setattr(agent_run_service, "uniform", lambda _low, _high: next(multipliers))
+
+    assert agent_run_service._jitter_run_sse_poll_interval(1.0) == 0.8
+    assert agent_run_service._jitter_run_sse_poll_interval(1.0) == 1.2
 
 
 def test_openai_content_parts_build_and_restore_multimodal_message():
@@ -46,13 +87,24 @@ def test_openai_content_parts_build_and_restore_multimodal_message():
     assert restored.require_langchain_message().content == raw_message["content"]
 
 
-def test_prepare_run_input_message_keeps_invocation_meta_namespaced():
-    input_message = agent_run_service._prepare_run_input_message(
-        run_type="chat",
-        input_message=build_chat_input_message("hello"),
-        resume=None,
-        request_id="req-1",
-        model_spec="provider:model",
+@pytest.mark.asyncio
+async def test_resume_input_message_keeps_invocation_meta_namespaced(monkeypatch):
+    db = _patch_agent_run_creation(
+        monkeypatch,
+        parent_run=SimpleNamespace(
+            id="parent-run",
+            conversation_thread_id="thread-1",
+            status="interrupted",
+            input_payload={"model_spec": "parent-model"},
+        ),
+    )
+    await agent_run_service.create_resume_run_view(
+        agent_slug="default",
+        thread_id="thread-1",
+        current_uid="user-1",
+        db=db,
+        resume={"answer": "ok"},
+        created_by_run_id="parent-run",
         meta={
             "source": "agent_call",
             "agent_invocation_meta": {"trace_id": "trace-1"},
@@ -61,7 +113,8 @@ def test_prepare_run_input_message_keeps_invocation_meta_namespaced():
         },
     )
 
-    assert input_message.extra_metadata["source"] == "agent_call"
+    input_message = db.added[0]
+    assert input_message.extra_metadata["source"] == "ask_user_question_resume"
     assert input_message.extra_metadata["agent_invocation_meta"] == {"trace_id": "trace-1"}
     assert "evaluation" not in input_message.extra_metadata
     assert "custom_variables" not in input_message.extra_metadata
@@ -218,7 +271,7 @@ class _FakeContext:
         self.model = "agent-default-model"
         self.tool_approval_mode = "default"
 
-    def update_from_dict(self, data: dict):
+    def update_config(self, data: dict):
         for key, value in data.items():
             if hasattr(self, key):
                 setattr(self, key, value)
@@ -385,6 +438,64 @@ async def test_stream_agent_run_events_emits_error_on_db_error(monkeypatch: pyte
 
 
 @pytest.mark.asyncio
+async def test_stream_agent_run_events_authorizes_before_reading_redis(monkeypatch: pytest.MonkeyPatch):
+    async def fake_load_run(run_id: str, uid: str):
+        del run_id, uid
+        return None
+
+    async def unexpected_list_events(*_args, **_kwargs):
+        pytest.fail("未授权连接不得读取 Redis Run 事件")
+
+    monkeypatch.setattr(agent_run_service, "_load_stream_run_for_user", fake_load_run)
+    monkeypatch.setattr(agent_run_service, "list_run_stream_events", unexpected_list_events)
+
+    chunks = [
+        chunk
+        async for chunk in agent_run_service.stream_agent_run_events(
+            run_id="run-1",
+            after_seq="0",
+            current_uid="other-user",
+        )
+    ]
+
+    assert len(chunks) == 1
+    assert chunks[0].startswith("event: error")
+    assert "运行任务不存在" in chunks[0]
+
+
+@pytest.mark.asyncio
+async def test_stream_agent_run_events_emits_error_when_status_refresh_fails(monkeypatch: pytest.MonkeyPatch):
+    async def fake_load_run(run_id: str, uid: str):
+        del run_id, uid
+        return _run_state()
+
+    async def broken_refresh(run_id: str):
+        del run_id
+        raise RuntimeError("db down")
+
+    async def fake_list_events(*_args, **_kwargs):
+        return []
+
+    monkeypatch.setattr(agent_run_service, "_load_stream_run_for_user", fake_load_run)
+    monkeypatch.setattr(agent_run_service, "_load_stream_run", broken_refresh)
+    monkeypatch.setattr(agent_run_service, "list_run_stream_events", fake_list_events)
+    monkeypatch.setattr(agent_run_service, "RUN_SSE_STATUS_POLL_SECONDS", 0.0)
+
+    chunks = [
+        chunk
+        async for chunk in agent_run_service.stream_agent_run_events(
+            run_id="run-1",
+            after_seq="0",
+            current_uid="user-1",
+        )
+    ]
+
+    assert len(chunks) == 1
+    assert chunks[0].startswith("event: error")
+    assert '"reason": "db_error"' in chunks[0]
+
+
+@pytest.mark.asyncio
 async def test_stream_agent_run_events_reads_redis_and_ends_on_end_event(monkeypatch: pytest.MonkeyPatch):
     @asynccontextmanager
     async def fake_session_ctx():
@@ -437,7 +548,6 @@ async def test_stream_agent_run_events_reads_redis_and_ends_on_end_event(monkeyp
     monkeypatch.setattr(agent_run_service.pg_manager, "get_async_session_context", fake_session_ctx)
     monkeypatch.setattr(agent_run_service, "AgentRunRepository", Repo)
     monkeypatch.setattr(agent_run_service, "list_run_stream_events", fake_list_events)
-    monkeypatch.setattr(agent_run_service, "SSE_POLL_INTERVAL_SECONDS", 0)
 
     chunks = []
     async for chunk in agent_run_service.stream_agent_run_events(
@@ -451,6 +561,176 @@ async def test_stream_agent_run_events_reads_redis_and_ends_on_end_event(monkeyp
     assert "id: 1700000000000-0" in chunks[0]
     assert chunks[-1].startswith("event: end")
     assert "id: 1700000000001-0" in chunks[-1]
+
+
+@pytest.mark.asyncio
+async def test_stream_agent_run_events_decouples_pg_checks_from_redis_polling(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """高频 Redis 空轮询不得同步放大 PostgreSQL 可见性查询。"""
+    pg_reads = 0
+
+    async def fake_load_run(run_id: str, uid: str):
+        nonlocal pg_reads
+        del run_id, uid
+        pg_reads += 1
+        return _run_state()
+
+    async def fake_refresh_run(run_id: str):
+        nonlocal pg_reads
+        del run_id
+        pg_reads += 1
+        return _run_state()
+
+    redis_reads = 0
+
+    async def fake_list_events(run_id: str, *, after_seq: str, limit: int):
+        nonlocal redis_reads
+        del run_id, after_seq, limit
+        redis_reads += 1
+        if redis_reads < 4:
+            return []
+        return [_run_stream_event("1700000000004-0", "end", {"status": "completed"})]
+
+    sleep_intervals = []
+
+    async def fake_sleep(seconds: float):
+        sleep_intervals.append(seconds)
+
+    monkeypatch.setattr(agent_run_service, "_load_stream_run_for_user", fake_load_run)
+    monkeypatch.setattr(agent_run_service, "_load_stream_run", fake_refresh_run)
+    monkeypatch.setattr(agent_run_service, "list_run_stream_events", fake_list_events)
+    monkeypatch.setattr(agent_run_service.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(agent_run_service, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(agent_run_service, "uniform", lambda _low, _high: 1.0)
+
+    chunks = []
+    async for chunk in agent_run_service.stream_agent_run_events(
+        run_id="run-1",
+        after_seq="0",
+        current_uid="user-1",
+    ):
+        chunks.append(chunk)
+
+    assert pg_reads == 1
+    assert redis_reads == 4
+    assert sleep_intervals == [0.1, 0.2, 0.4]
+    assert chunks[-1].startswith("event: end")
+
+
+@pytest.mark.asyncio
+async def test_stream_agent_run_events_resets_adaptive_poll_after_event(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """任一 Run 事件都必须把退避后的轮询恢复到低延迟档。"""
+
+    async def fake_load_run(run_id: str, uid: str):
+        del run_id, uid
+        return _run_state()
+
+    async def fake_refresh_run(run_id: str):
+        del run_id
+        return _run_state()
+
+    redis_results = iter(
+        [
+            [],
+            [],
+            [_run_stream_event("1700000000001-0", "messages", {"items": []})],
+            [],
+            [_run_stream_event("1700000000002-0", "end", {"status": "completed"})],
+        ]
+    )
+
+    async def fake_list_events(run_id: str, *, after_seq: str, limit: int):
+        del run_id, after_seq, limit
+        return next(redis_results)
+
+    sleep_intervals = []
+
+    async def fake_sleep(seconds: float):
+        sleep_intervals.append(seconds)
+
+    monkeypatch.setattr(agent_run_service, "_load_stream_run_for_user", fake_load_run)
+    monkeypatch.setattr(agent_run_service, "_load_stream_run", fake_refresh_run)
+    monkeypatch.setattr(agent_run_service, "list_run_stream_events", fake_list_events)
+    monkeypatch.setattr(agent_run_service.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(agent_run_service, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(agent_run_service, "uniform", lambda _low, _high: 1.0)
+
+    chunks = []
+    async for chunk in agent_run_service.stream_agent_run_events(
+        run_id="run-1",
+        after_seq="0",
+        current_uid="user-1",
+    ):
+        chunks.append(chunk)
+
+    assert sleep_intervals == [0.1, 0.2, 0.1, 0.1]
+    assert [chunk.splitlines()[0] for chunk in chunks] == ["event: messages", "event: end"]
+
+
+@pytest.mark.asyncio
+async def test_stream_agent_run_events_refreshes_pg_before_cleanup_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Redis 缺少 end 时，低频 PG 探测仍须等待 cleanup fence 后补发终态。"""
+    visibility_reads = 0
+    status_reads = 0
+
+    async def fake_load_run(run_id: str, uid: str):
+        nonlocal visibility_reads
+        del run_id, uid
+        visibility_reads += 1
+        return _run_state("completed", cleanup_pending=True)
+
+    async def fake_refresh_run(run_id: str):
+        nonlocal status_reads
+        del run_id
+        status_reads += 1
+        return _run_state("completed")
+
+    async def fake_list_events(run_id: str, *, after_seq: str, limit: int):
+        del run_id, after_seq, limit
+        return []
+
+    async def fake_last_stream_seq(run_id: str):
+        del run_id
+        return "0-0"
+
+    clock = 0.0
+    sleep_intervals = []
+
+    async def fake_sleep(seconds: float):
+        nonlocal clock
+        sleep_intervals.append(seconds)
+        clock += seconds
+
+    monkeypatch.setattr(agent_run_service, "_load_stream_run_for_user", fake_load_run)
+    monkeypatch.setattr(agent_run_service, "_load_stream_run", fake_refresh_run)
+    monkeypatch.setattr(agent_run_service, "list_run_stream_events", fake_list_events)
+    monkeypatch.setattr(agent_run_service, "get_last_run_stream_seq", fake_last_stream_seq)
+    monkeypatch.setattr(agent_run_service.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(agent_run_service, "monotonic", lambda: clock)
+    monkeypatch.setattr(agent_run_service, "uniform", lambda _low, _high: 1.2)
+    monkeypatch.setattr(agent_run_service, "RUN_SSE_LONG_IDLE_AFTER_SECONDS", 0.0)
+
+    chunks = []
+    async for chunk in agent_run_service.stream_agent_run_events(
+        run_id="run-1",
+        after_seq="0",
+        current_uid="user-1",
+        verbose=False,
+    ):
+        chunks.append(chunk)
+
+    assert visibility_reads == 1
+    assert status_reads == 1
+    assert clock == agent_run_service.RUN_SSE_STATUS_POLL_SECONDS
+    assert sleep_intervals[-1] < 3.2 * 1.2
+    assert len(chunks) == 1
+    assert chunks[0].startswith("event: end")
+    assert _sse_data(chunks[0])["payload"] == {"status": "completed"}
 
 
 @pytest.mark.asyncio
@@ -759,11 +1039,20 @@ async def test_stream_agent_run_events_does_not_fallback_end_before_runtime_clea
 
 
 @pytest.mark.asyncio
-async def test_create_agent_run_persists_input_before_enqueue(monkeypatch: pytest.MonkeyPatch):
-    db = _patch_agent_run_creation(monkeypatch)
+async def test_create_resume_run_persists_input_before_enqueue(monkeypatch: pytest.MonkeyPatch):
+    db = _patch_agent_run_creation(
+        monkeypatch,
+        parent_run=SimpleNamespace(
+            id="parent-run",
+            conversation_thread_id="thread-1",
+            status="interrupted",
+            input_payload={"model_spec": "parent-model", "tool_approval_mode": "default"},
+        ),
+    )
 
-    result = await agent_run_service.create_agent_run_view(
-        input_message=_chat_input("hello"),
+    result = await agent_run_service.create_resume_run_view(
+        resume={"answer": "ok"},
+        created_by_run_id="parent-run",
         agent_slug="default",
         thread_id="thread-1",
         meta={"request_id": "req-1"},
@@ -782,18 +1071,18 @@ async def test_create_agent_run_persists_input_before_enqueue(monkeypatch: pytes
     assert db.added[0].request_id == "req-1"
     assert db.enqueued == [("process_agent_run", db.created_run.id, f"run:{db.created_run.id}")]
     assert db.created_run_kwargs["input_payload"] == {
-        "model_spec": "agent-default-model",
+        "model_spec": "parent-model",
         "tool_approval_mode": "default",
     }
     assert "model_spec" not in db.added[0].extra_metadata
-    assert db.added[0].extra_metadata["raw_message"]["type"] == "human"
-    assert db.added[0].extra_metadata["raw_message"]["content"] == "hello"
+    assert db.added[0].message_type == "resume"
+    assert db.added[0].extra_metadata["resume"] == {"answer": "ok"}
     assert "run_id" not in db.added[0].extra_metadata
     assert "run_type" not in db.added[0].extra_metadata
 
 
 @pytest.mark.asyncio
-async def test_create_agent_run_reuses_existing_only_with_same_request_scope(monkeypatch: pytest.MonkeyPatch):
+async def test_create_resume_run_reuses_existing_only_with_same_request_scope(monkeypatch: pytest.MonkeyPatch):
     existing_run = SimpleNamespace(
         id="existing-run",
         conversation_thread_id="thread-1",
@@ -801,14 +1090,24 @@ async def test_create_agent_run_reuses_existing_only_with_same_request_scope(mon
         status="pending",
         request_id="req-1",
         uid="user-1",
-        run_type="chat",
-        created_by_run_id=None,
+        run_type="resume",
+        created_by_run_id="parent-run",
         subagent_thread_relation_id=None,
     )
-    db = _patch_agent_run_creation(monkeypatch, existing_run=existing_run)
+    db = _patch_agent_run_creation(
+        monkeypatch,
+        parent_run=SimpleNamespace(
+            id="parent-run",
+            conversation_thread_id="thread-1",
+            status="interrupted",
+            input_payload={"model_spec": "parent-model", "tool_approval_mode": "default"},
+        ),
+        existing_run=existing_run,
+    )
 
-    result = await agent_run_service.create_agent_run_view(
-        input_message=_chat_input("hello"),
+    result = await agent_run_service.create_resume_run_view(
+        resume={"answer": "ok"},
+        created_by_run_id="parent-run",
         agent_slug="default",
         thread_id="thread-1",
         meta={"request_id": "req-1"},
@@ -822,7 +1121,7 @@ async def test_create_agent_run_reuses_existing_only_with_same_request_scope(mon
 
 
 @pytest.mark.asyncio
-async def test_create_agent_run_rejects_request_id_scope_mismatch(monkeypatch: pytest.MonkeyPatch):
+async def test_create_resume_run_rejects_request_id_scope_mismatch(monkeypatch: pytest.MonkeyPatch):
     existing_run = SimpleNamespace(
         id="existing-run",
         conversation_thread_id="other-thread",
@@ -830,15 +1129,25 @@ async def test_create_agent_run_rejects_request_id_scope_mismatch(monkeypatch: p
         status="pending",
         request_id="req-1",
         uid="user-1",
-        run_type="chat",
-        created_by_run_id=None,
+        run_type="resume",
+        created_by_run_id="parent-run",
         subagent_thread_relation_id=None,
     )
-    db = _patch_agent_run_creation(monkeypatch, existing_run=existing_run)
+    db = _patch_agent_run_creation(
+        monkeypatch,
+        parent_run=SimpleNamespace(
+            id="parent-run",
+            conversation_thread_id="thread-1",
+            status="interrupted",
+            input_payload={"model_spec": "parent-model", "tool_approval_mode": "default"},
+        ),
+        existing_run=existing_run,
+    )
 
     with pytest.raises(agent_run_service.HTTPException) as exc:
-        await agent_run_service.create_agent_run_view(
-            input_message=_chat_input("hello"),
+        await agent_run_service.create_resume_run_view(
+            resume={"answer": "ok"},
+            created_by_run_id="parent-run",
             agent_slug="default",
             thread_id="thread-1",
             meta={"request_id": "req-1"},
@@ -852,7 +1161,7 @@ async def test_create_agent_run_rejects_request_id_scope_mismatch(monkeypatch: p
 
 
 @pytest.mark.asyncio
-async def test_create_agent_run_integrity_error_reuses_same_request_scope(monkeypatch: pytest.MonkeyPatch):
+async def test_create_resume_run_integrity_error_reuses_same_request_scope(monkeypatch: pytest.MonkeyPatch):
     existing_run = SimpleNamespace(
         id="existing-run",
         conversation_thread_id="thread-1",
@@ -860,18 +1169,25 @@ async def test_create_agent_run_integrity_error_reuses_same_request_scope(monkey
         status="pending",
         request_id="req-1",
         uid="user-1",
-        run_type="chat",
-        created_by_run_id=None,
+        run_type="resume",
+        created_by_run_id="parent-run",
         subagent_thread_relation_id=None,
     )
     db = _patch_agent_run_creation(
         monkeypatch,
+        parent_run=SimpleNamespace(
+            id="parent-run",
+            conversation_thread_id="thread-1",
+            status="interrupted",
+            input_payload={"model_spec": "parent-model", "tool_approval_mode": "default"},
+        ),
         existing_run_after_rollback=existing_run,
         raise_create_integrity_error=True,
     )
 
-    result = await agent_run_service.create_agent_run_view(
-        input_message=_chat_input("hello"),
+    result = await agent_run_service.create_resume_run_view(
+        resume={"answer": "ok"},
+        created_by_run_id="parent-run",
         agent_slug="default",
         thread_id="thread-1",
         meta={"request_id": "req-1"},
@@ -888,7 +1204,7 @@ async def test_create_agent_run_integrity_error_reuses_same_request_scope(monkey
 
 
 @pytest.mark.asyncio
-async def test_create_agent_run_integrity_error_rejects_scope_mismatch(monkeypatch: pytest.MonkeyPatch):
+async def test_create_resume_run_integrity_error_rejects_scope_mismatch(monkeypatch: pytest.MonkeyPatch):
     existing_run = SimpleNamespace(
         id="existing-run",
         conversation_thread_id="other-thread",
@@ -896,19 +1212,26 @@ async def test_create_agent_run_integrity_error_rejects_scope_mismatch(monkeypat
         status="pending",
         request_id="req-1",
         uid="user-1",
-        run_type="chat",
-        created_by_run_id=None,
+        run_type="resume",
+        created_by_run_id="parent-run",
         subagent_thread_relation_id=None,
     )
     db = _patch_agent_run_creation(
         monkeypatch,
+        parent_run=SimpleNamespace(
+            id="parent-run",
+            conversation_thread_id="thread-1",
+            status="interrupted",
+            input_payload={"model_spec": "parent-model", "tool_approval_mode": "default"},
+        ),
         existing_run_after_rollback=existing_run,
         raise_create_integrity_error=True,
     )
 
     with pytest.raises(agent_run_service.HTTPException) as exc:
-        await agent_run_service.create_agent_run_view(
-            input_message=_chat_input("hello"),
+        await agent_run_service.create_resume_run_view(
+            resume={"answer": "ok"},
+            created_by_run_id="parent-run",
             agent_slug="default",
             thread_id="thread-1",
             meta={"request_id": "req-1"},
@@ -924,18 +1247,25 @@ async def test_create_agent_run_integrity_error_rejects_scope_mismatch(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_create_agent_run_integrity_error_returns_run_busy_for_active_thread(
+async def test_create_resume_run_integrity_error_returns_run_busy_for_active_thread(
     monkeypatch: pytest.MonkeyPatch,
 ):
     db = _patch_agent_run_creation(
         monkeypatch,
+        parent_run=SimpleNamespace(
+            id="parent-run",
+            conversation_thread_id="thread-1",
+            status="interrupted",
+            input_payload={"model_spec": "parent-model", "tool_approval_mode": "default"},
+        ),
         active_run_after_rollback=SimpleNamespace(id="active-run", status="pending"),
         raise_create_integrity_error=True,
     )
 
     with pytest.raises(agent_run_service.HTTPException) as exc:
-        await agent_run_service.create_agent_run_view(
-            input_message=_chat_input("hello"),
+        await agent_run_service.create_resume_run_view(
+            resume={"answer": "ok"},
+            created_by_run_id="parent-run",
             agent_slug="default",
             thread_id="thread-1",
             meta={"request_id": "req-2"},
@@ -967,8 +1297,7 @@ async def test_create_resume_run_marks_input_message_source(monkeypatch: pytest.
         ),
     )
 
-    result = await agent_run_service.create_agent_run_view(
-        input_message=None,
+    result = await agent_run_service.create_resume_run_view(
         agent_slug="default",
         thread_id="thread-1",
         meta={"request_id": "resume-req"},
@@ -1004,8 +1333,7 @@ async def test_create_resume_run_preserves_explicit_origin_snapshot(monkeypatch:
         ),
     )
 
-    await agent_run_service.create_agent_run_view(
-        input_message=None,
+    await agent_run_service.create_resume_run_view(
         agent_slug="default",
         thread_id="thread-1",
         meta={"request_id": "resume-req"},
@@ -1035,8 +1363,7 @@ async def test_create_resume_run_without_request_id_reuses_stable_key(monkeypatc
     )
     first_db = _patch_agent_run_creation(monkeypatch, parent_run=parent_run)
 
-    await agent_run_service.create_agent_run_view(
-        input_message=None,
+    await agent_run_service.create_resume_run_view(
         agent_slug="default",
         thread_id="thread-1",
         meta={},
@@ -1060,8 +1387,7 @@ async def test_create_resume_run_without_request_id_reuses_stable_key(monkeypatc
     )
     retry_db = _patch_agent_run_creation(monkeypatch, existing_run=existing_run, parent_run=parent_run)
 
-    result = await agent_run_service.create_agent_run_view(
-        input_message=None,
+    result = await agent_run_service.create_resume_run_view(
         agent_slug="default",
         thread_id="thread-1",
         meta={},
@@ -1085,8 +1411,7 @@ async def test_create_resume_run_requires_parent_run_id(monkeypatch: pytest.Monk
     db = _patch_agent_run_creation(monkeypatch)
 
     with pytest.raises(agent_run_service.HTTPException) as exc:
-        await agent_run_service.create_agent_run_view(
-            input_message=None,
+        await agent_run_service.create_resume_run_view(
             agent_slug="default",
             thread_id="thread-1",
             meta={"request_id": "resume-req"},
@@ -1113,8 +1438,7 @@ async def test_create_resume_run_rejects_non_interrupted_parent(monkeypatch: pyt
     )
 
     with pytest.raises(agent_run_service.HTTPException) as exc:
-        await agent_run_service.create_agent_run_view(
-            input_message=None,
+        await agent_run_service.create_resume_run_view(
             agent_slug="default",
             thread_id="thread-1",
             meta={"request_id": "resume-req"},
@@ -1141,8 +1465,7 @@ async def test_create_resume_run_rejects_superseded_interrupt(monkeypatch: pytes
     db = _patch_agent_run_creation(monkeypatch, parent_run=parent_run, latest_run=newer_run)
 
     with pytest.raises(agent_run_service.HTTPException) as exc:
-        await agent_run_service.create_agent_run_view(
-            input_message=None,
+        await agent_run_service.create_resume_run_view(
             agent_slug="default",
             thread_id="thread-1",
             meta={"request_id": "resume-req"},
@@ -1169,8 +1492,7 @@ async def test_create_resume_run_rejects_parent_without_model_snapshot(monkeypat
     )
 
     with pytest.raises(agent_run_service.HTTPException) as exc:
-        await agent_run_service.create_agent_run_view(
-            input_message=None,
+        await agent_run_service.create_resume_run_view(
             agent_slug="default",
             thread_id="thread-1",
             meta={"request_id": "resume-req"},
@@ -1186,12 +1508,22 @@ async def test_create_resume_run_rejects_parent_without_model_snapshot(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_create_agent_run_rejects_active_checkpoint_run(monkeypatch: pytest.MonkeyPatch):
-    db = _patch_agent_run_creation(monkeypatch, active_run=SimpleNamespace(id="active-run", status="running"))
+async def test_create_resume_run_rejects_active_checkpoint_run(monkeypatch: pytest.MonkeyPatch):
+    db = _patch_agent_run_creation(
+        monkeypatch,
+        parent_run=SimpleNamespace(
+            id="parent-run",
+            conversation_thread_id="thread-1",
+            status="interrupted",
+            input_payload={"model_spec": "parent-model", "tool_approval_mode": "default"},
+        ),
+        active_run=SimpleNamespace(id="active-run", status="running"),
+    )
 
     with pytest.raises(agent_run_service.HTTPException) as exc:
-        await agent_run_service.create_agent_run_view(
-            input_message=_chat_input("hello"),
+        await agent_run_service.create_resume_run_view(
+            resume={"answer": "ok"},
+            created_by_run_id="parent-run",
             agent_slug="default",
             thread_id="thread-1",
             meta={"request_id": "req-1"},
@@ -1265,7 +1597,48 @@ async def test_get_agent_run_result_uses_output_message_id(monkeypatch: pytest.M
     assert payload["output"] == "older"
     assert payload["final_message_id"] == 2
     assert payload["langfuse_trace_id"] == "trace-old"
+    assert payload["timing"]["first_output_latency_ms"] is None
     assert "debug" not in payload
+
+
+@pytest.mark.asyncio
+async def test_get_agent_run_result_prefers_run_trace_without_final_message(monkeypatch: pytest.MonkeyPatch):
+    run = SimpleNamespace(
+        id="run-1",
+        status="failed",
+        agent_slug="default-chatbot",
+        conversation_thread_id="thread-1",
+        conversation_id=10,
+        request_id="req-1",
+        output_message_id=None,
+        langfuse_trace_id="trace-run",
+        error_type="model_error",
+        error_message="failed before output",
+    )
+
+    class RunRepo:
+        def __init__(self, db):
+            del db
+
+        async def get_run_for_user(self, run_id: str, uid: str):
+            assert (run_id, uid) == ("run-1", "user-1")
+            return run
+
+    class RunOutputRepo:
+        def __init__(self, db):
+            del db
+
+        async def get_output_message(self, **_kwargs):
+            return None
+
+    monkeypatch.setattr(agent_run_service, "AgentRunRepository", RunRepo)
+    monkeypatch.setattr(agent_run_service, "AgentRunOutputRepository", RunOutputRepo)
+
+    payload = await agent_run_service.get_agent_run_result(run_id="run-1", current_uid="user-1", db=object())
+
+    assert payload["output"] == ""
+    assert payload["final_message_id"] is None
+    assert payload["langfuse_trace_id"] == "trace-run"
 
 
 @pytest.mark.asyncio
@@ -1488,7 +1861,7 @@ async def test_cancel_agent_run_view_cascades_children(monkeypatch: pytest.Monke
     parent_run = SimpleNamespace(id="parent-run", uid="user-1", to_dict=lambda: {"id": "parent-run"})
     child_runs = [SimpleNamespace(id="child-1"), SimpleNamespace(id="child-2")]
     requested: list[str] = []
-    signals: list[tuple[str, bool]] = []
+    signals: list[tuple[list[str], bool]] = []
 
     class Db:
         committed = False
@@ -1507,11 +1880,11 @@ async def test_cancel_agent_run_view_cascades_children(monkeypatch: pytest.Monke
             requested.extend(["parent-run", *(child.id for child in child_runs)])
             return parent_run, list(requested)
 
-    async def fake_publish_cancel_signal(run_id: str):
-        signals.append((run_id, db.committed))
+    async def fake_publish_cancel_signals(run_ids: list[str]):
+        signals.append((run_ids, db.committed))
 
     monkeypatch.setattr(agent_run_service, "AgentRunRepository", RunRepo)
-    monkeypatch.setattr(agent_run_service, "publish_cancel_signal", fake_publish_cancel_signal)
+    monkeypatch.setattr(agent_run_service, "publish_cancel_signals", fake_publish_cancel_signals)
     db = Db()
 
     result = await agent_run_service.cancel_agent_run_view(
@@ -1522,7 +1895,7 @@ async def test_cancel_agent_run_view_cascades_children(monkeypatch: pytest.Monke
 
     assert result["run"]["id"] == "parent-run"
     assert requested == ["parent-run", "child-1", "child-2"]
-    assert signals == [("parent-run", True), ("child-1", True), ("child-2", True)]
+    assert signals == [(["parent-run", "child-1", "child-2"], True)]
 
 
 @pytest.mark.asyncio
@@ -1589,7 +1962,6 @@ async def test_resolve_agent_run_model_spec_validates_configured_model(monkeypat
 def _patch_agent_run_creation(
     monkeypatch: pytest.MonkeyPatch,
     *,
-    agent_config_json: dict | None = None,
     message_id: int = 10,
     active_run: SimpleNamespace | None = None,
     active_run_after_rollback: SimpleNamespace | None = None,
@@ -1642,7 +2014,7 @@ def _patch_agent_run_creation(
                 slug=slug,
                 name="Default",
                 backend_id="ChatbotAgent",
-                config_json=agent_config_json or {"context": {}},
+                config_json={"context": {}},
                 is_subagent=is_subagent,
             )
 
@@ -1655,7 +2027,7 @@ def _patch_agent_run_creation(
     async def fake_get_arq_pool():
         return Queue()
 
-    monkeypatch.setattr(agent_run_service.agent_manager, "get_agent", lambda backend_id: _FakeBackend())
+    monkeypatch.setattr(agent_run_service, "get_agent_backend", lambda backend_id: _FakeBackend())
     monkeypatch.setattr(agent_run_service, "AgentRepository", AgentRepo)
     monkeypatch.setattr(agent_run_service, "ConversationRepository", ConvRepo)
     monkeypatch.setattr(agent_run_service, "AgentRunRepository", _CreateRunRepo)
@@ -1674,85 +2046,7 @@ def _patch_agent_run_creation(
 
 
 @pytest.mark.asyncio
-async def test_create_chat_run_persists_validated_model_spec(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(
-        agent_run_service.model_cache,
-        "get_model_info",
-        lambda spec: SimpleNamespace(model_type="chat"),
-    )
-    db = _patch_agent_run_creation(monkeypatch)
-
-    await agent_run_service.create_agent_run_view(
-        input_message=_chat_input("hello"),
-        agent_slug="default",
-        thread_id="thread-1",
-        meta={"request_id": "req-1"},
-        current_uid="user-1",
-        db=db,
-        model_spec="claude-x",
-    )
-
-    assert db.created_run_kwargs["input_payload"]["model_spec"] == "claude-x"
-
-
-@pytest.mark.asyncio
-async def test_create_chat_run_with_image_persists_multimodal_message_type(monkeypatch: pytest.MonkeyPatch):
-    db = _patch_agent_run_creation(monkeypatch)
-
-    await agent_run_service.create_agent_run_view(
-        input_message=_chat_input("看图", "base64-image"),
-        agent_slug="default",
-        thread_id="thread-1",
-        meta={"request_id": "req-1"},
-        current_uid="user-1",
-        db=db,
-    )
-
-    assert db.created_run_kwargs["input_payload"] == {
-        "model_spec": "agent-default-model",
-        "tool_approval_mode": "default",
-    }
-    assert db.added[0].message_type == "multimodal_image"
-    assert db.added[0].image_content == "base64-image"
-    raw_message = db.added[0].extra_metadata["raw_message"]
-    assert raw_message["type"] == "human"
-    assert raw_message["content"][0] == {"type": "text", "text": "看图"}
-    assert raw_message["content"][1]["image_url"]["url"] == "data:image/jpeg;base64,base64-image"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("configured_model", "expected_spec"),
-    [
-        ("agent-config-model", "agent-config-model"),
-        ("", "system-default:model"),
-    ],
-)
-async def test_create_chat_run_snapshots_model_spec_source(
-    monkeypatch: pytest.MonkeyPatch, configured_model: str, expected_spec: str
-):
-    db = _patch_agent_run_creation(
-        monkeypatch,
-        agent_config_json={"context": {"model": configured_model}},
-    )
-
-    await agent_run_service.create_agent_run_view(
-        input_message=_chat_input("hello"),
-        agent_slug="default",
-        thread_id="thread-1",
-        meta={"request_id": "req-1"},
-        current_uid="user-1",
-        db=db,
-        model_spec=None,
-    )
-
-    assert db.created_run_kwargs["input_payload"]["model_spec"] == expected_spec
-    assert "model_spec" not in db.added[0].extra_metadata
-
-
-@pytest.mark.asyncio
 async def test_create_resume_run_inherits_parent_model_spec(monkeypatch: pytest.MonkeyPatch):
-    # 即使 resume 入参传了别的模型，也必须沿用父运行的模型
     db = _patch_agent_run_creation(
         monkeypatch,
         parent_run=SimpleNamespace(
@@ -1763,14 +2057,12 @@ async def test_create_resume_run_inherits_parent_model_spec(monkeypatch: pytest.
         ),
     )
 
-    await agent_run_service.create_agent_run_view(
-        input_message=None,
+    await agent_run_service.create_resume_run_view(
         agent_slug="default",
         thread_id="thread-1",
         meta={"request_id": "resume-req"},
         current_uid="user-1",
         db=db,
-        model_spec="ignored-model",
         resume={"language": "python"},
         created_by_run_id="parent-run",
     )
@@ -1792,8 +2084,7 @@ async def test_create_resume_run_defaults_tool_approval_mode_for_legacy_parent(m
         ),
     )
 
-    await agent_run_service.create_agent_run_view(
-        input_message=None,
+    await agent_run_service.create_resume_run_view(
         agent_slug="default",
         thread_id="thread-1",
         meta={"request_id": "resume-req"},
@@ -1860,3 +2151,19 @@ def test_compact_stream_chunk_retains_status_and_field(field: str, chunk: dict):
 
     assert compact["status"] == chunk["status"]
     assert compact[field] == chunk[field]
+
+
+@pytest.mark.asyncio
+async def test_create_resume_run_rejects_missing_resume():
+    """恢复入口不接受缺失恢复内容的普通消息调用。"""
+    with pytest.raises(agent_run_service.HTTPException) as exc:
+        await agent_run_service.create_resume_run_view(
+            agent_slug="default",
+            thread_id="thread-1",
+            current_uid="user-1",
+            db=None,
+            meta={},
+            resume=None,
+        )
+    assert exc.value.status_code == 422
+    assert exc.value.detail == "resume 不能为空"

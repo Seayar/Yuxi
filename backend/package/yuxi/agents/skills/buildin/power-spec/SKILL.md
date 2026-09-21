@@ -2,6 +2,8 @@
 name: power-spec
 slug: power-spec
 description: "基于电力规范知识库检索现行规范条款，并展示规范卡片。"
+version: "2026.09.10"
+tool_dependencies: ["search_power_spec"]
 ---
 
 # 电力规范检索

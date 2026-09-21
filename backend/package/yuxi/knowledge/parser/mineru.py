@@ -12,16 +12,19 @@ from pathlib import Path
 import requests
 
 from yuxi.knowledge.parser.base import BaseDocumentProcessor, DocumentParserException
+from yuxi.knowledge.parser.capabilities import get_parser_capability
 from yuxi.knowledge.parser.zip_utils import process_zip_file_sync
 from yuxi.utils import logger
+
+_CAPABILITY = get_parser_capability("mineru_ocr")
 
 
 class MinerUParser(BaseDocumentProcessor):
     """MinerU 文档解析器 - 使用 HTTP API 进行文档理解和解析"""
 
-    service_name = "mineru_ocr"
-    display_name = "MinerU OCR"
-    supported_extensions = [".pdf", ".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"]
+    service_name = _CAPABILITY.service_name
+    display_name = _CAPABILITY.display_name
+    supported_extensions = list(_CAPABILITY.supported_extensions)
 
     def __init__(
         self,
@@ -213,7 +216,7 @@ class MinerUParser(BaseDocumentProcessor):
                             image_bucket=image_bucket,
                             image_prefix=image_prefix,
                         )
-                        text = processed["markdown_content"]
+                        text = processed
                     finally:
                         os.unlink(tmp_zip.name)
 

@@ -9,7 +9,6 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from yuxi import get_version
 from yuxi.config.options import invalidate_option_cache, system_options, update_option_value
-from yuxi.config.runtime import knowledge_capability_enabled
 from yuxi.services.readiness_service import get_readiness
 from yuxi.storage.postgres.models_business import User
 from yuxi.utils.logging_config import LOG_FILE, logger
@@ -45,13 +44,12 @@ async def readiness_check(request: Request):
 @system.get("/discovery")
 async def discovery():
     """系统能力发现接口（公开接口）"""
-    knowledge_enabled = knowledge_capability_enabled()
     return {
         "name": "Yuxi",
         "version": get_version(),
         "api_prefix": "/api",
         "capabilities": {
-            "features": {"knowledge": knowledge_enabled},
+            "features": {"knowledge": True},
             "cli": {
                 "min_cli_version": "0.1.0",
                 "browser_login": True,
@@ -59,12 +57,12 @@ async def discovery():
                 "remote_config": True,
                 "agent_list": True,
                 "agent_show": True,
-                "kb_upload": knowledge_enabled,
-                "kb_list": knowledge_enabled,
-                "kb_files": knowledge_enabled,
-                "kb_query": knowledge_enabled,
-                "kb_open": knowledge_enabled,
-                "kb_find": knowledge_enabled,
+                "kb_upload": True,
+                "kb_list": True,
+                "kb_files": True,
+                "kb_query": True,
+                "kb_open": True,
+                "kb_find": True,
             },
         },
         "endpoints": {
@@ -175,6 +173,8 @@ async def get_system_logs(levels: str | None = None, current_user: User = Depend
 
         log = "".join(lines)
         return {"log": log, "message": "success", "log_file": LOG_FILE, "scope": "api"}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"获取系统日志失败: {e}")
         raise HTTPException(status_code=500, detail=f"获取系统日志失败: {str(e)}")
@@ -219,6 +219,8 @@ async def get_info_config():
     try:
         config = await load_info_config()
         return {"success": True, "data": config}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"获取信息配置失败: {e}")
         raise HTTPException(status_code=500, detail="获取信息配置失败")
@@ -230,6 +232,8 @@ async def reload_info_config(current_user: User = Depends(get_admin_user)):
     try:
         config = await load_info_config()
         return {"success": True, "message": "配置重新加载成功", "data": config}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"重新加载信息配置失败: {e}")
         raise HTTPException(status_code=500, detail="重新加载信息配置失败")

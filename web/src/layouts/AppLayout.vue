@@ -22,7 +22,6 @@ import { useChatUIStore } from '@/stores/chatUI'
 import { useDatabaseStore } from '@/stores/database'
 import { useInfoStore } from '@/stores/info'
 import { useProjectsStore } from '@/stores/projects'
-import { useRuntimeCapabilitiesStore } from '@/stores/runtimeCapabilities'
 import { useTaskerStore } from '@/stores/tasker'
 import { useUserStore } from '@/stores/user'
 import { storeToRefs } from 'pinia'
@@ -41,11 +40,9 @@ const chatUIStore = useChatUIStore()
 const databaseStore = useDatabaseStore()
 const infoStore = useInfoStore()
 const projectsStore = useProjectsStore()
-const runtimeCapabilitiesStore = useRuntimeCapabilitiesStore()
 const taskerStore = useTaskerStore()
 const userStore = useUserStore()
 const { activeCount: activeCountRef, isDrawerOpen } = storeToRefs(taskerStore)
-const { knowledgeEnabled } = storeToRefs(runtimeCapabilitiesStore)
 const { projects, isLoading: projectsLoading, error: projectsError } = storeToRefs(projectsStore)
 const { threads, currentThreadId, hasMoreThreads, isLoadingMoreThreads, threadCreationInFlight } =
   storeToRefs(chatThreadsStore)
@@ -77,8 +74,6 @@ const getRemoteConfig = async () => {
 }
 
 const getRemoteDatabase = async () => {
-  await runtimeCapabilitiesStore.ensureLoaded()
-  if (!knowledgeEnabled.value) return
   try {
     await databaseStore.loadDatabases()
   } catch (error) {
@@ -111,12 +106,13 @@ const handleGlobalKeydown = (e) => {
   }
 }
 
-onMounted(async () => {
+onMounted(() => {
   window.addEventListener('keydown', handleGlobalKeydown)
-  // 加载信息配置与知识库数据无依赖，可并行
-  await Promise.all([infoStore.loadInfoConfig(), getRemoteDatabase()])
-  await initAgentNavigation()
-  await getRemoteConfig()
+  // 各 Store 自行处理错误，导航不等待无依赖的品牌、知识库或配置请求。
+  void infoStore.loadInfoConfig()
+  void getRemoteDatabase()
+  void initAgentNavigation()
+  void getRemoteConfig()
   // 仅管理员加载任务中心数据
   if (userStore.isAdmin) {
     taskerStore.loadTasks()
@@ -189,7 +185,7 @@ const mainList = computed(() => {
   })
 
   items.push({
-    name: knowledgeEnabled.value ? '知识库 · 技能' : '技能',
+    name: '知识库 · 技能',
     path: '/extensions',
     activePaths: ['/extensions'],
     icon: LibraryBig,
@@ -269,6 +265,12 @@ const handleSearchSelectThread = (thread) => {
 const handleCreateConversationFromSearch = () => {
   if (!chatThreadsStore.setCurrentThreadId(null)) return
   router.push({ name: 'AgentComp' })
+}
+
+const handleCreateProjectChat = async (projectId) => {
+  if (!projectId || projectPendingId.value || threadCreationInFlight.value) return
+  await router.push({ name: 'AgentComp', query: { project_id: projectId } })
+  chatThreadsStore.setCurrentThreadId(null)
 }
 
 const searchWorkspace = (query) => searchWorkspaceFiles(query)
@@ -463,8 +465,8 @@ provide('settingsModal', {
           :current-chat-id="activeConversationThreadId"
           :chats-list="threads"
           :projects="projects"
-          :projects-loading="projectsLoading"
-          :projects-error="projectsError"
+          :projects-loading="projectsLoading && !projectsStore.hasLoaded"
+          :projects-error="projectsStore.hasLoaded ? '' : projectsError"
           :project-pending-id="projectPendingId"
           :has-more-chats="hasMoreThreads"
           :is-loading-more="isLoadingMoreThreads"
@@ -474,6 +476,7 @@ provide('settingsModal', {
           @toggle-pin="handleTogglePinChat"
           @rename-project="handleRenameProject"
           @delete-project="handleDeleteProject"
+          @create-project-chat="handleCreateProjectChat"
           @retry-projects="loadProjects"
           @load-more-chats="() => chatThreadsStore.loadMoreThreads()"
         />
@@ -550,15 +553,15 @@ provide('settingsModal', {
 <style lang="less" scoped>
 // Less 变量定义
 @sidebar-width: 230px;
-@sidebar-collapsed-width: 56px;
+@sidebar-collapsed-width: 52px;
 @sidebar-padding-y: 6px;
 @sidebar-padding-x: 8px;
 @sidebar-padding: @sidebar-padding-y @sidebar-padding-x;
 @sidebar-border-width: 1px;
 @sidebar-item-height: 32px;
-@sidebar-item-padding-x: 10px;
+@sidebar-item-padding-x: 6px;
 @sidebar-icon-size: 16px;
-@brand-avatar-size: 28px;
+@brand-avatar-size: 24px;
 @sidebar-collapsed-content-width: @sidebar-collapsed-width - (2 * @sidebar-padding-x) -
   @sidebar-border-width;
 @sidebar-collapsed-icon-padding-x: (
@@ -597,7 +600,7 @@ div.header,
   flex: 0 0 @sidebar-width;
   justify-content: flex-start;
   align-items: stretch;
-  gap: 16px;
+  gap: 0;
   background-color: var(--main-5);
   height: 100%;
   width: @sidebar-width;
@@ -617,6 +620,7 @@ div.header,
     align-items: stretch;
     position: relative;
     gap: 2px;
+    margin-top: 12px;
   }
 
   .sidebar-conversations {
@@ -635,6 +639,13 @@ div.header,
   .fill {
     flex: 1 1 0;
     min-height: 0;
+  }
+
+  .foo {
+    position: relative;
+    z-index: 1;
+    flex: 0 0 auto;
+    background: var(--main-5);
   }
 
   .sidebar-brand {

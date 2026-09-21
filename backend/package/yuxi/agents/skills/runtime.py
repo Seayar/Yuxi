@@ -12,7 +12,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from yuxi.agents.backends.paths import VIRTUAL_PERSONAL_SKILLS_PATH, VIRTUAL_SKILLS_PATH
 from yuxi.agents.skills.service import list_accessible_skills, normalize_string_list
 from yuxi.agents.toolkits import get_all_tool_instances
-from yuxi.config.runtime import lite_mode_enabled
 from yuxi.storage.postgres.models_business import User
 from yuxi.utils.logging_config import logger
 from yuxi.utils.paths import open_regular_file_fd
@@ -27,15 +26,6 @@ class RuntimeSkill(TypedDict):
     tools: list[str]
     mcps: list[str]
     skills: list[str]
-
-
-_LITE_DISABLED_SKILL_SLUGS = frozenset({"knowledge-base"})
-
-
-def is_skill_allowed_in_runtime_mode(slug: str) -> bool:
-    """判断 Skill 是否属于当前部署模式允许的运行时能力。"""
-
-    return not (lite_mode_enabled() and slug in _LITE_DISABLED_SKILL_SLUGS)
 
 
 def build_runtime_skills(skills: list) -> dict[str, RuntimeSkill]:
@@ -101,11 +91,7 @@ async def resolve_runtime_skills_for_context(
     user: User,
 ) -> dict:
     """从已授权 Skill 派生当前 Agent Run 的运行时 scope 与预加载快照。"""
-    skill_items = [
-        item
-        for item in await list_accessible_skills(db, user)
-        if item.slug and is_skill_allowed_in_runtime_mode(item.slug)
-    ]
+    skill_items = [item for item in await list_accessible_skills(db, user) if item.slug]
     runtime_skills = build_runtime_skills(skill_items)
     available = set(runtime_skills)
     selected = normalize_string_list(getattr(context, "skills", None))
@@ -125,7 +111,14 @@ async def resolve_runtime_skills_for_context(
         "context_preload_skills": context_preload_skills,
         "effective_skills": effective_skills,
         "runtime_skills": runtime_skills,
-        "runtime_skill_source_scopes": {slug: items_by_slug[slug].source_scope for slug in effective_skills},
+        "skill_metadata": {
+            slug: {
+                "source_scope": items_by_slug[slug].source_scope,
+                "version": items_by_slug[slug].version,
+                "content_hash": items_by_slug[slug].content_hash,
+            }
+            for slug in effective_skills
+        },
         "preloaded_skills": preloaded_skills,
         "preloaded_skill_contents": preloaded_contents,
     }
@@ -153,8 +146,8 @@ def _read_preloaded_skill_contents(slugs: list[str], skill_items: dict[str, Any]
 
 def resolve_skill_gated_tools(context) -> list:
     """解析所有可见 Skill 依赖且需注册到 ToolNode 的本地工具。"""
-    runtime_skills = getattr(context, "_runtime_skills", {}) or {}
-    effective_skills = getattr(context, "_effective_skill_slugs", []) or []
+    runtime_skills = getattr(context, "_skill_runtime_snapshot", {}).get("runtime_skills", {}) or {}
+    effective_skills = getattr(context, "_skill_runtime_snapshot", {}).get("effective_skills", []) or []
     tool_names: set[str] = set()
     for slug in effective_skills:
         node = runtime_skills.get(slug) or {}

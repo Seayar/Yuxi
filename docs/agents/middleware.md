@@ -25,8 +25,8 @@
 | 2 | `create_agent_filesystem_middleware` | 提供 Workdir、User Data、Skills 文件后端，并卸载过大的工具结果 |
 | 3 | `SkillsMiddleware` | 注入 Skill 说明，按激活状态开放依赖 |
 | 4 | `YuxiMemoryMiddleware` | Memory 开关开启且 `MEMORY.md` 有内容时，注入用户记忆并提供受限工具 |
-| 5 | `YuxiSubAgentMiddleware` | 主智能体有可见子智能体时提供 `task` 和生命周期工具 |
-| 6 | `YuxiSummarizationMiddleware` | 在上下文过大时执行 L1/L2 压缩 |
+| 5 | `YuxiSubAgentMiddleware` | 主智能体有可见子智能体时提供子智能体生命周期工具 |
+| 6 | `YuxiSummarizationMiddleware` | 先确定性压缩工具结果，仍达到同一阈值时生成摘要 |
 | 7 | `TodoListMiddleware` | 保存待办，供状态面板展示 |
 | 8 | `PatchToolCallsMiddleware` | 修正部分工具调用消息形态 |
 | 9 | `ModelRetryMiddleware` | 按配置重试模型调用失败 |
@@ -50,13 +50,13 @@ Skills middleware 将 Skill 说明按模型请求注入：预加载 Skill 从首
 
 ## 子智能体
 
-主智能体配置了可见子智能体时，middleware 提供 `task`、`subagent_start`、`subagent_status`、`subagent_cancel` 和 `subagent_await`。同步 `task` 会等待结果；异步工具按 `run_id` 查询和控制子 Run。子智能体使用自己的 Context 和 checkpoint，但继承发起用户的权限、Workdir 和 execution runtime。
+主智能体配置了可见子智能体时，middleware 提供 `subagent_start`、`subagent_status`、`subagent_cancel` 和 `subagent_await`。`subagent_start` 立即返回子 Run 身份，`subagent_await` 按需等待；查询和取消均按 `run_id` 执行。子智能体使用自己的 Context 和 checkpoint，但继承发起用户的权限、Workdir 和 execution runtime。
 
 详细的调用、busy、结果和文件边界见[子智能体](./subagents-management.md)。
 
 ## Summary 上下文压缩
 
-Summary 在文件和 Skills 等中间件之后运行：L1 只为当前模型请求精简消息并卸载长工具结果，L2 才写入历史文件、生成摘要并更新 checkpoint。它不会删除 PostgreSQL 聊天消息，也不会把内部摘要模型调用当作用户可见回复。
+Summary 在文件和 Skills 等中间件之后运行。请求达到唯一压力阈值后，它先为当前模型请求精简工具结果并重新计量；仍达到同一阈值时才写入历史文件、生成摘要并更新 checkpoint。它不会删除 PostgreSQL 聊天消息，也不会把内部摘要模型调用当作用户可见回复。支持主动压缩的 Agent 复用同一摘要器，并通过 service 在空闲线程的 canonical graph state 上更新 checkpoint。
 
 参数和状态细节见[上下文压缩机制](../mechanisms/context-compression.md)。
 

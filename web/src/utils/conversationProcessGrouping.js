@@ -1,12 +1,48 @@
-export const formatProcessDuration = (durationMs) => {
-  if (!durationMs) return '处理过程'
-  const totalSeconds = Math.max(0, Math.round(durationMs / 1000))
-  const minutes = Math.floor(totalSeconds / 60)
-  const seconds = totalSeconds % 60
-  return `耗时${minutes}分钟${seconds}秒`
+import { formatRunTimingDuration, getRunTotalLatencyMs } from './runTiming.js'
+
+/** 在展示层连接具有明确父子关系的相邻续跑。 */
+export const groupConversationContinuations = (conversations) => {
+  const groups = []
+  for (const conv of conversations) {
+    const previous = groups.at(-1)
+    if (
+      conv.run?.run_type !== 'resume' ||
+      !previous?.run?.run_id ||
+      conv.run.created_by_run_id !== previous.run.run_id ||
+      !previous.messages.length ||
+      !conv.messages.length ||
+      conv.messages.some((message) => message.type === 'human')
+    ) {
+      groups.push(conv)
+      continue
+    }
+
+    const previousDuration = getRunTotalLatencyMs(previous.processTiming || previous.run.timing)
+    const duration = getRunTotalLatencyMs(conv.run.timing)
+    groups[groups.length - 1] = {
+      ...conv,
+      displayKey: previous.displayKey || previous.run.run_id,
+      messages: [
+        ...previous.messages.map((message) =>
+          message.isLast ? { ...message, isLast: false } : message
+        ),
+        ...conv.messages
+      ],
+      processTiming: {
+        total_latency_ms:
+          previousDuration === null || duration === null ? null : previousDuration + duration
+      }
+    }
+  }
+  return groups
 }
 
-export const collapseConversationProcess = (items, enabled = false) => {
+export const formatProcessDuration = (durationMs) => {
+  const formattedDuration = formatRunTimingDuration(durationMs)
+  return formattedDuration ? `耗时 ${formattedDuration}` : '处理过程'
+}
+
+export const collapseConversationProcess = (items, enabled = false, runTiming = null) => {
   if (!enabled) return items
 
   const finalIndex = items.findLastIndex(
@@ -33,13 +69,7 @@ export const collapseConversationProcess = (items, enabled = false) => {
   )
   if (!messageCount && !toolCallCount) return items
 
-  const finalMessage = items[finalIndex].message
-  const startedAt = Date.parse(finalMessage?.run_started_at || '')
-  const finishedAt = Date.parse(finalMessage?.run_finished_at || finalMessage?.created_at || '')
-  const durationMs =
-    Number.isFinite(startedAt) && Number.isFinite(finishedAt) && finishedAt > startedAt
-      ? finishedAt - startedAt
-      : 0
+  const durationMs = getRunTotalLatencyMs(runTiming)
 
   return [
     ...items.slice(0, processStart),
@@ -54,3 +84,26 @@ export const collapseConversationProcess = (items, enabled = false) => {
     items[finalIndex]
   ]
 }
+
+/** 只有关联到本次运行的后续 resume 才延后当前回答的操作栏。 */
+export const isConversationSettled = (conversations, conv, isProcessing = false) => {
+  const index = conversations.indexOf(conv)
+  if (index === -1) return false
+  const next = conversations[index + 1]
+  if (next?.run) {
+    return !(next.run.run_type === 'resume' && next.run.created_by_run_id === conv.run?.run_id)
+  }
+  if (next) return next.messages?.[0]?.type === 'human'
+  return !isProcessing
+}
+
+/** 为没有普通消息的 Run 提供可观察状态。 */
+export const formatEmptyRunStatus = (status) => ({
+  pending: '等待运行',
+  running: '正在处理',
+  cancel_requested: '正在取消',
+  cancelled: '本次运行已取消',
+  failed: '本次运行失败',
+  interrupted: '本次运行已中断',
+  completed: '本次运行已结束'
+})[status] || '暂无消息'

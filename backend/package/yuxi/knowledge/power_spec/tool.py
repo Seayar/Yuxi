@@ -9,7 +9,6 @@ from pydantic import BaseModel, Field
 
 from yuxi.agents.backends.knowledge_base_backend import resolve_visible_knowledge_bases_for_context
 from yuxi.agents.toolkits.registry import tool
-from yuxi.config.runtime import knowledge_capability_enabled
 from yuxi.knowledge.power_spec.answer import build_subagent_caller, produce_power_spec_answer
 from yuxi.knowledge.power_spec.contracts import PowerSpecQuery
 from yuxi.knowledge.power_spec.ingestion import is_power_spec_metadata_ready
@@ -77,8 +76,6 @@ async def search_power_spec(
 ) -> dict[str, Any] | str:
     """检索现行电力规范并返回可验证的条款证据。"""
 
-    if not knowledge_capability_enabled():
-        return "当前运行模式未启用知识库能力"
     if not query_text.strip():
         return "请提供查询内容"
 

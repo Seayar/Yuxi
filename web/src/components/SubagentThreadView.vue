@@ -5,10 +5,14 @@
         <div v-if="loading && !hasRenderableMessages" class="subagent-thread-state">
           正在加载子智能体消息...
         </div>
-        <div v-else-if="error" class="subagent-thread-state is-error">{{ error }}</div>
+        <div v-if="error" class="subagent-thread-state is-error" role="alert">
+          {{ error }}
+          <button type="button" :disabled="loading" @click="loadThread">重试</button>
+        </div>
         <ThreadMessageList
-          v-else
+          v-if="hasRenderableMessages || (!loading && !error)"
           :messages="displayMessages"
+          :runs="runs"
           :ongoing-messages="streamedMessages"
           :is-processing="streamActive"
         />
@@ -20,7 +24,8 @@
 <script setup>
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { agentApi } from '@/apis'
-import { processRunSseResponse } from '@/composables/useAgentRunStream'
+import { dispatchRunEventChunks, processRunSseResponse } from '@/composables/useAgentRunStream'
+import { getMessageRunId } from '@/utils/messageDebug'
 import { useAgentStreamHandler } from '@/composables/useAgentStreamHandler'
 import { useStreamSmoother } from '@/composables/useStreamSmoother'
 import ThreadMessageList from '@/components/ThreadMessageList.vue'
@@ -29,6 +34,7 @@ import ScrollController from '@/utils/scrollController'
 
 const props = defineProps({
   threadId: { type: String, required: true },
+  runId: { type: String, default: '' },
   active: { type: Boolean, default: false }
 })
 
@@ -36,6 +42,7 @@ const RUN_TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled', 'inte
 const loading = ref(false)
 const error = ref('')
 const messages = ref([])
+const runs = ref([])
 const currentRunId = ref('')
 const currentRunStatus = ref('')
 const streamActive = ref(false)
@@ -47,6 +54,7 @@ let streamAbortController = null
 let resizeObserver = null
 let reconnectTimer = null
 let loadVersion = 0
+let loadAbortController = null
 let disposed = false
 
 const normalizeRunStatus = (status) => String(status || '').trim()
@@ -132,49 +140,55 @@ const scrollToBottom = async (force = false) => {
   if (force) await scrollController.scrollToBottomStaticForce()
   else await scrollController.scrollToBottom()
 }
-const loadPersistedMessages = async () => {
-  const response = await agentApi.getAgentHistory(props.threadId)
-  messages.value = normalizeMessages(response.history || [])
-}
-const getMessageRunId = (message) => {
-  const runId = message?.extra_metadata?.run_id || message?.run_id
-  return typeof runId === 'string' ? runId : ''
-}
 const loadThread = async () => {
-  if (!props.threadId) return
+  if (!props.threadId || !props.active || disposed) return
   const version = ++loadVersion
+  loadAbortController?.abort()
+  const controller = new AbortController()
+  loadAbortController = controller
+  const isCurrent = () => !disposed && props.active && version === loadVersion
   loading.value = true
   error.value = ''
   try {
-    const response = await agentApi.getAgentState(props.threadId, { includeMessages: true })
-    if (disposed || version !== loadVersion) return
-    currentRunId.value = response?.subagent_run?.run_id ? String(response.subagent_run.run_id) : ''
-    currentRunStatus.value = normalizeRunStatus(response?.subagent_run?.status)
-
+    // 已知 Run 时无需加载 checkpoint；历史接口本身包含线程的 Run 列表。
+    const history = await agentApi.getAgentHistory(props.threadId, { signal: controller.signal })
+    if (!isCurrent()) return
+    const threadRuns = history.runs || []
+    const selectedRun = props.runId
+      ? threadRuns.find((run) => run.run_id === props.runId)
+      : threadRuns.at(-1)
+    const run =
+      props.runId && !selectedRun
+        ? (await agentApi.getAgentRun(props.runId, { signal: controller.signal })).run
+        : selectedRun
+    if (!isCurrent()) return
+    currentRunId.value = run?.run_id || run?.id || props.runId || ''
+    currentRunStatus.value = normalizeRunStatus(run?.status)
+    runs.value = props.runId ? threadRuns.filter((item) => item.run_id === props.runId) : threadRuns
+    messages.value = normalizeMessages(history.history || []).filter(
+      (message) => !props.runId || getMessageRunId(message) === props.runId
+    )
     if (!currentRunId.value || isTerminalRunStatus(currentRunStatus.value)) {
       stopRunStream()
       resetStreamState()
-      await loadPersistedMessages()
-      if (disposed || version !== loadVersion) return
     } else {
-      await loadPersistedMessages()
-      if (disposed || version !== loadVersion) return
       messages.value = messages.value.filter(
         (message) => getMessageRunId(message) !== currentRunId.value
       )
-      lastEventId.value = '0-0'
-      void startRunStream(currentRunId.value, lastEventId.value, true)
+      void startRunStream(currentRunId.value, lastEventId.value, false)
     }
     await scrollToBottom(true)
   } catch (loadError) {
-    error.value = '加载子智能体消息失败'
-    console.error('Failed to load subagent thread messages:', loadError)
+    if (!isCurrent() || loadError?.name === 'AbortError') return
+    const status = loadError?.response?.status || loadError?.status
+    error.value =
+      status === 404 ? '子智能体记录不存在或已无权访问。' : '暂时无法加载子智能体消息，请重试。'
   } finally {
-    loading.value = false
+    if (isCurrent()) loading.value = false
   }
 }
 const scheduleReconnect = (runId) => {
-  if (disposed || reconnectTimer) return
+  if (disposed || !props.active || reconnectTimer) return
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null
     void startRunStream(runId, lastEventId.value, false)
@@ -182,7 +196,7 @@ const scheduleReconnect = (runId) => {
 }
 const startRunStream = async (runId, afterSeq = '0-0', resetMessages = false) => {
   stopRunStream()
-  if (disposed || !runId) return
+  if (disposed || !props.active || !runId) return
   if (resetMessages) resetStreamState()
   const controller = new AbortController()
   streamAbortController = controller
@@ -195,35 +209,20 @@ const startRunStream = async (runId, afterSeq = '0-0', resetMessages = false) =>
     })
     if (!response.ok) throw new Error(`SSE response not ok: ${response.status}`)
     await processRunSseResponse(response, (event, data, eventId) => {
-      if (!data) return
+      if (controller.signal.aborted || !props.active || !data) return
       if (eventId) lastEventId.value = String(eventId)
       const payload = data.payload || {}
       const isRetryableError =
         event === 'error' && (payload.retryable === true || payload.chunk?.retryable === true)
       if (isRetryableError) return
-      const chunks = Array.isArray(payload.items)
-        ? payload.items
-        : payload.chunk
-          ? [payload.chunk]
-          : []
-      chunks.forEach((chunk) => {
-        const threadId =
-          data.thread_id ||
-          payload.thread_id ||
-          chunk.thread_id ||
-          chunk.meta?.thread_id ||
-          chunk.metadata?.thread_id ||
-          props.threadId
-        if (threadId !== props.threadId) return
-        handleStreamChunk(
-          {
-            ...chunk,
-            request_id: chunk.request_id || data.request_id,
-            run_id: chunk.run_id || data.run_id || runId,
-            thread_id: threadId
-          },
-          threadId
-        )
+      dispatchRunEventChunks({
+        data,
+        runId,
+        fallbackThreadId: props.threadId,
+        onChunk: (chunk, threadId) => {
+          if (threadId !== props.threadId) return
+          handleStreamChunk(chunk, threadId)
+        }
       })
       if (event === 'end') streamActive.value = false
     })
@@ -232,29 +231,41 @@ const startRunStream = async (runId, afterSeq = '0-0', resetMessages = false) =>
       console.error('Failed to stream subagent run messages:', streamError)
     }
   } finally {
-    if (streamAbortController === controller) streamAbortController = null
-    streamActive.value = false
-    if (!controller.signal.aborted && !disposed) {
+    if (streamAbortController === controller) streamActive.value = false
+    if (!controller.signal.aborted && !disposed && props.active) {
       streamSmoother.flushThread(props.threadId)
       try {
-        const runResponse = await agentApi.getAgentRun(runId)
-        if (!disposed) {
+        const runResponse = await agentApi.getAgentRun(runId, { signal: controller.signal })
+        if (!disposed && !controller.signal.aborted && props.active) {
           const status = normalizeRunStatus(runResponse?.run?.status)
           if (isTerminalRunStatus(status)) await loadThread()
           else scheduleReconnect(runId)
         }
       } catch {
-        scheduleReconnect(runId)
+        if (!controller.signal.aborted) scheduleReconnect(runId)
       }
     }
+    if (streamAbortController === controller) streamAbortController = null
   }
 }
 
-watch(() => props.threadId, loadThread)
+watch([() => props.threadId, () => props.runId], () => {
+  stopRunStream()
+  resetStreamState()
+  lastEventId.value = '0-0'
+  messages.value = []
+  loadThread()
+})
 watch(
   () => props.active,
   (active) => {
-    if (active) scrollToBottom(true)
+    if (active) loadThread()
+    else {
+      loadVersion += 1
+      loadAbortController?.abort()
+      stopRunStream()
+      streamSmoother.flushThread(props.threadId)
+    }
   }
 )
 watch(streamedMessages, () => scrollToBottom(), { deep: true, flush: 'post' })
@@ -269,6 +280,7 @@ onMounted(() => {
 onUnmounted(() => {
   disposed = true
   loadVersion += 1
+  loadAbortController?.abort()
   stopRunStream()
   resetStreamState()
   resizeObserver?.disconnect()
