@@ -1,3 +1,4 @@
+import os
 from typing import Any
 
 from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
@@ -35,6 +36,9 @@ _SUBAGENT_DISABLED_TOOLS = frozenset({"present_artifacts", "ask_user_question", 
 # 默认审批模式额外隐藏敏感 backend 工具，避免子智能体绕过主线程逐项审批。
 _SUBAGENT_DISABLED_TOOLS_DEFAULT_MODE = _SUBAGENT_DISABLED_TOOLS | SENSITIVE_BACKEND_TOOLS
 
+# 子智能体承担短程整理、核验与检索任务，关闭思考可显著降低端到端延迟。
+SUBAGENT_DISABLE_THINKING = os.getenv("SUBAGENT_DISABLE_THINKING", "true").strip().lower() not in {"0", "false", "no"}
+
 
 def _tool_name(tool) -> str | None:
     if isinstance(tool, dict):
@@ -49,6 +53,12 @@ def _disabled_tools_for(mode: str) -> frozenset[str]:
     if mode == "always_trust":
         return _SUBAGENT_DISABLED_TOOLS
     return _SUBAGENT_DISABLED_TOOLS_DEFAULT_MODE
+
+
+def _load_subagent_model(model_spec: str):
+    """构造子智能体模型实例；子任务不需要长推理，统一关闭思考以降低端到端延迟。"""
+
+    return load_chat_model(fully_specified_name=model_spec, disable_thinking=SUBAGENT_DISABLE_THINKING)
 
 
 def _filter_disabled_tools(tools, disabled_tools: frozenset[str]):
@@ -80,7 +90,7 @@ async def _build_middlewares(context, backend, tool_approval_mode: str):
     summary_l2_trigger_ratio = getattr(context, "summary_l2_trigger_ratio", DEFAULT_SUMMARY_L2_TRIGGER_RATIO)
     model_spec = resolve_chat_model_spec(context.model)
     summary_middleware = create_summary_middleware(
-        model=load_chat_model(fully_specified_name=model_spec),
+        model=_load_subagent_model(model_spec),
         backend=backend,
         trigger=("tokens", summary_trigger_tokens),
         keep=("messages", summary_keep_messages),
@@ -146,7 +156,7 @@ class SubAgentBackend(BaseAgent):
         backend = create_agent_composite_backend(context)
 
         return create_agent(
-            model=load_chat_model(fully_specified_name=model_spec),
+            model=_load_subagent_model(model_spec),
             tools=_filter_disabled_tools(await resolve_configured_runtime_tools(context), disabled_tools),
             system_prompt=build_prompt_with_context(context),
             middleware=await _build_middlewares(context, backend, tool_approval_mode),

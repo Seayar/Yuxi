@@ -24,7 +24,11 @@ def _context(summary_threshold: int = 123) -> SimpleNamespace:
 
 
 def _patch_common_graph_deps(monkeypatch: pytest.MonkeyPatch, graph_module, captured: dict) -> None:
-    monkeypatch.setattr(graph_module, "load_chat_model", lambda fully_specified_name: object())
+    def fake_load_chat_model(fully_specified_name, **kwargs):
+        captured.setdefault("load_kwargs", []).append(kwargs)
+        return object()
+
+    monkeypatch.setattr(graph_module, "load_chat_model", fake_load_chat_model)
     monkeypatch.setattr(graph_module, "create_agent_filesystem_middleware", lambda *_args, **_kwargs: object())
 
     def create_summary_middleware(**kwargs):
@@ -62,3 +66,31 @@ async def test_summary_trim_limit_matches_summary_threshold(
     assert captured["summary_kwargs"]["l1_l2_trigger_ratio"] == 0.75
     middleware_names = [type(middleware).__name__ for middleware in middlewares]
     assert middleware_names.index("ModelRetryMiddleware") < middleware_names.index("ImageInputCompatibilityMiddleware")
+
+
+@pytest.mark.parametrize(
+    ("graph_module", "build_args", "expect_disable_thinking"),
+    [
+        (chatbot_graph, (object(),), False),
+        (subagent_graph, (object(), "default"), True),
+    ],
+)
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_subagent_model_disables_thinking(
+    monkeypatch: pytest.MonkeyPatch, graph_module, build_args, expect_disable_thinking: bool
+) -> None:
+    """子智能体模型关闭思考；主聊天模型保持供应商默认。"""
+
+    captured: dict = {}
+    _patch_common_graph_deps(monkeypatch, graph_module, captured)
+
+    async def no_subagent_middleware(_context):
+        return None
+
+    if graph_module is chatbot_graph:
+        monkeypatch.setattr(graph_module, "create_subagent_task_middleware", no_subagent_middleware)
+
+    await graph_module._build_middlewares(_context(), *build_args)
+
+    assert captured["load_kwargs"][0].get("disable_thinking", False) is expect_disable_thinking

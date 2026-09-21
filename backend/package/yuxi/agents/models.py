@@ -6,6 +6,9 @@ from yuxi.models.providers.cache import model_cache
 from yuxi.utils import get_docker_safe_url
 from yuxi.utils.logging_config import logger
 
+# 与 load_chat_model 的供应商分支一致：这两类不走 OpenAI 兼容的 extra_body。
+_NON_OPENAI_COMPATIBLE_PROVIDER_TYPES = frozenset({"anthropic", "gemini"})
+
 
 def resolve_chat_model_spec(model_spec: str | None, *, fallback: str | None = None) -> str:
     """解析空模型配置，不吞掉已经配置但无效的模型值。
@@ -19,7 +22,18 @@ def resolve_chat_model_spec(model_spec: str | None, *, fallback: str | None = No
     raise ValueError("model spec 不能为空")
 
 
-def load_chat_model(fully_specified_name: str | None, **kwargs) -> BaseChatModel:
+def load_chat_model(
+    fully_specified_name: str | None,
+    *,
+    disable_thinking: bool = False,
+    **kwargs,
+) -> BaseChatModel:
+    """加载对话模型。
+
+    `disable_thinking` 只作用于 OpenAI 兼容供应商，用于给不需要长推理的调用方
+    （如子智能体）降低延迟；该推理服务只识别 chat_template_kwargs.enable_thinking。
+    """
+
     fully_specified_name = resolve_chat_model_spec(fully_specified_name)
 
     info = model_cache.get_model_info(fully_specified_name)
@@ -36,9 +50,14 @@ def load_chat_model(fully_specified_name: str | None, **kwargs) -> BaseChatModel
 
     api_key = info.api_key
     base_url = get_docker_safe_url(info.base_url)
-    if info.request_body_overrides:
+    request_body_overrides = dict(info.request_body_overrides or {})
+    if disable_thinking and info.provider_type not in _NON_OPENAI_COMPATIBLE_PROVIDER_TYPES:
+        chat_template_kwargs = dict(request_body_overrides.get("chat_template_kwargs") or {})
+        chat_template_kwargs["enable_thinking"] = False
+        request_body_overrides["chat_template_kwargs"] = chat_template_kwargs
+    if request_body_overrides:
         extra_body = dict(kwargs.get("extra_body") or {})
-        extra_body.update(info.request_body_overrides)
+        extra_body.update(request_body_overrides)
         kwargs = {**kwargs, "extra_body": extra_body}
 
     metadata = dict(kwargs.pop("metadata", {}) or {})

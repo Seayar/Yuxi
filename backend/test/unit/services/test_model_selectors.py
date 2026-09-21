@@ -260,6 +260,63 @@ def test_load_chat_model_merges_request_body_overrides_into_extra_body(monkeypat
     assert captured_body["thinking_budget"] == 1024
 
 
+def test_load_chat_model_disable_thinking_sends_chat_template_kwargs(monkeypatch):
+    captured_body = {}
+
+    monkeypatch.setattr(
+        "yuxi.agents.models.model_cache.get_model_info",
+        lambda spec: (
+            _chat_model_info("local", "Qwen3.6-35B-A3B-w8a8") if spec == "local:Qwen3.6-35B-A3B-w8a8" else None
+        ),
+    )
+
+    def capture_request(request: httpx.Request) -> httpx.Response:
+        captured_body.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "Qwen3.6-35B-A3B-w8a8",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(capture_request)) as http_client:
+        model = load_chat_model("local:Qwen3.6-35B-A3B-w8a8", disable_thinking=True, http_client=http_client)
+        response = model.invoke("hello")
+
+    assert response.content == "ok"
+    # 该推理服务只识别 chat_template_kwargs.enable_thinking，顶层 enable_thinking 会被忽略。
+    assert captured_body["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def test_load_chat_model_disable_thinking_skips_non_openai_compatible(monkeypatch):
+    from langchain_anthropic import ChatAnthropic
+
+    monkeypatch.setattr(
+        "yuxi.agents.models.model_cache.get_model_info",
+        lambda spec: (
+            _chat_model_info("anthropic", "claude-sonnet-4", provider_type="anthropic")
+            if spec == "anthropic:claude-sonnet-4"
+            else None
+        ),
+    )
+
+    # Anthropic 不接受 OpenAI 兼容的 extra_body；构造成功即证明未向其注入该参数。
+    model = load_chat_model("anthropic:claude-sonnet-4", disable_thinking=True)
+
+    assert isinstance(model, ChatAnthropic)
+
+
 @pytest.mark.asyncio
 async def test_langchain_chat_adapter_preserves_call_response_contract():
     from langchain_core.messages import AIMessage
