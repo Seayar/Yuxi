@@ -158,6 +158,7 @@ async def test_ocr_options_and_config_options_permissions(
         "mineru_official_api_opts",
         "pp_structure_v3_ocr_host_opts",
         "paddleocr_api_opts",
+        "speech_recognition_opts",
         "remote_skill_source_policy",
     }
     assert all("deepseek" not in item["key"] for item in configs)

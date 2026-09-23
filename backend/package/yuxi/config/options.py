@@ -206,6 +206,40 @@ paddleocr_api_opts = Option(
     },
 )
 
+speech_recognition_opts = Option(
+    key="speech_recognition_opts",
+    name="语音识别服务",
+    description="配置自托管 vLLM 的语音识别（ASR）服务，供 /api/speech/transcriptions 使用。",
+    params={
+        "fields": [
+            {
+                "key": "server_url",
+                "label": "服务地址",
+                "type": "url",
+                "environment": "SPEECH_ASR_BASE_URL",
+                "placeholder": "http://host.docker.internal:8004",
+                "help": "vLLM OpenAI 兼容服务地址，留空时读取 SPEECH_ASR_BASE_URL。",
+            },
+            {
+                "key": "model",
+                "label": "模型名称",
+                "type": "string",
+                "environment": "SPEECH_ASR_MODEL",
+                "placeholder": "Qwen3-ASR-1.7B",
+                "help": "vLLM 启动参数 --served-model-name 的值，留空时读取 SPEECH_ASR_MODEL。",
+            },
+            {
+                "key": "api_key",
+                "label": "API Key",
+                "type": "password",
+                "environment": "SPEECH_ASR_API_KEY",
+                "sensitive": True,
+                "help": "服务未启用鉴权时留空；留空时读取 SPEECH_ASR_API_KEY。",
+            },
+        ]
+    },
+)
+
 remote_skill_source_policy = Option(
     key="remote_skill_source_policy",
     name="远程 Skill 来源",
@@ -230,6 +264,7 @@ OPTION_DEFINITIONS = {
         mineru_official_api_opts,
         pp_structure_v3_ocr_host_opts,
         paddleocr_api_opts,
+        speech_recognition_opts,
         remote_skill_source_policy,
         system_options,
     )

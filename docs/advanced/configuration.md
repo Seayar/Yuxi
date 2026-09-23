@@ -35,6 +35,7 @@ docker compose up -d --force-recreate api worker
 
 - 模型供应商、聊天模型、嵌入模型和重排模型的配置见[模型配置](../intro/model-config.md)。
 - OCR 引擎和各服务凭证的配置见[文档处理与 OCR](./document-processing.md)。
+- 语音识别的服务地址与模型见[语音识别](./speech-interaction.md)。
 - 沙盒应用层与 provisioner 的配置见[沙盒配置与运维](../agents/sandbox-architecture.md)。
 
 ## Agent 并发容量
