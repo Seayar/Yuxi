@@ -19,7 +19,7 @@ Owner：new-web/docker-compose.yml
 - 静态文件放在 `new-web/dist/`（已被 `.gitignore` 的 `dist` 规则忽略，不进入版本控制）。
 - 站点配置 `new-web/nginx.conf` 与主仓库 `docker/nginx/default.conf` 保持同一套反代语义（`proxy_buffering off` 以支持 SSE，`client_max_body_size 20M`）。
 - 独立 `new-web/docker-compose.yml` 通过 `external` 网络接入 `yuxi_app-network`，因此可独立启停、不依赖主 compose 启动顺序，也不把新服务写进会被上游合并频繁改动的根 compose。
-- 对外端口取 8080（`YUXI_NEW_WEB_PORT` 可覆盖）。
+- **HTTPS**：可信入口为 443，自签证书（`new-web/certs/`，gitignored，SAN 覆盖 `192.168.138.10`/`127.0.0.1`/`localhost`）；HTTP `8080`（`YUXI_NEW_WEB_PORT`）保留并 301 重定向到 443（面向浏览器入口；仍以 `http://…:8080/api` 为 base 的调用方跟随重定向会降级为 GET，API 已同源走 HTTPS，可接受）。nginx 终止 TLS 后仍以 `http://api:5050` 反代，前端 `location.origin` 即 `https://<host>`，同源语义不变。
 
 ## 替代方案
 
@@ -33,14 +33,23 @@ Owner：new-web/docker-compose.yml
 - 该服务与主 compose 只在网络层耦合：`api` / `minio` 服务名是它解析依赖的契约，重命名主 compose 服务会破坏反代。
 - 后端每 20MB 以上的上传（`client_max_body_size`）会被 nginx 拒绝；与上游生产配置一致。
 - 前端静态资源无版本前缀失效策略，替换 `dist/` 后浏览器可能命中旧缓存。
+- **自签证书**：浏览器首次访问会报证书不受信任，需在各客户端导入 `new-web/certs/server.crt` 或手动信任；证书有效期到 2027-11-10，到期前需重新签发并替换 `new-web/certs/`（无需重建镜像，nginx 直接读挂载目录）。内网无公网域名，未采用 Let's Encrypt。`new-web/certs/` 是未跟踪目录，部署前必须先按下面命令生成（缺失时 nginx 报 `cannot load certificate` 并 crash-loop）：
+```bash
+mkdir -p new-web/certs
+openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 397 \
+  -keyout new-web/certs/server.key -out new-web/certs/server.crt \
+  -subj "/CN=192.168.138.10" \
+  -addext "subjectAltName=IP:192.168.138.10,IP:127.0.0.1,DNS:localhost"
+chmod 600 new-web/certs/server.key
+```
 
 ## 验证
 
-部署后实测（2026-10-09）：
+实测（2026-10-09）：
 
-- `GET http://127.0.0.1:8080/` → 200 `text/html`；`/assets/js/app-DQpUYnPz.js` → 200 `application/javascript`；`/assets/styles/index-CCzCl5QG.css` → 200 `text/css`。
-- SPA 深链 `GET /power-search` → 200 `text/html`（`try_files` 回退 `index.html`）。
-- 反代：`GET /api/system/health` → 200 `{"status":"ok",...,"version":"0.7.3"}`；`GET /api/system/ready` → 200。
-- 浏览器实测：页面跳转 `/login`，`window.__backend_api_url === location.origin`，`#root` 已挂载，控制台无错误、无失败请求；提交探测账号触发 `POST /api/auth/token` → 401 `{"detail":"登录标识或密码错误"}`，证明鉴权链路经 nginx 到达真实后端。
-- 局域网可达：`GET http://192.168.138.10:8080/` → 200。
-- 未验证范围：使用真实账号的登录后主流程与 SSE 长连接未做端到端验证（缺可用凭据）；`/minio/public/` 反代未以真实对象验证。
+- HTTPS：`curl -sk https://127.0.0.1/` 与 `https://192.168.138.10/` → 200 `text/html`；`/assets/js/app-DQpUYnPz.js` → 200 `application/javascript`；SPA 深链 `/power-search` → 200（`try_files` 回退）。
+- 反代经 TLS：`GET /api/system/health|ready` → 200（`{"status":"ok","version":"0.7.3"}`）；`POST /api/auth/token` → FastAPI 422 校验响应（已到达真实后端）。
+- 重定向：`http://<host>:8080/`、SPA 深链、SSE 路径与 `POST /api/auth/token` 均 301 → `https://<host>/`，Location 不带端口。
+- TLS：`openssl s_client` 确认 TLSv1.2/1.3、ECDHE-RSA-AES256-GCM-SHA384，TLS1.0/1.1 被拒；证书 SAN 覆盖 `IP:192.168.138.10`、`IP:127.0.0.1`、`DNS:localhost`。
+- 浏览器（忽略自签错误上下文）实测 `https://192.168.138.10/login` 渲染、`window.__backend_api_url === location.origin`（https）、`#root` 挂载、控制台无错误。
+- 未验证范围：使用真实账号的登录后主流程与 SSE 长连接未做端到端验证（缺可用凭据）；`/minio/public/` 反代未以真实对象验证；自签证书在真实客户端的信任流程未逐机验证。

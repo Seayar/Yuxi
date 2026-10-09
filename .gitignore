@@ -84,3 +84,6 @@ srs/
 .taskr/
 .workbuddy/
 web/src/utils/__tests__/
+
+# 部署与运行期秘密/产物（不入版本控制）
+new-web/certs/

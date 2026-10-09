@@ -4,7 +4,8 @@
 #   cd /opt/Yuxi/new-web && docker-compose up -d
 #
 # 说明：
-# - 站点由 nginx:alpine 直接托管 ./dist 静态文件；
+# - 站点由 nginx:alpine 直接托管 ./dist 静态文件，HTTPS 入口为 443（自签证书 new-web/certs/，
+#   gitignored 不入版本控制）；HTTP 8080 保留且 301 重定向到 443；
 # - /api/ 反代到主 compose 的 api 服务，/minio/public/ 反代到 minio，
 #   因此前端 config.js 的 `window.__backend_api_url = location.origin` 可用；
 # - 通过 external network 接入主 compose 网络，不依赖主 compose 的启动顺序。
@@ -15,9 +16,12 @@ services:
     image: nginx:alpine
     container_name: yuxi-new-web
     ports:
+      - "443:443"
       - "${YUXI_NEW_WEB_PORT:-8080}:80"
     volumes:
       - ./dist:/usr/share/nginx/html:ro
+      # 自签证书（new-web/certs/server.{crt,key}，gitignored）；生成命令见决策记录 2026-10-09
+      - ./certs:/etc/nginx/certs:ro
       - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
       # 复用主仓库的 nginx.conf：基础镜像 mime.types 缺少 .mjs 的 JavaScript 映射
       - ../docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
