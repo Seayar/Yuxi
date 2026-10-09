@@ -1,0 +1,31 @@
+# 自有前端（/root/dist.7z 解包出的静态构建）独立部署，与主 docker-compose.yml 解耦。
+#
+# 用法：
+#   cd /opt/Yuxi/new-web && docker-compose up -d
+#
+# 说明：
+# - 站点由 nginx:alpine 直接托管 ./dist 静态文件；
+# - /api/ 反代到主 compose 的 api 服务，/minio/public/ 反代到 minio，
+#   因此前端 config.js 的 `window.__backend_api_url = location.origin` 可用；
+# - 通过 external network 接入主 compose 网络，不依赖主 compose 的启动顺序。
+#   ❗ 网络名默认取主 compose 的项目名（本项目 = yuxi → yuxi_app-network）。
+#     若主 compose 以其它项目名启动，用环境变量 YUXI_APP_NETWORK 覆盖。
+services:
+  new-web:
+    image: nginx:alpine
+    container_name: yuxi-new-web
+    ports:
+      - "${YUXI_NEW_WEB_PORT:-8080}:80"
+    volumes:
+      - ./dist:/usr/share/nginx/html:ro
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      # 复用主仓库的 nginx.conf：基础镜像 mime.types 缺少 .mjs 的 JavaScript 映射
+      - ../docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    networks:
+      - app-network
+    restart: unless-stopped
+
+networks:
+  app-network:
+    name: ${YUXI_APP_NETWORK:-yuxi_app-network}
+    external: true
