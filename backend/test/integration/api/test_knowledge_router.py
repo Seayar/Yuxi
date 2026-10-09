@@ -301,14 +301,18 @@ async def test_knowledge_virtual_folder_migration_runs_without_sse_and_is_resuma
         assert final_detection.json()["has_virtual_folders"] is False
         async with engine.connect() as connection:
             folder_creators = (
-                await connection.execute(
-                    text(
-                        "SELECT created_by FROM knowledge_files WHERE kb_id = :kb "
-                        "AND is_folder IS TRUE AND filename IN (:root, 'shared', 'other')"
-                    ),
-                    {"kb": kb_id, "root": f"history-{prefix}"},
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT created_by FROM knowledge_files WHERE kb_id = :kb "
+                            "AND is_folder IS TRUE AND filename IN (:root, 'shared', 'other')"
+                        ),
+                        {"kb": kb_id, "root": f"history-{prefix}"},
+                    )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
         assert len(folder_creators) == 3
         assert all(folder_creators)
     finally:
@@ -362,26 +366,28 @@ async def test_virtual_folder_migration_keeps_conflicts_and_commits_other_paths(
 
         async with engine.connect() as connection:
             rows = (
-                await connection.execute(
-                    text(
-                        "SELECT filename, parent_id FROM knowledge_files WHERE file_id IN "
-                        "(:blocked_file, :movable_file) ORDER BY file_id"
-                    ),
-                    {
-                        "blocked_file": f"file_{suffix}_blocked",
-                        "movable_file": f"file_{suffix}_movable",
-                    },
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT filename, parent_id FROM knowledge_files WHERE file_id IN "
+                            "(:blocked_file, :movable_file) ORDER BY file_id"
+                        ),
+                        {
+                            "blocked_file": f"file_{suffix}_blocked",
+                            "movable_file": f"file_{suffix}_movable",
+                        },
+                    )
                 )
-            ).mappings().all()
+                .mappings()
+                .all()
+            )
         assert {row["filename"] for row in rows} == {f"{blocked}/a.txt", "b.txt"}
         assert sum(row["parent_id"] is not None for row in rows) == 1
     finally:
         await engine.dispose()
 
 
-async def test_folder_mutations_reject_invalid_name_and_directory_cycle(
-    test_client, admin_headers, knowledge_database
-):
+async def test_folder_mutations_reject_invalid_name_and_directory_cycle(test_client, admin_headers, knowledge_database):
     kb_id = knowledge_database["kb_id"]
 
     parent_response = await test_client.post(
@@ -573,6 +579,68 @@ async def test_update_database_additional_params_merge_keeps_chunk_preset(
     assert info_response.json()["additional_params"]["chunk_preset_id"] == "qa"
 
 
+async def test_update_database_migrates_files_inheriting_chunk_preset(test_client, admin_headers, knowledge_database):
+    """负向：改知识库默认分块策略时，沿用旧默认值的文件要一起迁移。
+
+    文件级分块参数优先于知识库默认值；不迁移的话，用户改完默认策略再重新入库，
+    那些文件仍会沿用旧策略。
+    """
+
+    kb_id = knowledge_database["kb_id"]
+    prefix = uuid.uuid4().hex[:6]
+    inheriting = f"file_{prefix}_inherit"
+    overridden = f"file_{prefix}_override"
+    engine = create_async_engine(os.environ["POSTGRES_URL"], pool_pre_ping=True)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO knowledge_files "
+                    "(file_id, kb_id, parent_id, filename, file_type, status, is_folder, processing_params) VALUES "
+                    "(:id1, :kb, NULL, :n1, 'txt', 'indexed', FALSE, CAST(:p1 AS jsonb)), "
+                    "(:id2, :kb, NULL, :n2, 'txt', 'indexed', FALSE, CAST(:p2 AS jsonb))"
+                ),
+                {
+                    "id1": inheriting,
+                    "id2": overridden,
+                    "kb": kb_id,
+                    "n1": f"inherit-{prefix}.txt",
+                    "n2": f"override-{prefix}.txt",
+                    "p1": '{"chunk_preset_id": "general"}',
+                    "p2": '{"chunk_preset_id": "qa"}',
+                },
+            )
+
+        response = await test_client.put(
+            f"/api/knowledge/databases/{kb_id}",
+            json={
+                "name": knowledge_database["name"],
+                "description": "switch chunk preset",
+                "additional_params": {"chunk_preset_id": "power_spec"},
+            },
+            headers=admin_headers,
+        )
+        assert response.status_code == 200, response.text
+
+        async with engine.connect() as connection:
+            rows = dict(
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT file_id, processing_params->>'chunk_preset_id' FROM knowledge_files "
+                            "WHERE file_id IN (:id1, :id2)"
+                        ),
+                        {"id1": inheriting, "id2": overridden},
+                    )
+                ).all()
+            )
+
+        assert rows[inheriting] == "power_spec"
+        assert rows[overridden] == "qa"
+    finally:
+        await engine.dispose()
+
+
 async def test_knowledge_routes_enforce_permissions(test_client, standard_user, knowledge_database):
     kb_id = knowledge_database["kb_id"]
 
@@ -604,9 +672,7 @@ async def test_knowledge_routes_enforce_permissions(test_client, standard_user, 
     _assert_forbidden_response(forbidden_exists)
 
 
-async def test_kb_image_proxy_requires_auth_and_streams_private_image(
-    test_client, admin_headers, knowledge_database
-):
+async def test_kb_image_proxy_requires_auth_and_streams_private_image(test_client, admin_headers, knowledge_database):
     """知识库图片代理：未登录不可访问，鉴权后可读取私有 bucket 图片"""
     from yuxi.storage.minio.client import MinIOClient, get_minio_client
 

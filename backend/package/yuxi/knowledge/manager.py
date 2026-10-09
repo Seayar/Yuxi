@@ -1155,10 +1155,45 @@ class KnowledgeBaseManager:
         # 保存到数据库
         await kb_repo.update(kb_id, update_data)
 
+        if additional_params is not None:
+            await self._migrate_inherited_chunk_preset(
+                kb_id,
+                previous=current_additional_params.get("chunk_preset_id"),
+                current=update_data["additional_params"].get("chunk_preset_id"),
+            )
+
         database = await self.get_database_info(kb_id)
         if database is None:
             raise KBNotFoundError(f"Database {kb_id} not found after update")
         return database
+
+    @staticmethod
+    async def _migrate_inherited_chunk_preset(
+        kb_id: str,
+        *,
+        previous: Any,
+        current: Any,
+    ) -> None:
+        """把沿用旧默认分块策略的文件改到新默认策略，避免旧值长期遮蔽新默认值。
+
+        文件级分块参数优先于知识库默认值；用户改完默认策略后，只有把这些仍写着旧值
+        的文件一起改掉，重新入库才会真正用上新策略。
+        """
+
+        if not previous or not current or previous == current:
+            return
+        from yuxi.repositories.knowledge_file_repository import KnowledgeFileRepository
+
+        migrated = await KnowledgeFileRepository().migrate_processing_param(
+            kb_id=kb_id,
+            key="chunk_preset_id",
+            old_value=previous,
+            new_value=current,
+        )
+        if migrated:
+            logger.info(
+                f"Knowledge base {kb_id} chunk preset {previous} -> {current}; migrated {migrated} inheriting files"
+            )
 
     async def retrieve(self, kb_id: str, query: str, **options) -> dict:
         """按 kb_id 加载最新运行时元数据并执行检索。"""

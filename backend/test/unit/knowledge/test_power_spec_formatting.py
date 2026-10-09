@@ -1,10 +1,8 @@
 from yuxi.knowledge.power_spec.answer import (
     CONDITIONAL_SRS_FIELDS,
     SRS_CARD_FIELDS,
-    SRS_THINKING_STEPS,
     apply_organized_clauses,
     format_power_spec_results,
-    render_thinking_steps,
 )
 from yuxi.knowledge.power_spec.contracts import SpecClauseEvidence
 
@@ -124,12 +122,3 @@ def test_apply_organized_clauses_publishes_only_organized_clauses():
 
     assert [item["citation_key"] for item in result["items"]] == ["doc-1#6.2.1"]
     assert "**规范卡片 2**" not in result["answer_markdown"]
-
-
-def test_render_thinking_steps_lists_srs_steps():
-    markdown = render_thinking_steps([{"citation_key": "doc-1#6.2.1"}], elapsed_seconds=0.8)
-
-    assert "已思考（用时 0.8 秒）" in markdown
-    for step in SRS_THINKING_STEPS:
-        assert step in markdown
-    assert "共匹配到 1 条相关条款" in markdown

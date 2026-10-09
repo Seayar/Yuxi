@@ -5,10 +5,16 @@ import re
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from typing import Any
 
-import json_repair
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from yuxi.knowledge.power_spec.contracts import EvidenceBundle, PowerSpecQuery, SpecClauseEvidence, VerificationIssue
+from yuxi.knowledge.power_spec.contracts import (
+    EvidenceBundle,
+    PowerSpecQuery,
+    SpecClauseEvidence,
+    VerificationIssue,
+    citation_key_of,
+)
+from yuxi.knowledge.power_spec.model_output import parse_model_json
 from yuxi.utils import logger
 
 
@@ -148,38 +154,6 @@ def adapt_vector_results(
     return evidence
 
 
-def adapt_graph_results(
-    graph_result: Mapping[str, Any],
-    metadata_by_file_id: Mapping[str, Mapping[str, Any]],
-    query: PowerSpecQuery,
-) -> list[SpecClauseEvidence]:
-    """将图谱节点查询结果转换为规范条款证据。"""
-
-    evidence: list[SpecClauseEvidence] = []
-    for node in graph_result.get("nodes") or []:
-        properties = node.get("properties") or node
-        if not _is_clause_node(properties):
-            continue
-        file_id = str(properties.get("file_id") or properties.get("document_id") or "")
-        document_metadata = metadata_by_file_id.get(file_id)
-        if not document_metadata:
-            continue
-        clause_metadata = _resolve_clause_metadata(properties, document_metadata)
-        if clause_metadata is None:
-            continue
-        evidence.append(
-            _build_evidence(
-                document_id=file_id,
-                document_metadata=document_metadata,
-                clause_metadata=clause_metadata,
-                clause_body=str(properties.get("clause_body") or properties.get("content") or ""),
-                rerank_score=None,
-                metadata={"graph_node_id": properties.get("entity_id") or properties.get("id")},
-            )
-        )
-    return evidence
-
-
 def _resolve_clause_metadata(
     result_metadata: Mapping[str, Any],
     document_metadata: Mapping[str, Any],
@@ -238,11 +212,6 @@ def _shared_trigram_count(left: str, right: str) -> int:
     return len(left_trigrams & right_trigrams)
 
 
-def _is_clause_node(properties: Mapping[str, Any]) -> bool:
-    node_type = str(properties.get("type") or properties.get("label") or "").lower()
-    return bool(properties.get("clause_no")) or node_type in {"clause", "spec_clause", "条款"}
-
-
 def _build_evidence(
     *,
     document_id: str,
@@ -255,9 +224,8 @@ def _build_evidence(
 ) -> SpecClauseEvidence:
     clause_no = str(clause_metadata.get("clause_no") or "未知条款")
     resolved_body = _resolve_clause_body(clause_metadata, clause_body)
-    display_source = (
-        clause_body if query_text and any(term in clause_body for term in _query_terms(query_text)) else resolved_body
-    )
+    matched = query_text and any(term in clause_body for term in _line_match_terms(query_text))
+    display_source = clause_body if matched else resolved_body
     display_body = _select_relevant_clause_text(display_source, query_text)
     clause_title = _resolve_clause_title(clause_metadata, clause_body, clause_no)
     return SpecClauseEvidence(
@@ -291,7 +259,7 @@ def _select_relevant_clause_text(body: str, query_text: str | None) -> str:
 
     if not body or not query_text:
         return body
-    terms = _query_terms(query_text)
+    terms = _line_match_terms(query_text)
     if not terms:
         return body
     lines = body.splitlines()
@@ -322,7 +290,9 @@ def _table_blocks(lines: list[str]) -> list[list[int]]:
     return blocks
 
 
-def _query_terms(query: str) -> list[str]:
+def _line_match_terms(query: str) -> list[str]:
+    """返回用于行级命中判定的词元：完整词元加上 2~6 字的子串，尽量提高召回。"""
+
     terms = set(re.findall(r"[\u4e00-\u9fff]{2,}|\d+(?:\.\d+)?kV|[A-Za-z0-9]+", query))
     for phrase in re.findall(r"[\u4e00-\u9fff]{2,}", query):
         for size in range(2, min(len(phrase), 6) + 1):
@@ -557,7 +527,7 @@ def build_correction_prompt(evidences: Sequence[Any]) -> str:
         body = str(getattr(evidence, "clause_body", "") or "")[:MAX_BODY_CHARS]
         lines.extend(
             [
-                f"### citation_key: {_citation_key(evidence)}",
+                f"### citation_key: {citation_key_of(evidence)}",
                 f"clause_no: {getattr(evidence, 'clause_no', '')}",
                 f"clause_title: {getattr(evidence, 'clause_title', '')}",
                 f"原文片段：\n{body}",
@@ -571,8 +541,8 @@ def parse_corrections(raw: str | dict[str, Any]) -> dict[str, ClauseCorrection]:
     """解析模型校对结果，无法解析时返回空映射（等同于不做修复）。"""
 
     try:
-        payload = raw if isinstance(raw, dict) else _loads(raw)
-    except Exception as exc:  # noqa: BLE001
+        payload = parse_model_json(raw)
+    except ValueError as exc:
         logger.warning(f"条款字段校对结果无法解析: {exc}")
         return {}
     items = payload.get("items")
@@ -597,7 +567,7 @@ def apply_corrections(evidences: Sequence[Any], corrections: dict[str, ClauseCor
     applied: list[str] = []
     rejected: list[str] = []
     for evidence in evidences:
-        correction = corrections.get(_citation_key(evidence))
+        correction = corrections.get(citation_key_of(evidence))
         if correction is None:
             updated.append(evidence)
             continue
@@ -610,17 +580,17 @@ def apply_corrections(evidences: Sequence[Any], corrections: dict[str, ClauseCor
         if display_no and display_no != evidence.clause_no:
             if is_supported_clause_no(display_no, raw_clause_no):
                 metadata[DISPLAY_CLAUSE_NO_KEY] = display_no
-                applied.append(f"{_citation_key(evidence)}:编号 {evidence.clause_no} → {display_no}")
+                applied.append(f"{citation_key_of(evidence)}:编号 {evidence.clause_no} → {display_no}")
             else:
-                rejected.append(f"{_citation_key(evidence)}:编号修复被拒绝「{display_no}」")
+                rejected.append(f"{citation_key_of(evidence)}:编号修复被拒绝「{display_no}」")
 
         display_title = _clean(correction.clause_title, limit=MAX_TITLE_CHARS)
         if display_title and display_title != evidence.clause_title:
             if is_supported_clause_title(display_title, raw_title, raw_bodies):
                 metadata[DISPLAY_CLAUSE_TITLE_KEY] = display_title
-                applied.append(f"{_citation_key(evidence)}:标题 → {display_title}")
+                applied.append(f"{citation_key_of(evidence)}:标题 → {display_title}")
             else:
-                rejected.append(f"{_citation_key(evidence)}:标题修复被拒绝「{display_title}」")
+                rejected.append(f"{citation_key_of(evidence)}:标题修复被拒绝「{display_title}」")
 
         updated.append(
             evidence.model_copy(update={"metadata": metadata})
@@ -666,13 +636,6 @@ def display_clause_title(evidence: Any) -> str:
     return str(metadata.get(DISPLAY_CLAUSE_TITLE_KEY) or getattr(evidence, "clause_title", ""))
 
 
-def _citation_key(evidence: Any) -> str:
-    key = getattr(evidence, "citation_key", None)
-    if key:
-        return str(key)
-    return f"{getattr(evidence, 'document_id', '')}#{getattr(evidence, 'clause_no', '')}"
-
-
 def _clean(value: str | None, *, limit: int) -> str | None:
     if value is None:
         return None
@@ -680,15 +643,3 @@ def _clean(value: str | None, *, limit: int) -> str | None:
     if not text or text.lower() in {"null", "none", "无", "无需修复"}:
         return None
     return text[:limit]
-
-
-def _loads(raw: str) -> dict[str, Any]:
-    text = str(raw or "").strip()
-    if text.startswith("```"):
-        text = text.strip("`").strip()
-        if text.startswith("json"):
-            text = text[4:].strip()
-    payload = json_repair.loads(text)
-    if not isinstance(payload, dict):
-        raise ValueError("校对结果不是 JSON 对象")
-    return payload

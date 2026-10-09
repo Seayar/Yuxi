@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from langgraph.prebuilt.tool_node import ToolRuntime
@@ -10,10 +11,15 @@ from pydantic import BaseModel, Field
 from yuxi.agents.backends.knowledge_base_backend import resolve_visible_knowledge_bases_for_context
 from yuxi.agents.toolkits.registry import tool
 from yuxi.knowledge.power_spec.answer import build_subagent_caller, produce_power_spec_answer
-from yuxi.knowledge.power_spec.contracts import PowerSpecQuery
+from yuxi.knowledge.power_spec.contracts import (
+    INTENT_ATTEMPTS_EXHAUSTED_MESSAGE,
+    KNOWLEDGE_BASE_NOT_READY_MESSAGE,
+    NO_EVIDENCE_MESSAGE,
+    RETRIEVAL_NOT_CONFIGURED_MESSAGE,
+    PowerSpecQuery,
+)
 from yuxi.knowledge.power_spec.ingestion import is_power_spec_metadata_ready
 from yuxi.knowledge.power_spec.intent import (
-    INTENT_ATTEMPTS_EXHAUSTED_MESSAGE,
     MAX_INTENT_ATTEMPTS,
     PowerSpecIntentModelCall,
     build_confirmation_payload,
@@ -41,8 +47,6 @@ POWER_SPEC_RETRIEVAL_OPTIONS = {
     "graph_top_k": 20,
     "final_top_k": 20,
 }
-NO_EVIDENCE_MESSAGE = "未检索到资料"
-KNOWLEDGE_BASE_NOT_READY_MESSAGE = "电力规范知识库尚未完成条款级重建"
 POWER_SPEC_KEYWORD_QUERY_TERMS = int(os.getenv("POWER_SPEC_KEYWORD_QUERY_TERMS", "8"))
 POWER_SPEC_CLAUSE_REVIEW_ENABLED = os.getenv("POWER_SPEC_CLAUSE_REVIEW_ENABLED", "true").strip().lower() not in {
     "0",
@@ -110,7 +114,11 @@ async def search_power_spec(
     config = await knowledge_base.get_kb_config(kb_id)
     reranker_model = config.query_options.get("reranker_model")
     if not reranker_model:
-        return NO_EVIDENCE_MESSAGE
+        # 缺重排模型时排分无法计算，后续所有候选都会被丢掉；这里必须报出真实原因，
+        # 不能给用户一个“未检索到资料”而让他以为知识库里没有内容。
+        # 这是配置类失败，不写入结果缓存：配置修好后同一次运行里应当能重新生效。
+        logger.warning(f"知识库 {kb_id} 未配置 reranker_model，电力规范检索不可用")
+        return RETRIEVAL_NOT_CONFIGURED_MESSAGE
 
     executor = await knowledge_base.get_kb_executor(kb_id)
     async with pg_manager.get_async_session_context() as db:
@@ -161,8 +169,8 @@ async def search_power_spec(
         query=query,
         evidences=reviewed,
         call_subagent=build_subagent_caller(context),
+        call_compose=_context_model_call(context),
         tool_call_id=getattr(runtime, "tool_call_id", None),
-        ask_acceptance=interrupt,
     )
     retrieval_mode = (
         "graph+vector+rerank"
@@ -186,13 +194,9 @@ async def search_power_spec(
 async def _review_clause_metadata(context: Any, evidence: list[Any]) -> list[Any]:
     """由模型校对条款编号与标题，只应用通过代码校验的字符级修复。"""
 
-    if not POWER_SPEC_CLAUSE_REVIEW_ENABLED or not getattr(context, "model", None):
+    model_call = _context_model_call(context)
+    if not POWER_SPEC_CLAUSE_REVIEW_ENABLED or model_call is None:
         return evidence
-
-    async def model_call(prompt: str) -> str:
-        model = _select_context_model(context, max_tokens=POWER_SPEC_INTENT_MAX_TOKENS)
-        response = await model.call(prompt, stream=False)
-        return getattr(response, "content", "") or ""
 
     outcome = await review_clause_metadata(evidence, model_call=model_call)
     return outcome.evidence
@@ -304,10 +308,13 @@ async def _confirm_intent_with_user(query_text: str, *, context: Any) -> PowerSp
     return INTENT_ATTEMPTS_EXHAUSTED_MESSAGE
 
 
-def _build_intent_model_call(context: Any) -> PowerSpecIntentModelCall | None:
-    """构造意图识别模型调用；未启用或上下文没有模型标识时返回 None 以回退规则解析。"""
+def _context_model_call(context: Any) -> Callable[[str], Awaitable[str]] | None:
+    """构造按当前 Agent 模型执行的非流式单次调用；上下文没有模型标识时返回 None。
 
-    if not POWER_SPEC_INTENT_ENABLED:
+    意图识别、条款字段校对与最终整理共用这条路径，避免重复的模型构造代码。
+    """
+
+    if not getattr(context, "model", None):
         return None
 
     async def model_call(prompt: str) -> str:
@@ -315,7 +322,15 @@ def _build_intent_model_call(context: Any) -> PowerSpecIntentModelCall | None:
         response = await model.call(prompt, stream=False)
         return getattr(response, "content", "") or ""
 
-    return model_call if getattr(context, "model", None) else None
+    return model_call
+
+
+def _build_intent_model_call(context: Any) -> PowerSpecIntentModelCall | None:
+    """构造意图识别模型调用；未启用或上下文没有模型标识时返回 None 以回退规则解析。"""
+
+    if not POWER_SPEC_INTENT_ENABLED:
+        return None
+    return _context_model_call(context)
 
 
 def _select_context_model(context: Any, *, max_tokens: int):

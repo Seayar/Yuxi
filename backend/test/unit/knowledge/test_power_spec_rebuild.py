@@ -78,3 +78,36 @@ def test_power_spec_metadata_ready_matches_rebuild_quality_gate():
     assert not is_power_spec_metadata_ready(
         {"clauses": [{"clause_no": "1.1", "clause_title": "1.1", "clause_body": "短"}]}
     )
+
+
+def test_untitled_clause_with_substantive_body_is_ready():
+    """无标题条款用编号作标题，正文充分时写入与读取都必须放行。
+
+    标准里本来就有不带标题的条款；读取侧若因其标题等于编号而拒绝，就会出现
+    「重建成功但检索说未完成条款级重建」的落差。
+    """
+
+    metadata = {
+        "clauses": [
+            {
+                "clause_no": "7.3.5.2",
+                "clause_title": "7.3.5.2",
+                "clause_body": "停电操作应按照“断路器一负荷侧隔离开关一电源侧隔离开关”的顺序依次进行。",
+            }
+        ]
+    }
+
+    assert is_power_spec_metadata_ready(metadata)
+
+
+def test_power_spec_metadata_ready_rejects_heading_only_extraction():
+    """负向：标题只剩编号且正文过短的伪条款仍要被读取侧拒绝。"""
+
+    metadata = {
+        "clauses": [
+            {"clause_no": "1.1", "clause_title": "1.1", "clause_body": "短"},
+            {"clause_no": "1.2", "clause_title": "1.2", "clause_body": "也短"},
+        ]
+    }
+
+    assert not is_power_spec_metadata_ready(metadata)

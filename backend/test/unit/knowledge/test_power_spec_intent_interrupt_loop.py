@@ -13,7 +13,7 @@ from langgraph.types import Command
 
 from yuxi.knowledge.power_spec import tool as tool_module
 from yuxi.knowledge.power_spec.contracts import PowerSpecQuery
-from yuxi.knowledge.power_spec.intent import INTENT_ATTEMPTS_EXHAUSTED_MESSAGE
+from yuxi.knowledge.power_spec.contracts import INTENT_ATTEMPTS_EXHAUSTED_MESSAGE
 from yuxi.knowledge.power_spec.tool import _confirm_intent_with_user
 
 QUESTION = "220 的变压器色谱多久做一回？"

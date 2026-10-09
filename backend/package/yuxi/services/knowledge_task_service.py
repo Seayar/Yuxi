@@ -180,13 +180,18 @@ async def run_knowledge_ingest(context: TaskContext) -> dict:
                         indexing_params,
                         operator_id=operator_id,
                     )
-                    processed_items[record["index"]] = await knowledge_base.index_file(
+                    indexed_result = await knowledge_base.index_file(
                         kb_id,
                         record["file_id"],
                         operator_id=operator_id,
                         params=indexing_params,
                         **processing_owner,
                     )
+                    # 入库结果换成了新字典，补回解析阶段已算出的条款重建报告，
+                    # 否则任务结果里看不到元数据，无法判断重建是否执行过。
+                    if "power_spec" in record["file_meta"]:
+                        indexed_result["power_spec"] = record["file_meta"]["power_spec"]
+                    processed_items[record["index"]] = indexed_result
                 except Exception as exc:
                     logger.error("自动入库失败 %s (file_id=%s): %s", record["item"], record["file_id"], exc)
                     processed_items[record["index"]] = {
@@ -270,7 +275,6 @@ async def _run_file_ids(context: TaskContext, *, action: str) -> dict:
                     operator_id=operator_id,
                     **processing_owner,
                 )
-                await _attach_power_spec_rebuild(kb_id, file_id, result)
             else:
                 result = await knowledge_base.index_file(
                     kb_id,
@@ -279,6 +283,9 @@ async def _run_file_ids(context: TaskContext, *, action: str) -> dict:
                     params=params,
                     **processing_owner,
                 )
+            # 重新入库同样要重建条款元数据：只改分块策略不会产生派生元数据，
+            # 缺少它会让电力规范检索把整个知识库判为「尚未完成条款级重建」。
+            await _attach_power_spec_rebuild(kb_id, file_id, result)
             processed_items.append(result)
         except Exception as exc:
             logger.error("%s failed for %s: %s", label, file_id, exc)
@@ -341,7 +348,6 @@ async def _run_pending_files(context: TaskContext, *, action: str) -> dict:
                         operator_id=operator_id,
                         **processing_owner,
                     )
-                    await _attach_power_spec_rebuild(kb_id, file_id, result)
                 else:
                     if params:
                         await knowledge_base.update_file_params(kb_id, file_id, params, operator_id=operator_id)
@@ -352,6 +358,7 @@ async def _run_pending_files(context: TaskContext, *, action: str) -> dict:
                         params=params,
                         **processing_owner,
                     )
+                await _attach_power_spec_rebuild(kb_id, file_id, result)
                 _append_result_sample(result_items, result)
             except Exception as exc:
                 failed_count += 1

@@ -56,6 +56,14 @@ def _filter_disabled_tools(tools, disabled_tools: frozenset[str]):
     return [tool for tool in tools if _tool_name(tool) not in disabled_tools]
 
 
+def _subagent_model_kwargs(context) -> dict[str, Any]:
+    """返回预设声明的模型参数；未声明时不改变服务默认行为。"""
+
+    if getattr(context, "temperature", None) is None:
+        return {}
+    return {"temperature": context.temperature}
+
+
 class _SubAgentToolFilterMiddleware(AgentMiddleware[Any, Any, Any]):
     def __init__(self, tool_approval_mode: str = "default"):
         self.disabled_tools = _disabled_tools_for(tool_approval_mode)
@@ -153,6 +161,7 @@ class SubAgentBackend(BaseAgent):
                 fully_specified_name=model_spec,
                 session_id=context.thread_id,
                 disable_thinking=SUBAGENT_DISABLE_THINKING,
+                **_subagent_model_kwargs(context),
             ),
             tools=_filter_disabled_tools(await resolve_configured_runtime_tools(context), disabled_tools),
             system_prompt=build_prompt_with_context(context),

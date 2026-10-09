@@ -15,7 +15,7 @@
         <div v-else class="spec-summary">
           <span class="spec-count">共 {{ cards.length }} 条相关条款</span>
           <span v-if="summary.retrievalMode" class="spec-mode">{{ summary.retrievalMode }}</span>
-          <span v-if="summary.unverified" class="spec-warning">未通过审查</span>
+          <span v-if="summary.reviewIssues" class="spec-reviewed">已结合审查意见</span>
         </div>
 
         <article v-for="(card, index) in cards" :key="`spec-card-${index}`" class="result-card">
@@ -87,6 +87,8 @@ const props = defineProps({
 const PLAIN_MESSAGES = {
   未检索到资料: '未检索到资料',
   电力规范知识库尚未完成条款级重建: '电力规范知识库尚未完成条款级重建',
+  // 键必须与后端 contracts.RETRIEVAL_NOT_CONFIGURED_MESSAGE 逐字一致，否则永远匹配不到
+  '该知识库未配置重排模型，无法检索电力规范': '该知识库未配置重排模型，无法检索电力规范',
   多次未确认问题意图: '多次未确认问题意图，请重新描述您的电力规范问题'
 }
 
@@ -143,7 +145,7 @@ const summary = computed(() => ({
   query: summaryText.value,
   notice: parsed.value.plain || '',
   retrievalMode: parsed.value.retrieval_mode || '',
-  unverified: parsed.value.answer_verified === false
+  reviewIssues: parsed.value.answer_verified === false
 }))
 </script>
 
@@ -194,8 +196,8 @@ const summary = computed(() => ({
     font-size: 12.5px;
     color: var(--text-secondary);
 
-    .spec-warning {
-      color: #fa8c16;
+    .spec-reviewed {
+      color: var(--text-secondary);
     }
   }
 

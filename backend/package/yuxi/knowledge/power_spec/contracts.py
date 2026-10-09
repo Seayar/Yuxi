@@ -7,6 +7,21 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 PowerSpecIntent = Literal["设备参数查询", "检修标准查询", "安全规范查询", "其他类型"]
 
+# 工具直接返回给用户的纯文本结果。发布门需要原样透传这些句子，不再做模型改写，
+# 因此文案与集合定义在同一处，避免多处硬编码漏改。
+NO_EVIDENCE_MESSAGE = "未检索到资料"
+KNOWLEDGE_BASE_NOT_READY_MESSAGE = "电力规范知识库尚未完成条款级重建"
+RETRIEVAL_NOT_CONFIGURED_MESSAGE = "该知识库未配置重排模型，无法检索电力规范"
+INTENT_ATTEMPTS_EXHAUSTED_MESSAGE = "多次未确认问题意图，请重新描述您的电力规范问题"
+PLAIN_TOOL_MESSAGES = frozenset(
+    {
+        NO_EVIDENCE_MESSAGE,
+        KNOWLEDGE_BASE_NOT_READY_MESSAGE,
+        RETRIEVAL_NOT_CONFIGURED_MESSAGE,
+        INTENT_ATTEMPTS_EXHAUSTED_MESSAGE,
+    }
+)
+
 
 class PowerSpecQuery(BaseModel):
     """表示一次意图分析后的电力规范查询。"""
@@ -56,6 +71,19 @@ class SpecClauseEvidence(BaseModel):
         """返回稳定的文档条款引用键。"""
 
         return f"{self.document_id}#{self.clause_no}"
+
+
+def citation_key_of(evidence: Any) -> str:
+    """返回证据对象的引用键。
+
+    `SpecClauseEvidence.citation_key` 是模型属性，这里额外兼容缺少该属性的替身对象
+    （测试替身、图谱节点），避免各调用点重复实现同一兜底。
+    """
+
+    key = getattr(evidence, "citation_key", None)
+    if key:
+        return str(key)
+    return f"{getattr(evidence, 'document_id', '')}#{getattr(evidence, 'clause_no', '')}"
 
 
 class EvidenceBundle(BaseModel):

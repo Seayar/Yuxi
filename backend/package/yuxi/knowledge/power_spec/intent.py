@@ -327,7 +327,6 @@ def _clean_terms(values: Any, *, limit: int) -> list[str]:
 MAX_INTENT_ATTEMPTS = 3
 INTENT_QUESTION_ID = "power_spec_intent_confirm"
 CORRECTION_QUESTION_ID = "power_spec_intent_correction"
-INTENT_ATTEMPTS_EXHAUSTED_MESSAGE = "多次未确认问题意图，请重新描述您的电力规范问题"
 
 
 def build_intent_plan(query: PowerSpecQuery) -> dict[str, Any]:

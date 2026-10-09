@@ -494,28 +494,64 @@ async def _save_ai_message(
 
     return ai_msg
 
+
 def _is_power_spec_context(context) -> bool:
     return "power-spec" in set(getattr(context, "skills", []) or [])
 
-def _resolve_power_spec_output(messages, fallback_content: str) -> str:
-    """发布前优先采用检索 Tool 的固定格式，阻止模型改写卡片结构。"""
 
-    for message in reversed(messages or []):
-        if getattr(message, "type", None) != "tool":
-            continue
-        content = getattr(message, "content", "")
+def _message_field(message, name: str):
+    """读取 checkpoint 消息字段；消息可能是 LangChain 对象或普通字典。"""
+
+    if isinstance(message, dict):
+        return message.get(name)
+    return getattr(message, name, None)
+
+
+def _current_turn_tool_messages(messages, run_tool_call_ids: set[str]) -> list:
+    """返回本轮产生的工具结果。
+
+    checkpoint 里包含线程完整历史，跨轮次取用会把上一轮的检索卡片当成本轮答案。归属优先
+    按运行判定，与工具消息对账使用同一标准；运行归属不可用时按最后一条用户消息划界。
+    两条路径都只覆盖本轮。
+    """
+
+    history = list(messages or [])
+    if run_tool_call_ids:
+        return [
+            message
+            for message in history
+            if _message_field(message, "type") == "tool"
+            and str(_message_field(message, "tool_call_id") or "") in run_tool_call_ids
+        ]
+    last_user_index = -1
+    for index, message in enumerate(history):
+        if _message_field(message, "type") == "human":
+            last_user_index = index
+    return [message for message in history[last_user_index + 1 :] if _message_field(message, "type") == "tool"]
+
+
+def _resolve_power_spec_output(messages, fallback_content: str, *, run_tool_call_ids: set[str] | None = None) -> str:
+    """从本轮检索 Tool 的结果里取卡片，阻止模型改写卡片结构。
+
+    只认本轮的工具结果：checkpoint 里包含线程完整历史，跨轮次取用会把上一轮的卡片当成
+    本轮答案。本轮没有检索结果时回退到模型自己的内容。
+    """
+
+    from yuxi.knowledge.power_spec.contracts import PLAIN_TOOL_MESSAGES
+
+    for message in reversed(_current_turn_tool_messages(messages, set(run_tool_call_ids or ()))):
+        content = _message_field(message, "content")
         if not isinstance(content, str):
             continue
         try:
             payload = json.loads(content)
         except (TypeError, json.JSONDecodeError):
-            return content if content in {"未检索到资料", "电力规范知识库尚未完成条款级重建"} else fallback_content
+            return content if content in PLAIN_TOOL_MESSAGES else fallback_content
         if isinstance(payload, dict) and isinstance(payload.get("answer_markdown"), str):
             return payload["answer_markdown"]
         if isinstance(payload, str):
             return payload
     return fallback_content
-
 
 
 async def _save_tool_message(conv_repo: ConversationRepository, msg_dict: dict, *, commit: bool = True) -> None:
@@ -777,7 +813,11 @@ async def save_messages_from_langgraph_state(
             if msg_type == "ai":
                 if _is_power_spec_context(agent_context):
                     msg_dict = dict(msg_dict)
-                    msg_dict["content"] = _resolve_power_spec_output(messages, msg_dict.get("content", ""))
+                    msg_dict["content"] = _resolve_power_spec_output(
+                        messages,
+                        msg_dict.get("content", ""),
+                        run_tool_call_ids=current_tool_operation_ids,
+                    )
                 last_state_ai_id = str(msg_id) if msg_id else None
                 if run_id and msg_id and str(msg_id) in current_audit_operation_ids:
                     # Checkpoint 包含线程完整历史；同一来源键只对账最后一次 AIMessage。

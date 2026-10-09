@@ -725,6 +725,31 @@ class KnowledgeFileRepository:
                 setattr(existing, key, value)
             return existing
 
+    async def migrate_processing_param(
+        self,
+        *,
+        kb_id: str,
+        key: str,
+        old_value: Any,
+        new_value: Any,
+    ) -> int:
+        """把仍沿用知识库默认值的文件迁移到新默认值，返回受影响文件数。
+
+        分块参数是文件级优先的，文件里存着旧默认值时，知识库改默认值对它不再生效。
+        """
+
+        async with pg_manager.get_async_session_context() as session:
+            records = (await session.execute(select(KnowledgeFile).where(KnowledgeFile.kb_id == kb_id))).scalars().all()
+            migrated = 0
+            for record in records:
+                params = dict(record.processing_params or {})
+                if params.get(key) != old_value:
+                    continue
+                params[key] = new_value
+                record.processing_params = params
+                migrated += 1
+            return migrated
+
     async def update_fields(
         self,
         *,

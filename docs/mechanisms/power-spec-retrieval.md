@@ -43,9 +43,19 @@ graph TD
 
 ### 条款提取与质量门
 
-`parse_power_spec_text` 负责把解析后的 Markdown 转成 `PowerSpecDocument`。它按行扫描，识别标准编号、文档适用范围和数字条款，并把每个条款的正文按原始换行拼接。
+`parse_power_spec_text` 负责把解析后的 Markdown 转成 `PowerSpecDocument`。它按标准文档的写法提取三类信息：
 
-质量门 `_quality_failure_reason` 与 `is_power_spec_metadata_ready` 拒绝达不到回答质量的文档，主要判据是数字标题占比和过短正文占比。未通过的文件不会写入元数据，检索时会把它们整体排除。
+- **条款**：优先按 Markdown 条款标题（`## 6.1 油浸式电力变压器和电抗器`）切分，正文到下一个标题为止；没有这种标题的旧式 PDF 文本回退到行首编号规则（`6.1 上层油温限值`）。只有标题、没有自身正文的分层章节不产出条款。
+- **目录**：从 `## 目 次`／`## 目录` 这类标题到同级或更高级的 Markdown 标题之间整块跳过。人工整理的文档常把目录条目也写成标题，不跳过就会把目录当成条款，并把正文跨章节累积成巨块。
+- **标准编号与名称**：封面只写「代替 DL/T 393—2010」时，用发布日期年份推导本版编号（`DL/T393—2021`），避免把卡片上的编号写成上一版；名称优先取「代替…《名称》」，其次文档一级标题，都不成立时退回编号原文。
+
+条款页码取自标题之前最近的 `<!-- source_pdf_page: N -->` 标记，写入 `clause.source_page`，卡片上的「源文件页码」由此得到。
+
+质量门 `_quality_failure_reason`（写入）与 `is_power_spec_metadata_ready`（读取）共用 `_clause_quality_failure` 这一条规则，主要判据是过短正文占比（正文短于 20 字视为没拿到内容，占比超过 0.2 即拒绝）；标题只剩编号且正文也短时给出更具体的拒绝原因。未通过的文件不会写入元数据，检索时会把它们整体排除。
+
+条款标题写成 `## 6.4.1.1` 这类纯编号时，标题取紧邻的下一级标题（如 `### 表17 …`），正文从该标题之后开始；确实没有标题的条款用编号作标题，只要正文充分就是可用证据。单级编号（`## 6`）仍按章节处理。
+
+附录式编号（`D.3.2`、`E.1`）与标题为「表N」的纯表格片段目前不产出条款，这类文件需要按 `general` 分块，否则 `index_file` 会因解析失败而把文件置为 `error_indexing`。
 
 `PostgresPowerSpecExtractionStore` 把结果写入 `knowledge_files.processing_params["power_spec"]`，其中 `clauses` 是该文件全部条款的轻量投影。检索时的条款编号、标题、正文和适用范围都来自这里，而不是 chunk 内容。
 
@@ -103,27 +113,29 @@ sequenceDiagram
 
 ### 模型组织答案
 
-证据通过投影校验后，工具把证据交给两个真实子智能体形成闭环。
+证据通过投影校验后，工具按「整理 → 审查 → 合并」三步组织答案。每步只执行一次，任一步失败即回退固定卡片。
 
-整理子智能体 `power-spec-organizer` 接收用户问题与受限条款原文，只保留与问题维度相关的内容。它可以改写、分条和重新组织语言，使结论简短可读，但每条结论必须带 `[source:document_id#clause_no]` 引用，且不能改变数值、单位、条件、期限和判据的含义。
+1. 整理子智能体 `power-spec-organizer` 接收用户问题、意图识别给出的关注维度与受限条款原文，逐条输出 JSON 中的 `body`。它可以改写、分条和重新组织语言，但必须列出与问题相关或最接近的原文内容，不得改变数值、单位、条件、期限和判据的含义，每条结论带 `[source:document_id#clause_no]` 引用。
+2. 审查子智能体 `power-spec-reviewer` 同时接收原文与整理结果，核验编造、事实错误、遗漏、无关内容和引用有效性，只输出审查意见 `{"issues":[...]}`，不给出通过与否的判定。
+3. 主智能体（父 Agent 的模型，非子智能体）以整理内容为基础结合审查意见产出最终 `body`，然后直接发布。提示词要求只修改「判断确实成立」的意见，审查意见与整理内容冲突时保留整理内容。
 
-审查子智能体 `power-spec-reviewer` 同时接收原文与整理结果，对抗式核验编造、事实错误、遗漏和引用有效性，输出结构化 JSON 判定。只要有编造或事实错误，判定必须为不通过。
+三个环节都从模型输出中**提取** JSON 对象（容忍前面的分析文字与代码块围栏），而不是要求整段就是 JSON。实测本地模型会先写一段分析再在末尾用代码块给出 JSON，若只解析整段文本，合法结论会被当成解析失败丢弃。
 
-审查通过即发布整理结果。审查不通过时把审查意见回灌给整理子智能体重试，上限 3 次。整理子智能体不可用、返回空内容或审查全部失败时，不向用户展示未经核验的内容。
+代码保留两道廉价检查，它们不再阻断流程，而是各转成一条审查意见交给第 3 步修正：整理结果中的每个数字必须能在原文或用户问题中找到（按完整数字词元比较，`12` 不会被 `2021` 当成有依据）；正文不得为空或只写「本条款未涉及该问题」这类占位说明。
 
-代码只保留一道廉价的编造前置门：整理结果中的每个数字必须能在原文或用户问题中找到。它挡住代价最高的数字类编造，且不限制措辞。正文文字不再要求逐字不动，忠实性由审查子智能体负责。
+### 降级与发布标记
 
-### 降级与用户接受
+流程不重试、也不询问用户，因此不存在「用户接受未核验结论」这条路径。以下情况直接输出程序生成的固定卡片：未提供工具调用标识、整理或审查子智能体不可用、整理或合并输出不可解析、合并后没有可用条款。
 
-超过重试上限后工具询问用户是否接受当前答案，并展示审查给出的具体原因。用户接受则发布模型结果并标记 `answer_verified=false`；不接受则输出程序生成的固定卡片。
-
-模型不可用、子智能体启动失败或用户拒绝时，工具输出固定卡片。工具在返回结果中给出 `answer_source` 与 `answer_verified`，发布门只发布工具给出的 `answer_markdown`，因此发布判断只存在于工具一处。
+工具在返回结果中给出 `answer_source` 与 `answer_verified`。`answer_verified=false` 表示审查提出了意见，且意见已由主智能体合并进正文，不再是「未通过审查」的意思。发布门只发布工具给出的 `answer_markdown`，因此发布判断只存在于工具一处。
 
 子智能体在工具内启动并同步等待，父运行在等待期间占用一个 worker 槽位。默认并发足够单个用户使用，高并发时需要按 `max_jobs` 评估容量。
 
 ### 发布门
 
 `chat_service` 在保存助手消息前检查该轮上下文是否启用 `power-spec` 技能。命中时用工具返回的 `answer_markdown` 覆盖模型输出，模型自行改写的版本不会落库。这个问题在排查答案格式异常时很关键：如果卡片字段正确但文字被改写，说明覆盖未生效。
+
+覆盖只认**本轮**产生的检索结果。checkpoint 的 `messages` 是线程完整历史，直接倒序取第一个带 `answer_markdown` 的工具消息会在本轮未调用检索工具时命中上一轮的卡片，把旧结果当成本轮答案。归属判定优先按当前运行的 `tool_call_id`，与工具消息对账使用同一标准；运行归属不可用时按最后一条用户消息划界。本轮没有检索结果时回退到模型自己的内容。
 
 ## 数据 Owner 与形态
 
@@ -148,12 +160,14 @@ sequenceDiagram
 | 现象 | 含义 | 下一步 |
 | --- | --- | --- |
 | `未检索到资料` | 无可用证据，或证据未通过投影校验 | 分层确认召回数量与校验结论 |
+| `该知识库未配置重排模型，无法检索电力规范` | 知识库 `query_options.reranker_model` 为空 | 在知识库查询设置里选一个重排模型；这一条不会伪装成无资料 |
 | `电力规范知识库尚未完成条款级重建` | 有召回但全部被元数据过滤 | 检查 `processing_params.power_spec` |
 | 入库失败 `length of varchar field content exceeds max length` | 字节上限 | 检查字节切分是否生效 |
 | 卡片字段正确但文字被改写 | 发布门未生效 | 检查该轮上下文是否启用技能 |
+| 第二轮重复出现上一轮的卡片 | 发布门跨轮取用了历史工具结果 | 检查该轮是否调用过检索工具；未调用时应当只输出模型自己的内容 |
 | 条款缺失 | 重建窗口或解析规则截断 | 对比全文行数与条款数 |
-| `answer_source=fixed_card` | 子智能体不可用、结论为空或用户拒绝 | 查看日志中的降级原因 |
-| `answer_verified=false` | 用户接受了未通过审查的答案 | 检查该轮接受询问结果 |
+| `answer_source=fixed_card` | 子智能体不可用，或整理/合并输出里找不到 JSON 对象 | 查看日志中的降级原因；对比子智能体线程里的原始输出 |
+| `answer_verified=false` | 审查提出了意见，已合并进正文 | 查看日志中的审查意见条数 |
 | 子 run 立即变为 `cancelled` | 父运行缺少运行态（lease/owner） | 用真实页面运行复现，不要注入运行记录 |
 
 工具会把结果缓存在运行上下文里，同一轮对话不会重复检索。排查时使用新的会话线程，避免读到上一轮的缓存结果。
@@ -164,7 +178,7 @@ sequenceDiagram
 - [条款解析与重建](https://github.com/xerrors/Yuxi/blob/main/backend/package/yuxi/knowledge/power_spec/ingestion.py)：标准信息、条款边界、范围识别、质量门与元数据重建
 - [意图分析](https://github.com/xerrors/Yuxi/blob/main/backend/package/yuxi/knowledge/power_spec/intent.py)：模型意图识别、规则兜底与确认卡片
 - [召回与校验](https://github.com/xerrors/Yuxi/blob/main/backend/package/yuxi/knowledge/power_spec/retrieval.py)：证据适配、现行过滤、维度匹配、投影校验与字段校对
-- [答案组织与渲染](https://github.com/xerrors/Yuxi/blob/main/backend/package/yuxi/knowledge/power_spec/answer.py)：整理与审查编排、重试、固定字段卡片渲染
+- [答案组织与渲染](https://github.com/xerrors/Yuxi/blob/main/backend/package/yuxi/knowledge/power_spec/answer.py)：整理、审查与最终合并编排、固定字段卡片渲染
 - [检索工具](https://github.com/xerrors/Yuxi/blob/main/backend/package/yuxi/knowledge/power_spec/tool.py)：权限、意图确认、行为链编排与结果缓存
 - [数据契约](https://github.com/xerrors/Yuxi/blob/main/backend/package/yuxi/knowledge/power_spec/contracts.py)：查询、证据与验证结果模型
 - [Milvus executor](https://github.com/xerrors/Yuxi/blob/main/backend/package/yuxi/knowledge/implementations/milvus.py)：分块、字节切分、双写与召回
@@ -446,16 +460,19 @@ PY
 
 ### 重建
 
-修改解析规则、治理 OCR 输出或调整分块预设后，元数据不会自动更新，必须重新解析或重建。
+修改解析规则、治理 OCR 输出或调整分块预设后，元数据与 chunk 都不会自动更新，必须重建。两者的触发方式不同：
+
+- **chunk**：走入库任务（`knowledge_index`），它会重新读解析后的 Markdown 并按当前预设重新切分。`indexed` 状态允许重新入库。
+- **条款元数据**：走重建服务。**`indexed` 状态的文件不允许再次解析**（`parse_file` 只接受 `error_parsing`／`uploaded`／`failed`），所以重建元数据不能靠「重新解析」按钮，要用下面的脚本或重新上传文件。
 
 ```bash
 docker compose exec -T api python - <<'PY'
 import asyncio
-from server.routers.knowledge_router import _read_power_spec_source
 from yuxi.knowledge.power_spec import PowerSpecRebuildFile, PowerSpecRebuildService
 from yuxi.knowledge.power_spec.ingestion import PostgresPowerSpecExtractionStore
 from yuxi.knowledge.runtime import knowledge_base
 from yuxi.repositories.power_spec_repository import PowerSpecRepository
+from yuxi.services.knowledge_task_service import _read_power_spec_source
 from yuxi.storage.postgres.manager import pg_manager
 
 KB, FID = "kb_xxx", "file_xxx"
@@ -468,6 +485,7 @@ async def main():
             [rebuild_file], source=lambda _file: _read_power_spec_source(KB, FID), dry_run=False
         )
         print("rebuild=", report.items[0].model_dump(mode="json"))
+        await db.commit()
     result = await knowledge_base.index_file(KB, FID, operator_id="1")
     print("index status=", result.get("status"), "chunks=", result.get("chunk_count"))
 
@@ -476,12 +494,17 @@ asyncio.run(main())
 
 先把 `dry_run` 设为 `True` 可以只运行质量门而不写库，用于确认新规则是否会被拒绝。重建会覆盖该文件的条款元数据并重新生成 chunk，因此不要在共享知识库上批量试跑。
 
-## 尚未接入的能力
+重建完成后按同一份 Markdown 核对两个投影是否一致：元数据 `clauses` 条数与文件 `chunk_count` 应当相等（条款与 chunk 一一对应）。
 
-以下能力已实现并通过单元测试，但当前没有生产调用方。评审时不要把它们的当前形态当作生效链路的一部分。
+## 已清理的未接入能力
 
-- `power_spec/ingestion.py` 的 `PowerSpecIngestionService` 与 `extract_from_source`：模型辅助的单文件提取入口；页面重建走同模块的 `PowerSpecRebuildService`。
-- `power_spec/retrieval.py` 的 `adapt_graph_results`：图谱节点到条款证据的适配；当前召回只走向量与重排。
+以下能力曾有实现与单元测试，但没有生产调用方，已于 2026-09-23 删除，避免评审时误以为它们是生效链路的一部分：
+
+- `PowerSpecIngestionService` 与 `extract_from_source`：模型辅助的单文件提取入口。入库实际走 `PowerSpecRebuildService`，解析走 `parse_power_spec_text`。
+- `adapt_graph_results` 与 `_is_clause_node`：图谱节点到条款证据的适配。召回当前只走向量与重排，`tool.graph_search` 只是从同一路结果里筛 `graph_score`。
+- `build_clause_tags`、`PowerSpecExtractionStore`、`AsyncPowerSpecTextSource`：只服务于上面两个入口的辅助定义。
+
+若将来要接入图谱召回或独立提取入口，按当时的真实需求重新实现，而不是恢复这批定义。
 
 链路的生效路径是 `tool.py` 编排的意图确认与召回校验，以及 `answer.py` 的整理审查。
 
@@ -490,14 +513,14 @@ asyncio.run(main())
 | 配置 | 位置 | 作用 |
 | --- | --- | --- |
 | `chunk_preset_id = power_spec` | 知识库 `additional_params` | 启用条款分块与条款提取 |
-| `reranker_model` | 知识库 `query_options` | 缺少时工具直接判定无证据 |
+| `reranker_model` | 知识库 `query_options` | 缺失时工具直接返回「该知识库未配置重排模型」，不发起检索 |
 | `recall_top_k`、`bm25_top_k`、`final_top_k` | 工具内的检索选项 | 召回与候选宽度 |
 | `max_execution_steps` | Agent `config_json.context` | 电力规范 Agent 期望值 300 |
 | `POWER_SPEC_INTENT_ENABLED` | 环境变量 | 关闭后意图识别直接走规则解析 |
-| `POWER_SPEC_INTENT_MAX_TOKENS` | 环境变量 | 意图识别的输出额度，受服务上下文上限约束 |
+| `POWER_SPEC_INTENT_MAX_TOKENS` | 环境变量 | 意图识别、条款校对与最终整理共用的输出额度，受服务上下文上限约束 |
 | `POWER_SPEC_ORGANIZE_ENABLED` | 环境变量 | 关闭后答案直接使用固定卡片 |
-| `POWER_SPEC_ORGANIZE_MAX_ATTEMPTS` | 环境变量 | 答案组织的校验重试上限 |
-| `POWER_SPEC_ORGANIZE_MAX_TOKENS` | 环境变量 | 答案组织的输出额度，受服务上下文上限约束 |
+| `POWER_SPEC_CLAUSE_REVIEW_ENABLED` | 环境变量 | 关闭后跳过条款编号与标题的模型校对 |
+| `POWER_SPEC_KEYWORD_QUERY_TERMS` | 环境变量 | 模型关键词召回使用的关键词数量上限（默认 8） |
 | `EMBEDDING_RETRYABLE_STATUS_CODES` | `models/embed.py` | 可重试的嵌入状态码 |
 | `MAX_MILVUS_CONTENT_CHARS` | `chunking/ragflow_like/dispatcher.py` | 分块阶段长度保护 |
 

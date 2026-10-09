@@ -1,13 +1,13 @@
 import pytest
 
 from yuxi.knowledge.power_spec import tool as tool_module
+from yuxi.knowledge.power_spec.contracts import INTENT_ATTEMPTS_EXHAUSTED_MESSAGE
 from yuxi.knowledge.power_spec.intent import (
-    INTENT_ATTEMPTS_EXHAUSTED_MESSAGE,
     extract_correction_text,
     parse_intent_confirmation,
     parse_power_spec_query,
 )
-from yuxi.knowledge.power_spec.tool import NO_EVIDENCE_MESSAGE, search_power_spec
+from yuxi.knowledge.power_spec.tool import RETRIEVAL_NOT_CONFIGURED_MESSAGE, search_power_spec
 
 QUESTION = "220 的变压器色谱多久做一回？氢气总烃多少算超标？"
 
@@ -18,11 +18,14 @@ class Context:
 
 
 class Runtime:
-    context = Context()
+    """每次实例化都给出独立上下文，避免工具的结果缓存在测试之间泄漏。"""
+
+    def __init__(self):
+        self.context = Context()
 
 
 class _FakeKnowledgeBase:
-    """缺少 reranker 配置时工具在确认之后直接返回无证据。"""
+    """缺少 reranker 配置时工具在确认之后报出配置缺失，而不是伪装成无资料。"""
 
     async def get_kb_config(self, kb_id):
         return type("Config", (), {"query_options": {}})()
@@ -63,7 +66,7 @@ async def test_confirming_intent_once_continues_to_retrieval(monkeypatch):
 
     result = await search_power_spec.coroutine(query_text=QUESTION, confirmed_intent=False, runtime=Runtime())
 
-    assert result == NO_EVIDENCE_MESSAGE
+    assert result == RETRIEVAL_NOT_CONFIGURED_MESSAGE
     assert len(queue.payloads) == 1
     plan = queue.payloads[0]["intent_plan"]
     assert plan["voltage_level"] == "220kV"
@@ -83,7 +86,7 @@ async def test_rejecting_intent_with_correction_asks_for_confirmation_again(monk
 
     result = await search_power_spec.coroutine(query_text=QUESTION, confirmed_intent=False, runtime=Runtime())
 
-    assert result == NO_EVIDENCE_MESSAGE
+    assert result == RETRIEVAL_NOT_CONFIGURED_MESSAGE
     assert len(queue.payloads) == 2
     assert queue.payloads[0]["source"] == "power_spec_intent_confirmation"
     assert queue.payloads[1]["source"] == "power_spec_intent_confirmation"
@@ -105,7 +108,7 @@ async def test_rejecting_intent_without_correction_asks_for_details(monkeypatch)
 
     result = await search_power_spec.coroutine(query_text=QUESTION, confirmed_intent=False, runtime=Runtime())
 
-    assert result == NO_EVIDENCE_MESSAGE
+    assert result == RETRIEVAL_NOT_CONFIGURED_MESSAGE
     assert [payload["source"] for payload in queue.payloads] == [
         "power_spec_intent_confirmation",
         "power_spec_intent_correction",
@@ -145,7 +148,7 @@ async def test_confirmed_intent_skips_user_confirmation(monkeypatch):
 
     result = await search_power_spec.coroutine(query_text=QUESTION, confirmed_intent=True, runtime=Runtime())
 
-    assert result == NO_EVIDENCE_MESSAGE
+    assert result == RETRIEVAL_NOT_CONFIGURED_MESSAGE
     assert queue.payloads == []
 
 

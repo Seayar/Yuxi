@@ -378,6 +378,7 @@ services:
       MINIO_ADDRESS: minio:9000
       MINIO_ACCESS_KEY_ID: ${MINIO_ACCESS_KEY:-minioadmin}
       MINIO_SECRET_ACCESS_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_REGION: us-east-1
       MILVUS_LOG_LEVEL: error
     volumes:
       - type: bind
