@@ -76,6 +76,14 @@ def test_render_srs_cards_reports_missing_values_instead_of_omitting_fields():
     assert "**条款在源文件中的位置**：未提供" in markdown
 
 
+def test_render_srs_cards_keeps_clause_body_label_out_of_previous_item():
+    markdown = format_power_spec_results("变压器巡检周期", [_evidence()])["answer_markdown"]
+
+    # 「条款正文」标签必须是独立列表项、正文是列表项之外的独立段落：否则
+    # Markdown 懒续行会把标签并进上一条「条款标题」，正文（含表格）无法独立渲染。
+    assert "\n- **条款正文**\n\n" in markdown
+
+
 def test_apply_organized_clauses_uses_model_values_but_keeps_code_format():
     evidence = _evidence()
     clause = type(

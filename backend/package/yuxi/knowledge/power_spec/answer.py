@@ -591,7 +591,9 @@ def render_srs_cards(query: str, items: Sequence[dict]) -> str:
             if key in CONDITIONAL_SRS_FIELDS and not value:
                 continue
             if key == "clause_body":
-                lines.extend([f"**{label}**", "", str(value or "未提供"), ""])
+                # 标签写成独立列表项、与正文之间保留空行：缺前者会被 Markdown 懒续
+                # 行并进上一条「条款标题」，缺后者则正文并进列表项、表格无法渲染。
+                lines.extend([f"- **{label}**", "", str(value or "未提供"), ""])
                 continue
             lines.append(f"- **{label}**：{value if value else '未提供'}")
         lines.extend([f"- **引用**：[source:{item['citation_key']}]", ""])
