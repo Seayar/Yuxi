@@ -908,3 +908,113 @@ async def test_query_filters_orphaned_chunks_from_search_results(monkeypatch):
 
     assert len(chunks) == 1
     assert chunks[0]["content"] == "live content"
+
+
+def test_connect_milvus_with_retry_succeeds_first_attempt(monkeypatch):
+    attempts = {"count": 0}
+
+    def ok_connect(**kwargs):
+        del kwargs
+        attempts["count"] += 1
+        return None
+
+    monkeypatch.setattr(milvus_module.connections, "connect", ok_connect)
+
+    milvus_module.connect_milvus_with_retry(alias="a", uri="http://milvus:19530", max_attempts=3, base_delay=0)
+
+    assert attempts["count"] == 1
+
+
+def test_connect_milvus_with_retry_recovers_after_transient_failure(monkeypatch):
+    from pymilvus.exceptions import MilvusException
+
+    attempts = {"count": 0}
+    sleeps = []
+
+    def flaky_connect(**kwargs):
+        del kwargs
+        attempts["count"] += 1
+        if attempts["count"] < 3:
+            raise MilvusException(message="Milvus Proxy is not ready yet. please wait")
+        return None
+
+    monkeypatch.setattr(milvus_module.connections, "connect", flaky_connect)
+    monkeypatch.setattr(milvus_module.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    milvus_module.connect_milvus_with_retry(alias="a", uri="http://milvus:19530", max_attempts=5, base_delay=1)
+
+    assert attempts["count"] == 3
+    assert sleeps == [1.0, 2.0]
+
+
+def test_connect_milvus_with_retry_backoff_caps_at_max_delay(monkeypatch):
+    from pymilvus.exceptions import MilvusException
+
+    sleeps = []
+
+    def always_fail(**kwargs):
+        del kwargs
+        raise MilvusException(message="Fail connecting to server")
+
+    monkeypatch.setattr(milvus_module.connections, "connect", always_fail)
+    monkeypatch.setattr(milvus_module.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    with pytest.raises(MilvusException):
+        milvus_module.connect_milvus_with_retry(
+            alias="a", uri="http://milvus:19530", max_attempts=6, base_delay=1, max_delay=10
+        )
+
+    assert sleeps == [1.0, 2.0, 4.0, 8.0, 10.0]
+
+
+def test_connect_milvus_with_retry_fails_after_exhaustion(monkeypatch):
+    from pymilvus.exceptions import MilvusException
+
+    attempts = {"count": 0}
+    last_exc = None
+
+    def always_fail(**kwargs):
+        nonlocal last_exc
+        del kwargs
+        attempts["count"] += 1
+        last_exc = MilvusException(message="Fail connecting to server")
+        raise last_exc
+
+    monkeypatch.setattr(milvus_module.connections, "connect", always_fail)
+    monkeypatch.setattr(milvus_module.time, "sleep", lambda _: None)
+
+    with pytest.raises(MilvusException) as exc_info:
+        milvus_module.connect_milvus_with_retry(alias="a", uri="http://milvus:19530", max_attempts=4, base_delay=1)
+
+    assert attempts["count"] == 4
+    assert exc_info.value is last_exc
+
+
+def test_connect_milvus_with_retry_does_not_retry_non_milvus_errors(monkeypatch):
+    attempts = {"count": 0}
+    sleeps = []
+
+    def bad_connect(**kwargs):
+        del kwargs
+        attempts["count"] += 1
+        raise ValueError("invalid uri")
+
+    monkeypatch.setattr(milvus_module.connections, "connect", bad_connect)
+    monkeypatch.setattr(milvus_module.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    with pytest.raises(ValueError):
+        milvus_module.connect_milvus_with_retry(alias="a", uri="not-a-uri", max_attempts=5)
+
+    assert attempts["count"] == 1
+    assert sleeps == []
+
+
+def test_connect_milvus_with_retry_rejects_zero_attempts(monkeypatch):
+    def unexpected_connect(**kwargs):
+        del kwargs
+        raise AssertionError("connect must not be called for max_attempts < 1")
+
+    monkeypatch.setattr(milvus_module.connections, "connect", unexpected_connect)
+
+    with pytest.raises(ValueError):
+        milvus_module.connect_milvus_with_retry(alias="a", uri="http://milvus:19530", max_attempts=0)

@@ -20,6 +20,7 @@ from pymilvus import (
     db,
     utility,
 )
+from pymilvus.exceptions import MilvusException
 
 from yuxi.config.options import system_options
 from yuxi.knowledge.base import FileStatus, KnowledgeBase
@@ -79,6 +80,45 @@ async def _run_milvus_query_io(func, /, *args, **kwargs):
 
     task.add_done_callback(release_capacity)
     return await asyncio.shield(task)
+
+
+MILVUS_CONNECT_MAX_ATTEMPTS = 24
+MILVUS_CONNECT_BASE_DELAY = 1.0
+MILVUS_CONNECT_MAX_DELAY = 10.0
+
+
+def connect_milvus_with_retry(
+    *,
+    alias: str,
+    uri: str,
+    token: str = "",
+    max_attempts: int = MILVUS_CONNECT_MAX_ATTEMPTS,
+    base_delay: float = MILVUS_CONNECT_BASE_DELAY,
+    max_delay: float = MILVUS_CONNECT_MAX_DELAY,
+) -> None:
+    """连接 Milvus，并对代理启动期/重启期的瞬时不可用做有界指数退避重试。
+
+    knowledge_base 是 required 启动组件：冷启动时 Milvus proxy 可能尚未就绪
+    （返回 "Milvus Proxy is not ready yet"），此时直接失败会让 API 进程退出并留下
+    僵尸 reload 进程。这里以有界重试等待依赖就绪而非硬失败；超过 max_attempts
+    仍抛出最后一次 MilvusException，不把未就绪伪装为成功。
+    """
+
+    if max_attempts < 1:
+        raise ValueError(f"max_attempts must be >= 1, got {max_attempts}")
+
+    delay = base_delay
+    for attempt in range(1, max_attempts + 1):
+        try:
+            connections.connect(alias=alias, uri=uri, token=token)
+            return
+        except MilvusException as exc:
+            if attempt == max_attempts:
+                logger.error(f"Failed to connect to Milvus after {max_attempts} attempts: uri={uri}: {exc}")
+                raise
+            logger.warning(f"Milvus not ready (attempt {attempt}/{max_attempts}), retrying in {delay:.1f}s: {exc}")
+            time.sleep(delay)
+        delay = min(delay * 2, max_delay)
 
 
 @dataclass(kw_only=True)
@@ -323,8 +363,8 @@ class MilvusKB(KnowledgeBase):
     def _init_connection(self):
         """初始化 Milvus 连接"""
         try:
-            # 连接到 Milvus
-            connections.connect(alias=self.connection_alias, uri=self.milvus_uri, token=self.milvus_token)
+            # 连接到 Milvus（对启动期瞬时不可用做有界重试）
+            connect_milvus_with_retry(alias=self.connection_alias, uri=self.milvus_uri, token=self.milvus_token)
 
             # 创建数据库（如果不存在）
             try:
