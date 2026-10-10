@@ -1,6 +1,6 @@
 # 知识库机制
 
-本页说明文档怎样从上传走到可检索状态，以及 PostgreSQL、MinIO、Milvus、Neo4j、Durable Task 和 Agent 工具各自负责什么。第一次操作知识库请看[创建并使用知识库](../intro/knowledge-base.md)，解析器配置见[文档处理与 OCR](../advanced/document-processing.md)。
+本页说明文档怎样从上传走到可检索状态，以及 PostgreSQL、MinIO、Milvus、图数据库（Neo4j / TuGraph）、Durable Task 和 Agent 工具各自负责什么。第一次操作知识库请看[创建并使用知识库](../intro/knowledge-base.md)，解析器配置见[文档处理与 OCR](../advanced/document-processing.md)。
 
 ## 能力边界
 
@@ -26,7 +26,7 @@ flowchart LR
     MilvusKB --> PG[("PostgreSQL")]
     MilvusKB --> Object[("MinIO")]
     MilvusKB --> Vector[("Milvus")]
-    MilvusKB --> Graph[("Neo4j，可选")]
+    MilvusKB --> Graph[("图数据库（Neo4j / TuGraph），可选")]
     Connector --> External["外部检索 API"]
 
     Context["Agent Context.knowledges"] --> Visible["用户权限 ∩ Agent 选择"]
@@ -72,7 +72,7 @@ stateDiagram-v2
 | PostgreSQL | 知识库配置、权限、文件元数据和状态、chunk 正文、图谱处理状态、Task 执行意图与 lease | 原文件字节、向量索引 |
 | MinIO | 上传原件、解析 Markdown、解析图片 | 文件当前状态、用户权限 |
 | Milvus | chunk 向量、BM25/混合检索字段、图实体和关系向量 | 权限、文件状态 |
-| Neo4j | 可选的实体、关系和 chunk 关联 | 原文件、权限和检索排序 |
+| 图数据库（Neo4j / TuGraph） | 可选的实体、关系和 chunk 关联 | 原文件、权限和检索排序 |
 | Redis / ARQ | Task 投递与 worker 唤醒、知识库最小运行配置缓存 | Task 最终状态、配置最终值、文件状态 |
 
 Milvus 索引会把 chunk 写入 PostgreSQL 和 Milvus。它不是跨存储事务：任一侧失败时会尝试补偿并把文件置为 `error_indexing`，排查时需要同时查看两侧。
@@ -83,7 +83,7 @@ Milvus 索引会把 chunk 写入 PostgreSQL 和 Milvus。它不是跨存储事�
 
 worker 用唯一 attempt token claim Task 并续租 lease；重复投递和失权 worker 的迟到写入会被 PostgreSQL 拒绝。首次发布失败时，pending Task 保留，启动和周期 publisher 会补发。所有 Durable Task 在 owner 中断或 lease 过期后都会明确失败，不自动重放未知外部副作用。
 
-批量“待解析”和“待入库”入口按状态筛选文件，并通过数据库 dedupe key 拒绝活跃重复任务。取消运行中任务时先保存 `cancel_requested`，由 worker 在控制点收敛。重试前保留故障现场，检查文件记录、MinIO、chunk、Milvus 和 Neo4j，再选择重新解析、重新索引或图谱修复。
+批量“待解析”和“待入库”入口按状态筛选文件，并通过数据库 dedupe key 拒绝活跃重复任务。取消运行中任务时先保存 `cancel_requested`，由 worker 在控制点收敛。重试前保留故障现场，检查文件记录、MinIO、chunk、Milvus 和图数据库（Neo4j / TuGraph），再选择重新解析、重新索引或图谱修复。
 
 ## Agent 如何看到知识库
 
@@ -132,4 +132,4 @@ Agent 的 `knowledges` 只能缩小用户已有权限。子智能体使用自己
 - [知识库 HTTP integration](https://github.com/xerrors/Yuxi/blob/main/backend/test/integration/api/test_knowledge_router.py)
 - [外部知识库 integration](https://github.com/xerrors/Yuxi/blob/main/backend/test/integration/api/test_knowledge_external_router.py)
 
-修改状态、权限、存储或 Agent 工具链路时，至少运行对应 unit 和真实 HTTP integration；涉及外部存储时，从 PostgreSQL、MinIO、Milvus 或 Neo4j 回读最终结果。
+修改状态、权限、存储或 Agent 工具链路时，至少运行对应 unit 和真实 HTTP integration；涉及外部存储时，从 PostgreSQL、MinIO、Milvus 或图数据库（Neo4j / TuGraph）回读最终结果。

@@ -21,7 +21,7 @@ Yuxi 是一个面向 RAG、知识图谱和多智能体工作流的知识库平�
 - `redis`：ARQ 投递、运行事件、取消信号以及跨进程配置和模型缓存。
 - `minio`：附件、知识库原始文件和其他对象数据。
 - `milvus`、`etcd`：向量检索及其元数据协调。
-- `graph`：Neo4j 知识图谱。
+- `graph`：Neo4j 知识图谱；可选 `tugraph` 服务提供 TuGraph 后端（`GRAPH_BACKEND=tugraph`）。
 - `mineru-api`、`paddlex`：通过 `all` profile 可选启动的文档解析和 OCR 服务。
 
 ## 后端代码地图
@@ -46,8 +46,8 @@ Yuxi 只交付完整知识能力路径。API 始终注册 `external_kb`、`knowl
 - `storage/postgres` 管理 SQLAlchemy 模型、业务连接池和 LangGraph checkpoint 连接池。
 - `storage/redis` 管理同步/异步 Redis 客户端和 ARQ 连接参数；业务 key、事件格式和缓存语义留在各自服务中。
 - `storage/minio` 管理对象上传、下载和临时文件访问。
-- `storage/neo4j` 管理共享 Neo4j Driver、生命周期和图查询辅助。
-- `knowledge` 是知识库、文档解析、评估和图谱领域。`runtime.py` 暴露运行时知识库管理器；`preview.py` 拥有 Knowledge metadata、MinIO 原始对象读取和 MinIO Office PDF 缓存；`implementations` 放 Milvus、Dify、Notion 和只读连接器；`parser` 统一封装 OCR/文档解析；`chunking` 管理分块策略；`graphs` 管理 Milvus 与 Neo4j 图谱能力。
+- `storage/graph_connection` 管理共享图数据库连接（Neo4j 或 TuGraph）、Bolt 读写辅助与生命周期。
+- `knowledge` 是知识库、文档解析、评估和图谱领域。`runtime.py` 暴露运行时知识库管理器；`preview.py` 拥有 Knowledge metadata、MinIO 原始对象读取和 MinIO Office PDF 缓存；`implementations` 放 Milvus、Dify、Notion 和只读连接器；`parser` 统一封装 OCR/文档解析；`chunking` 管理分块策略；`graphs` 管理 Milvus 与图数据库（Neo4j / TuGraph）图谱能力。
 - `models` 封装 chat、embedding 和 rerank 模型适配；`models/providers` 使用 PostgreSQL 保存模型供应商，并通过 Redis 缓存向 API 和 worker 提供一致视图。
 - `config` 区分系统级配置和用户级配置。PostgreSQL 持久化系统配置和用户配置；Redis 只保存带版本失效的短缓存，旧 `base.toml` 只作为一次性迁移来源。
 - `utils` 只放跨领域且足够通用的日志、时间、SSE 和轻量工具；`filepreview.py` 提供不依赖存储、领域或 HTTP 的格式识别、文本渲染和 Office 转换原语。

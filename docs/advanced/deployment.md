@@ -240,6 +240,7 @@ Yuxi 本体使用 MIT License。Compose 依赖以独立进程运行，Yuxi 通�
 | etcd | `quay.io/coreos/etcd:v3.5.5` | Apache-2.0 |
 | PostgreSQL | `postgres:16` | PostgreSQL License |
 | Redis | `redis:7.4.10-alpine` | RSALv2 / SSPLv1（均非 OSI 许可证） |
+| TuGraph（可选 `tugraph` profile） | `tugraph/tugraph-runtime-centos7:4.5.2` | Apache-2.0 |
 | MinerU / PaddleX（可选） | `mineru-vllm:latest` / `paddlex:latest` | 以各自 Dockerfile 和上游声明为准 |
 
 这张表只覆盖 Compose 的主要镜像本体，不是完整的软件物料清单，也不承诺 `latest` 镜像的内容固定。镜像还可能包含各自的基础系统和传递依赖，离线交付前要按实际 digest 核对许可证、版权声明和对应源码。
@@ -255,3 +256,19 @@ NEO4J_ACCEPT_LICENSE_AGREEMENT=yes
 ```
 
 同时按 Neo4j 官方订阅协议确认许可范围；替换镜像不会自动迁移或改变现有数据卷。以上是工程侧边界，不构成法律意见；再分发、修改组件或对外托管前请让法务按具体版本和交付方式确认。
+
+### 图数据库后端
+
+默认使用 Neo4j（`GRAPH_BACKEND=neo4j`）。需要 TuGraph 时设置 `GRAPH_BACKEND=tugraph`
+并启动可选 profile：
+
+```bash
+docker compose --profile tugraph up -d tugraph
+```
+
+TuGraph 使用强 Schema 且每个点/边只有一个标签，应用会在首次写入前自动创建
+`Chunk`/`Entity`、`MENTIONS`/`RELATION` 标签；隔离按 `kb_id` 属性进行。生产必须为
+TuGraph 显式设置强口令（`TUGRAPH_PASSWORD`），Compose 不为生产提供默认口令。
+
+Neo4j 与 TuGraph 的图谱数据相互独立。切换 `GRAPH_BACKEND` 前，请先对相关知识库执行图谱
+`reset`；图谱 `reset` 只清理当前生效后端的数据，不会自动迁移另一后端的存量图谱。

@@ -196,12 +196,12 @@ async def _shutdown_component(name: str, operation: Callable[[], object]) -> Non
         logger.error(f"Shutdown component failed: component={name}, type={type(exc).__name__}")
 
 
-def _close_neo4j_connection() -> object:
-    """关闭共享图数据库连接。"""
+def _close_graph_connection() -> object:
+    """关闭共享图数据库连接（Neo4j 或 TuGraph）。"""
 
-    from yuxi.storage.neo4j import close_shared_neo4j_connection
+    from yuxi.storage.graph_connection import close_shared_graph_connection
 
-    return close_shared_neo4j_connection()
+    return close_shared_graph_connection()
 
 
 @asynccontextmanager
@@ -217,5 +217,5 @@ async def lifespan(app: FastAPI):
         app.state.startup_complete = False
         await _shutdown_component("sandbox_provider", shutdown_sandbox_provider)
         await _shutdown_component("queue_clients", close_queue_clients)
-        await _shutdown_component("neo4j", _close_neo4j_connection)
+        await _shutdown_component("graph", _close_graph_connection)
         await _shutdown_component("postgres", pg_manager.close)

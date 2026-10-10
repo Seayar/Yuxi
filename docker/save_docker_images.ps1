@@ -20,6 +20,7 @@ $Images = @(
     "node:24-slim",
     "nginx:alpine",
     "neo4j:5.26.29",
+    "tugraph/tugraph-runtime-centos7:4.5.2",
     "quay.io/coreos/etcd:v3.5.5",
     "quay.io/minio/minio:RELEASE.2023-03-20T20-16-18Z",
     "milvusdb/milvus:v2.5.6",

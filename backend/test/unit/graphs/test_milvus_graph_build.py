@@ -11,6 +11,7 @@ from yuxi.knowledge.graphs.extractors import (
     LLMGraphExtractor,
     normalize_extraction_result,
 )
+from yuxi.knowledge.graphs.graph_stores import Neo4jGraphStore
 from yuxi.knowledge.graphs.milvus_graph_service import MilvusGraphService
 from yuxi.knowledge.graphs.milvus_graph_vector_store import MilvusGraphVectorStore
 
@@ -909,7 +910,7 @@ def test_milvus_graph_service_writes_chunk_entity_and_relation():
     driver = MagicMock()
     driver.session.return_value = session
     connection = SimpleNamespace(driver=driver)
-    service = MilvusGraphService(neo4j_connection=connection)
+    service = MilvusGraphService(graph_connection=connection)
     chunk = SimpleNamespace(
         chunk_id="chunk_1",
         file_id="file_1",
@@ -974,9 +975,9 @@ def test_milvus_graph_service_delete_file_graph_uses_scoped_streaming_queries():
     session.execute_write.side_effect = lambda func: func(tx)
     driver = MagicMock()
     driver.session.return_value = session
-    service = MilvusGraphService(neo4j_connection=SimpleNamespace(driver=driver))
+    store = Neo4jGraphStore(SimpleNamespace(driver=driver))
 
-    service._delete_file_graph_from_neo4j("kb_test", "file_1")
+    store.delete_file_graph("kb_test", "file_1")
 
     queries = [call.args[0] for call in tx.run.call_args_list]
     assert len(queries) == 3
@@ -987,6 +988,25 @@ def test_milvus_graph_service_delete_file_graph_uses_scoped_streaming_queries():
     assert "collect(" not in cleanup_query
     assert "MATCH (e:Entity:MilvusKB:`kb_test` {kb_id: $kb_id})" not in cleanup_query
     assert "DETACH DELETE c" in queries[2]
+
+
+async def test_milvus_graph_service_delete_file_graph_forwards_orphan_lists():
+    graph_repo = MagicMock()
+    graph_repo.delete_file_references = AsyncMock(return_value=(["e1"], ["t1"]))
+    graph_vector_store = MagicMock()
+    graph_vector_store.delete_graph_records = AsyncMock()
+    store = MagicMock()
+    service = MilvusGraphService(
+        graph_repo=graph_repo,
+        graph_vector_store=graph_vector_store,
+        graph_store=store,
+    )
+
+    await service.delete_file_graph("kb_1", "file_1")
+
+    # 两个孤儿清单必须透传给 store；漏传 orphan_triple_ids 会让 TuGraph 残留孤儿边。
+    graph_vector_store.delete_graph_records.assert_called_once_with("kb_1", entity_ids=["e1"], triple_ids=["t1"])
+    store.delete_file_graph.assert_called_once_with("kb_1", "file_1", ["e1"], ["t1"])
 
 
 @pytest.mark.parametrize(
@@ -1046,11 +1066,9 @@ def test_milvus_graph_service_delete_file_graph_uses_scoped_streaming_queries():
         ),
     ],
 )
-def test_milvus_graph_service_process_query_result(
-    payload, limit, exclude_chunk, expected_node_ids, expected_edge_ids
-):
-    service = MilvusGraphService()
-    result = service._process_query_result(payload, limit=limit, kb_id="kb_test", exclude_chunk=exclude_chunk)
+def test_milvus_graph_service_process_query_result(payload, limit, exclude_chunk, expected_node_ids, expected_edge_ids):
+    store = Neo4jGraphStore()
+    result = store._process_query_result(payload, limit=limit, kb_id="kb_test", exclude_chunk=exclude_chunk)
 
     assert [node["id"] for node in result["nodes"]] == expected_node_ids
     assert [edge["id"] for edge in result["edges"]] == expected_edge_ids
@@ -1058,9 +1076,9 @@ def test_milvus_graph_service_process_query_result(
 
 @pytest.mark.parametrize("max_depth", [1, 2, 3])
 def test_milvus_graph_service_build_query_uses_requested_depth(max_depth):
-    service = MilvusGraphService()
+    store = Neo4jGraphStore()
 
-    query = service._build_query("kb_test", "entity", limit=20, max_depth=max_depth)
+    query = store._build_query("kb_test", "entity", limit=20, max_depth=max_depth)
 
     assert f"[*1..{max_depth}]" in query
     assert "nodes(path)" in query
@@ -1069,9 +1087,9 @@ def test_milvus_graph_service_build_query_uses_requested_depth(max_depth):
 
 
 def test_milvus_graph_service_build_query_excludes_chunks_from_entire_path():
-    service = MilvusGraphService()
+    store = Neo4jGraphStore()
 
-    query = service._build_query("kb_test", "entity", limit=20, max_depth=3, exclude_chunk=True)
+    query = store._build_query("kb_test", "entity", limit=20, max_depth=3, exclude_chunk=True)
 
     assert "NOT n:Chunk" in query
     assert "NOT path_node:Chunk" in query
@@ -1091,9 +1109,9 @@ def test_milvus_graph_service_query_nodes_sync_returns_complete_multi_hop_path()
     session.run.return_value = query_result
     driver = MagicMock()
     driver.session.return_value = session
-    service = MilvusGraphService(neo4j_connection=SimpleNamespace(driver=driver))
+    store = Neo4jGraphStore(SimpleNamespace(driver=driver))
 
-    result = service._query_nodes_sync(
+    result = store._query_nodes_sync(
         "kb_test",
         "kb_test",
         "node-a",
@@ -1117,9 +1135,9 @@ def test_milvus_graph_service_query_nodes_sync_caps_max_depth():
     session.run.return_value = query_result
     driver = MagicMock()
     driver.session.return_value = session
-    service = MilvusGraphService(neo4j_connection=SimpleNamespace(driver=driver))
+    store = Neo4jGraphStore(SimpleNamespace(driver=driver))
 
-    service._query_nodes_sync(
+    store._query_nodes_sync(
         "kb_test",
         "kb_test",
         "node-a",

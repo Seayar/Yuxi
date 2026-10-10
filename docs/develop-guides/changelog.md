@@ -21,6 +21,10 @@
 
 ### 功能与修复
 
+- 知识图谱图数据库后端可切换：新增 `GRAPH_BACKEND`（默认 `neo4j`，可选 `tugraph`），
+  引入图存储抽象并按后端生成 Cypher；Compose 提供 `tugraph` profile 服务（镜像锁定
+  `tugraph/tugraph-runtime-centos7:4.5.2`）。详见
+  [TuGraph 后端决策](./decisions/implemented/2026-10-09-tugraph-graph-backend.md)。
 - 深度研究 Skill 不再依赖 `html-preview`，默认在当前 Workdir 的 `outputs/` 目录生成独立、响应式的 HTML 阅读文档并作为交付物展示；宽屏可使用侧栏目录，窄屏隐藏或折叠侧栏，并可按内容需要使用外部图片等公开资源。来源在 HTML 中以普通链接呈现；用户明确指定其他格式时仍以用户要求为准。
 - 新增用户定时智能体任务（Beta），支持 cron、时区、独立 Project 和立即运行；重叠执行跳过，错过的触发合并处理。边界见[定时任务决策](./decisions/implemented/2026-08-26-user-agent-scheduled-tasks.md)。
 - 支持空闲线程主动压缩上下文；达到预算 85% 时提示操作。自动压缩统一使用一个阈值，大工具结果保留完整文件及模型可读摘要，检索预览保留来源信息。

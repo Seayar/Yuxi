@@ -10,6 +10,7 @@
 | 5050 | API | API 和 Swagger 文档 |
 | 8002 | `sandbox-provisioner` | 本机排查 provisioner；只绑定 `127.0.0.1` |
 | 7474 / 7687 | Neo4j | HTTP 管理界面 / Bolt |
+| 7070 / 7688 | TuGraph（可选 `tugraph` profile） | HTTP 管理界面 / Bolt |
 | 9000 / 9001 | MinIO | 对象 API / 管理控制台 |
 | 19530 / 9091 | Milvus | gRPC / 健康检查 |
 | 5432 | PostgreSQL | 本机数据库维护 |
@@ -33,10 +34,11 @@ etcd 只在 Compose 网络内供 Milvus 使用，没有发布到宿主机。Mine
 - API 存活检查：<http://localhost:5050/api/system/health>
 - API 就绪检查：<http://localhost:5050/api/system/ready>
 - Neo4j：<http://localhost:7474>
+- TuGraph（启用 `tugraph` profile 时）：<http://localhost:7070>
 - 沙盒 provisioner：<http://localhost:8002/health>
 
 `/api/system/health` 只表示 API 进程存活；`/api/system/ready` 还会检查启动完成、PostgreSQL、Redis 和 worker 健康租约；provisioner 的 `/health` 表示自身进程、backend 和沙盒跟踪状态。三类接口都不能单独证明知识库、模型或 Agent 业务链路正确。
 
 ## 安全边界
 
-不要把 PostgreSQL、Redis、MinIO、Neo4j、Milvus 或 provisioner 的管理端口暴露到公网。生产入口、TLS、CORS 和密钥要求见[生产部署](./deployment.md)。
+不要把 PostgreSQL、Redis、MinIO、Neo4j、TuGraph、Milvus 或 provisioner 的管理端口暴露到公网。生产入口、TLS、CORS 和密钥要求见[生产部署](./deployment.md)。

@@ -18,7 +18,7 @@ Yuxi is built for teams that need control over their data, models, and permissio
 
 - **Build knowledge-based Q&A**: Upload documents, parse and chunk them, build vector indexes, and let agents answer questions using retrieved content.
 - **Execute multi-step tasks**: Combine tools, MCP, Skills, sub-agents, and sandboxes to produce previewable, downloadable files.
-- **Connect knowledge graphs**: Extract entities and relationships from document chunks in Milvus knowledge bases, store them in Neo4j, and use them in retrieval.
+- **Connect knowledge graphs**: Extract entities and relationships from document chunks in Milvus knowledge bases, store them in the graph database (Neo4j by default, optional TuGraph), and use them in retrieval.
 - **Manage team access**: Control access to knowledge bases, agents, Skills, and models by user, department, and sharing scope.
 - **Compare execution quality**: Evaluate knowledge base retrieval results, or use Langfuse Datasets to evaluate complete agent tasks.
 

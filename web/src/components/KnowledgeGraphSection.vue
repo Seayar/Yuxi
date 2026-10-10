@@ -784,7 +784,7 @@ const openFailedChunkSamples = async () => {
 const confirmResetGraph = () => {
   Modal.confirm({
     title: '清空并重建图谱',
-    content: '将删除该知识库在 Neo4j 中的图谱，重置 Chunk 图谱状态，并清空抽取结果与配置。',
+    content: '将删除该知识库在图数据库（Neo4j / TuGraph）中的图谱，重置 Chunk 图谱状态，并清空抽取结果与配置。',
     okText: '确认重置',
     cancelText: '取消',
     onOk: resetGraphBuild

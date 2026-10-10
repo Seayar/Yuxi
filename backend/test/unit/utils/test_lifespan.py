@@ -108,4 +108,4 @@ async def test_required_startup_component_failure_still_releases_every_runtime_c
         "default_agents": {"status": "error", "required": True, "code": "RuntimeError"}
     }
     assert "password" not in str(exc_info.value)
-    assert released == ["sandbox_provider", "queue_clients", "neo4j", "postgres"]
+    assert released == ["sandbox_provider", "queue_clients", "graph", "postgres"]

@@ -93,4 +93,4 @@ yuxi kb find --kb-id <kb-id> --file-id <file-id> --pattern "年假"
 - [知识库 HTTP integration](https://github.com/xerrors/Yuxi/blob/main/backend/test/integration/api/test_knowledge_router.py)
 - [外部知识库 integration](https://github.com/xerrors/Yuxi/blob/main/backend/test/integration/api/test_knowledge_external_router.py)
 
-修改导入、权限或查询接口时，运行真实 HTTP integration，并从 PostgreSQL、MinIO、Milvus 或 Neo4j 回读最终结果。
+修改导入、权限或查询接口时，运行真实 HTTP integration，并从 PostgreSQL、MinIO、Milvus 或图数据库（Neo4j / TuGraph）回读最终结果。

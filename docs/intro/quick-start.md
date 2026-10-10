@@ -121,7 +121,7 @@ docker compose up --build -d
 
 ### 知识库依赖启动失败
 
-默认拓扑需要 Milvus、etcd、MinIO 和 Neo4j。先查看对应服务的日志和健康状态：
+默认拓扑需要 Milvus、etcd、MinIO 和图数据库（默认 Neo4j）。先查看对应服务的日志和健康状态：
 
 ```bash
 docker compose ps milvus etcd minio graph

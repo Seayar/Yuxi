@@ -33,7 +33,7 @@ Yuxi 使用 LangGraph 组织智能体运行。管理员可以配置模型、系�
 
 ### 知识图谱
 
-Milvus 知识库可以从已索引的文档块中抽取实体和关系，并将图谱信息写入 Neo4j。检索时，系统可以把图谱结果与文本块结果融合；知识库详情页提供图谱构建、查询和展示入口。
+Milvus 知识库可以从已索引的文档块中抽取实体和关系，并将图谱信息写入图数据库（默认 Neo4j，可选 TuGraph）。检索时，系统可以把图谱结果与文本块结果融合；知识库详情页提供图谱构建、查询和展示入口。
 
 ### 团队治理
 
@@ -55,7 +55,7 @@ Worker 执行 LangGraph，写入事件和最终结果
 PostgreSQL 保存状态，前端通过 SSE 获取过程
 ```
 
-PostgreSQL 保存请求、运行、消息、知识库元数据和 LangGraph checkpoint；Redis 负责任务投递、短期事件、取消信号和缓存；MinIO 保存对象文件；Milvus 负责向量检索；Neo4j 保存可选知识图谱。
+PostgreSQL 保存请求、运行、消息、知识库元数据和 LangGraph checkpoint；Redis 负责任务投递、短期事件、取消信号和缓存；MinIO 保存对象文件；Milvus 负责向量检索；图数据库（Neo4j / TuGraph）保存可选知识图谱。
 
 ## 部署与沙盒
 
@@ -71,7 +71,7 @@ PostgreSQL 保存请求、运行、消息、知识库元数据和 LangGraph chec
 | API 与运行时 | FastAPI、LangGraph、ARQ | 请求接入、智能体编排和后台执行 |
 | 持久化 | PostgreSQL | 业务状态、知识库元数据和 checkpoint |
 | 缓存与事件 | Redis | 投递、短期事件、取消和缓存 |
-| 对象与检索 | MinIO、Milvus、Neo4j | 文件对象、向量索引和知识图谱 |
+| 对象与检索 | MinIO、Milvus、图数据库（Neo4j / TuGraph） | 文件对象、向量索引和知识图谱 |
 | 文档处理 | MinerU、PaddleX、RapidOCR 等 | 文档解析、版面分析和 OCR |
 | 部署 | Docker Compose | 开发与单机部署拓扑 |
 
