@@ -10,6 +10,8 @@ from yuxi.knowledge.power_spec import tool as _power_spec_tool  # noqa: F401
 # 故障溯源工具（导入即注册 trace_fault）
 from yuxi.knowledge.fault_trace import tool as _fault_trace_tool  # noqa: F401
 
+# 处置方案工具（导入即注册 generate_maintenance_plan）
+from yuxi.knowledge.maintenance_plan import tool as _maintenance_plan_tool  # noqa: F401
 
 # 工具获取函数
 from .registry import (

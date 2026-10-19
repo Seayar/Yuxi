@@ -48,7 +48,7 @@ async def test_discovered_presets_creates_orchestrator_and_subagents(monkeypatch
         "power-spec-organizer",
         "power-spec-reviewer",
         "fault-trace-agent",
-
+        "maintenance-plan-agent",
     }
 
     explorer = created["research-explorer"]
