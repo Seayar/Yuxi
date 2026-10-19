@@ -41,6 +41,7 @@ def test_normalize_payload_accepts_allowed_model_request_body_overrides():
         "thinking": {"type": "enabled"},
         "reasoning": {"future_provider_option": {"enabled": True}},
         "reasoning_effort": "high",
+        "temperature": 0,
     }
     payload = _normalize_payload(
         {

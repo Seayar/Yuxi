@@ -93,13 +93,22 @@ class BaseEmbeddingModel(ABC):
 
         return data
 
+    @staticmethod
+    def _is_context_length_error(exc: httpx.HTTPStatusError) -> bool:
+        """是否命中模型上下文长度上限（vLLM 以 400 返回并在 body 中说明）。"""
+        body = (exc.response.text or "").lower()
+        return "context length" in body
+
     async def _aencode_resilient(self, messages: list[str], depth: int = 0) -> list[list[float]]:
-        """对 413 payload 自适应拆批；单条超长文本以分片向量均值保持一对一输出。"""
+        """对 413/424 载荷过大与 400 上下文超限自适应拆批；单条超长文本以分片向量均值保持一对一输出。"""
 
         try:
             return await self.aencode(messages)
         except httpx.HTTPStatusError as exc:
-            if exc.response.status_code not in {413, 424} or depth >= EMBEDDING_MAX_SPLIT_DEPTH:
+            if (
+                exc.response.status_code not in {413, 424}
+                and not (exc.response.status_code == 400 and self._is_context_length_error(exc))
+            ) or depth >= EMBEDDING_MAX_SPLIT_DEPTH:
                 raise
             if len(messages) > 1:
                 midpoint = max(len(messages) // 2, 1)

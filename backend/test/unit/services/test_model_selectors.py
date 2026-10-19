@@ -329,6 +329,55 @@ def test_load_chat_model_merges_request_body_overrides_into_extra_body(monkeypat
     assert captured_body["thinking_budget"] == 1024
 
 
+def test_load_chat_model_request_body_temperature_overrides_caller(monkeypatch):
+    """模型级 temperature 作为全局参数生效：覆盖调用方显式温度。"""
+    captured_body = {}
+
+    monkeypatch.setattr(
+        "yuxi.models.chat.model_cache.get_model_info",
+        lambda spec: (
+            _chat_model_info(
+                "local",
+                "Qwen3.6-35B-A3B-w8a8",
+                request_body_overrides={"temperature": 0},
+            )
+            if spec == "local:Qwen3.6-35B-A3B-w8a8"
+            else None
+        ),
+    )
+
+    def capture_request(request: httpx.Request) -> httpx.Response:
+        captured_body.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "Qwen3.6-35B-A3B-w8a8",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(capture_request)) as http_client:
+        model = load_chat_model(
+            "local:Qwen3.6-35B-A3B-w8a8",
+            temperature=0.6,
+            http_client=http_client,
+        )
+        response = model.invoke("hello")
+
+    assert response.text == "ok"
+    assert captured_body["temperature"] == 0
+
+
 def test_load_chat_model_disable_thinking_sends_chat_template_kwargs(monkeypatch):
     captured_body = {}
 

@@ -1316,7 +1316,7 @@ defineExpose({
           />
           <small class="form-help">
             仅 OpenAI 兼容供应商（含 OpenRouter）的 chat 模型会通过 extra_body 透传；支持
-            enable_thinking、thinking_budget、thinking、reasoning 和 reasoning_effort。
+            enable_thinking、thinking_budget、thinking、reasoning、reasoning_effort 和 temperature。
           </small>
         </label>
 

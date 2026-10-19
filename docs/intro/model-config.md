@@ -89,7 +89,7 @@ siliconflow-cn:Pro/BAAI/bge-m3
 
 ## 配置聊天模型的请求参数
 
-OpenAI Completions API 兼容供应商的 `chat` 模型可以配置“模型请求参数 JSON”。Yuxi 会把它作为 OpenAI SDK 的 `extra_body` 合并到请求体顶层，用于支持不同供应商的思考或推理参数。
+OpenAI Completions API 兼容供应商的 `chat` 模型可以配置“模型请求参数 JSON”。Yuxi 会把它作为 OpenAI SDK 的 `extra_body` 合并到请求体顶层，用于支持不同供应商的思考、推理或采样参数。
 
 当前允许的顶层字段是：
 
@@ -100,6 +100,7 @@ OpenAI Completions API 兼容供应商的 `chat` 模型可以配置“模型请�
 | `thinking` | 供应商的思考配置对象 |
 | `reasoning` | 推理配置对象 |
 | `reasoning_effort` | OpenAI 风格的推理强度 |
+| `temperature` | 采样温度，例如 `0` 使输出更确定 |
 
 示例：
 

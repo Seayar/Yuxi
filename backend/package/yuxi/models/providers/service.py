@@ -27,6 +27,7 @@ ALLOWED_EXTRA_BODY_FIELDS = {
     "enable_thinking",
     "reasoning",
     "reasoning_effort",
+    "temperature",
     "thinking",
     "thinking_budget",
 }
