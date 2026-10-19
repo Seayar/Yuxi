@@ -93,7 +93,7 @@ async def test_run_knowledge_index_rebuilds_power_spec_metadata(monkeypatch):
         rebuilt.append(file_id)
 
     monkeypatch.setattr(knowledge_task_service, "knowledge_base", fake)
-    monkeypatch.setattr(knowledge_task_service, "_attach_power_spec_rebuild", fake_attach)
+    monkeypatch.setattr(knowledge_task_service, "attach_power_spec_rebuild", fake_attach)
 
     context = _FakeTaskContext({"kb_id": "kb_1", "file_ids": ["file_1", "file_2"], "params": {}, "operator_id": "u_1"})
     await knowledge_task_service.run_knowledge_index(context)

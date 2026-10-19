@@ -57,7 +57,7 @@ async def _rebuild_power_spec_file(kb_id: str, file_id: str) -> dict:
     return report.items[0].model_dump(mode="json")
 
 
-async def _attach_power_spec_rebuild(kb_id: str, file_id: str, result: dict) -> None:
+async def attach_power_spec_rebuild(kb_id: str, file_id: str, result: dict) -> None:
     """电力规范知识库解析完成后追加条款提取与质量门。"""
 
     if not isinstance(result, dict) or not await _is_power_spec_mode(kb_id):
@@ -150,7 +150,7 @@ async def run_knowledge_ingest(context: TaskContext) -> dict:
                     operator_id=operator_id,
                     **processing_owner,
                 )
-                await _attach_power_spec_rebuild(kb_id, record["file_id"], file_meta)
+                await attach_power_spec_rebuild(kb_id, record["file_id"], file_meta)
                 record["file_meta"] = file_meta
                 if not auto_index or file_meta.get("status") != "parsed":
                     processed_items[record["index"]] = file_meta
@@ -285,7 +285,7 @@ async def _run_file_ids(context: TaskContext, *, action: str) -> dict:
                 )
             # 重新入库同样要重建条款元数据：只改分块策略不会产生派生元数据，
             # 缺少它会让电力规范检索把整个知识库判为「尚未完成条款级重建」。
-            await _attach_power_spec_rebuild(kb_id, file_id, result)
+            await attach_power_spec_rebuild(kb_id, file_id, result)
             processed_items.append(result)
         except Exception as exc:
             logger.error("%s failed for %s: %s", label, file_id, exc)
@@ -358,7 +358,7 @@ async def _run_pending_files(context: TaskContext, *, action: str) -> dict:
                         params=params,
                         **processing_owner,
                     )
-                await _attach_power_spec_rebuild(kb_id, file_id, result)
+                await attach_power_spec_rebuild(kb_id, file_id, result)
                 _append_result_sample(result_items, result)
             except Exception as exc:
                 failed_count += 1
