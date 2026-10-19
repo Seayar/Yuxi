@@ -264,9 +264,52 @@ class BaseAgent:
                 yield event
 
     async def stream_resume_with_state(self, resume_input, *, context: BaseContext, **kwargs):
-        async with aclosing(self._stream_input_with_state(resume_input, context=context, **kwargs)) as stream:
+        bound_input = await self._bind_resume_to_pending_interrupts(resume_input, context=context)
+        async with aclosing(self._stream_input_with_state(bound_input, context=context, **kwargs)) as stream:
             async for event in stream:
                 yield event
+
+    async def _bind_resume_to_pending_interrupts(self, resume_input: Any, *, context: BaseContext) -> Any:
+        """把裸恢复值绑定到每个待恢复中断上。
+
+        一轮里模型可能并行发起多个工具调用（含两个子问题的多跳题会并行调用两次
+        search_power_spec），每个调用各自 interrupt()，checkpoint 因而留下多个待恢复
+        中断；此时投递裸值 LangGraph 无法判断归属，会报 "When there are multiple
+        pending interrupts, you must specify the interrupt id when resuming" 并让整次
+        运行失败。这里按中断 id 逐个投递同一个恢复值，语义等价于用户对这些卡片做了
+        同一选择。
+
+        只在「多个待恢复中断且它们的载荷声明了同一个 source」时改写，其余情况保持原有
+        单中断行为，避免把同一个值误投给不同种类的中断。
+        """
+        if not isinstance(resume_input, Command) or resume_input.resume is None:
+            return resume_input
+        value = resume_input.resume
+        if isinstance(value, dict):
+            # 已是按中断 id 组织的恢复值，交给 LangGraph 处理。
+            return resume_input
+        try:
+            graph = await self.get_graph(context=context)
+            state = await graph.aget_state({"configurable": {"thread_id": context.thread_id, "uid": context.uid}})
+            interrupts = list(getattr(state, "interrupts", None) or ())
+        except Exception as exc:  # 读取失败时保持原有行为，不阻断恢复
+            logger.warning(f"读取待恢复中断失败，按单中断恢复: {exc}")
+            return resume_input
+        if len(interrupts) <= 1:
+            return resume_input
+        sources = {
+            item.value.get("source")
+            for item in interrupts
+            if isinstance(getattr(item, "value", None), dict) and item.value.get("source")
+        }
+        if len(sources) != 1:
+            # 异源中断的正确归属取决于各中断的业务语义，这里无法代答；保持原样投递
+            # 意味着 LangGraph 仍会拒绝多中断裸值（运行失败并显式报错），由调用方按
+            # 具体中断类型改用按 interrupt id 组织的 resume 值解决。
+            logger.warning(f"存在 {len(interrupts)} 个待恢复中断但来源不一致，保持原样投递")
+            return resume_input
+        logger.info(f"检测到 {len(interrupts)} 个同源待恢复中断，按中断 id 逐个投递恢复值")
+        return Command(resume={item.id: value for item in interrupts})
 
     async def invoke_messages(
         self, messages: list[str], *, context: BaseContext, callbacks=None, metadata=None, tags=None
