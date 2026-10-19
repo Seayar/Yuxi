@@ -335,8 +335,9 @@ services:
     profiles: ["tugraph"]
     command: lgraph_server -c /usr/local/etc/lgraph.json -d run
     ports:
-      - "127.0.0.1:${YUXI_TUGRAPH_HTTP_PORT:-7070}:7070"
-      - "127.0.0.1:${YUXI_TUGRAPH_BOLT_PORT:-7688}:7687"
+      # 开发环境绑定 0.0.0.0 便于局域网/远程调试；生产 Compose 仍限定 127.0.0.1
+      - "0.0.0.0:${YUXI_TUGRAPH_HTTP_PORT:-7070}:7070"
+      - "0.0.0.0:${YUXI_TUGRAPH_BOLT_PORT:-7688}:7687"
     volumes:
       - type: bind
         source: ${YUXI_STATE_DIR:-./docker/volumes}/tugraph/data

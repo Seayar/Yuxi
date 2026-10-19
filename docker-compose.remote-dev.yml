@@ -1,0 +1,46 @@
+# 本地开发叠加文件：本机只运行 API、worker、web 与 sandbox-provisioner，
+# PostgreSQL、Redis、MinIO、Milvus、MinerU 通过 SSH 隧道使用远端测试环境。
+#
+# 用法见 docs/develop-guides/local-remote-middleware.md。中间件的真实地址全部
+# 来自 .env（已被 git 忽略），本文件不保存任何内部地址或凭据。
+services:
+  remote-dev-tunnel:
+    build:
+      context: ./docker/remote_dev_tunnel
+    image: ${COMPOSE_PROJECT_NAME:-yuxi}-remote-dev-tunnel:${YUXI_VERSION:-0.7.3}
+    restart: unless-stopped
+    networks:
+      - app-network
+    volumes:
+      - ${YUXI_REMOTE_SSH_DIR:-./docker/volumes/remote-dev/ssh}:/ssh:ro
+    ports:
+      # 共享数据库里的系统配置直接写死了 host.docker.internal:18786（MinerU）与
+      # localhost:8001（语音识别，容器内会被改写成 host.docker.internal），
+      # 容器内的 127.0.0.1 满足不了这两种写法，必须发布到宿主机。
+      - "${YUXI_REMOTE_MINERU_PORT:-18786}:18786"
+      - "${YUXI_REMOTE_ASR_PORT:-8001}:8001"
+    environment:
+      YUXI_REMOTE_HOST: ${YUXI_REMOTE_HOST:?请在 .env 设置远端测试环境地址 YUXI_REMOTE_HOST}
+      YUXI_REMOTE_SSH_USER: ${YUXI_REMOTE_SSH_USER:-root}
+      YUXI_REMOTE_SSH_KEY: /ssh/id_ed25519
+      YUXI_REMOTE_KNOWN_HOSTS: /ssh/known_hosts
+    healthcheck:
+      test: ['CMD-SHELL', 'for port in 5432 6379 9000 19530 18786 8001; do netstat -ltn | grep -q ":$$port " || exit 1; done']
+      interval: 15s
+      timeout: 15s
+      retries: 3
+      start_period: 10s
+
+  worker:
+    healthcheck:
+      # 本机冷启动 uv 并导入 yuxi 需要约 20 秒，镜像默认的 10 秒超时会把健康的 worker
+      # 一直标成 unhealthy；这里只放宽时间，检查命令沿用基础文件。
+      interval: 60s
+      timeout: 45s
+      retries: 3
+      start_period: 180s
+
+  web:
+    environment:
+      # vite 默认把 /minio 代理到 http://minio:9000；本机没有该服务，改为隧道地址。
+      - VITE_MINIO_URL=${MINIO_URI:-http://remote-dev-tunnel:9000}
