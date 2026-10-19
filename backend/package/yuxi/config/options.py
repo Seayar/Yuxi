@@ -206,6 +206,66 @@ paddleocr_api_opts = Option(
     },
 )
 
+fault_image_opts = Option(
+    key="fault_image_opts",
+    name="故障图片识别服务",
+    description="配置 YOLO 设备图片故障类型识别服务，供 /api/fault/images 使用。",
+    params={
+        "fields": [
+            {
+                "key": "server_url",
+                "label": "服务地址",
+                "type": "url",
+                "environment": "YOLO_FAULT_BASE_URL",
+                "placeholder": "http://<yolo-host>:8082",
+                "help": "YOLO 设备图片故障识别服务地址（见 srs/ 接口文档），留空时读取 YOLO_FAULT_BASE_URL。",
+            },
+        ]
+    },
+)
+
+fault_trace_opts = Option(
+    key="fault_trace_opts",
+    name="故障溯源知识图谱",
+    description="配置故障溯源智能体使用的独立 TuGraph 图（kg 图，人工录入故障数据）。",
+    params={
+        "fields": [
+            {
+                "key": "server_url",
+                "label": "服务地址",
+                "type": "string",
+                "environment": "FAULT_TRACE_GRAPH_URI",
+                "placeholder": "bolt://<tugraph-host>:7688",
+                "help": "TuGraph Bolt 服务地址（bolt://host:port），留空时读取 FAULT_TRACE_GRAPH_URI。",
+            },
+            {
+                "key": "graph",
+                "label": "图名称",
+                "type": "string",
+                "environment": "FAULT_TRACE_GRAPH",
+                "placeholder": "kg",
+                "help": "人工录入故障数据的图名称，留空时读取 FAULT_TRACE_GRAPH。",
+            },
+            {
+                "key": "username",
+                "label": "用户名",
+                "type": "string",
+                "environment": "FAULT_TRACE_GRAPH_USERNAME",
+                "placeholder": "admin",
+                "help": "TuGraph 用户名，留空时读取 FAULT_TRACE_GRAPH_USERNAME。",
+            },
+            {
+                "key": "password",
+                "label": "密码",
+                "type": "password",
+                "environment": "FAULT_TRACE_GRAPH_PASSWORD",
+                "sensitive": True,
+                "help": "TuGraph 密码，留空时读取 FAULT_TRACE_GRAPH_PASSWORD。",
+            },
+        ]
+    },
+)
+
 speech_recognition_opts = Option(
     key="speech_recognition_opts",
     name="语音识别服务",
@@ -265,6 +325,8 @@ OPTION_DEFINITIONS = {
         pp_structure_v3_ocr_host_opts,
         paddleocr_api_opts,
         speech_recognition_opts,
+        fault_image_opts,
+        fault_trace_opts,
         remote_skill_source_policy,
         system_options,
     )

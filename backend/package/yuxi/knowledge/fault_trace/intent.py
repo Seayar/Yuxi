@@ -1,0 +1,435 @@
+"""故障溯源意图识别与输入约束（方案二/方案三 + 确认卡片）。"""
+
+from __future__ import annotations
+
+import json
+import re
+from collections.abc import Awaitable, Callable
+from typing import Any
+
+import json_repair
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+
+from yuxi.knowledge.fault_trace.contracts import FaultTraceQuery
+from yuxi.utils import logger
+
+# ---------------------------------------------------------------------------
+# 规则解析
+# ---------------------------------------------------------------------------
+
+_DEVICE_TYPES = ("变压器", "开关柜", "断路器", "隔离开关", "电缆", "配电柜", "互感器", "避雷器", "母线", "线路")
+_VOLTAGE_PATTERN = re.compile(r"(?P<value>\d+(?:\.\d+)?)\s*[kKＫｋ][vVＶｖ]")
+# SRS：设备名称应指向具体设备；只出现类型词（如“变压器”）不算具体设备。
+_DEVICE_SUFFIXES = (
+    "主变",
+    "主变压器",
+    "变压器",
+    "开关柜",
+    "开闭所",
+    "断路器",
+    "隔离开关",
+    "互感器",
+    "避雷器",
+    "电抗器",
+    "母线",
+    "电缆",
+    "线路",
+    "进线",
+    "出线",
+    "冷却器",
+    "接头",
+    "泵",
+    "风扇",
+)
+_DEVICE_NAME_PATTERN = re.compile(
+    r"(?P<name>"
+    r"\d+\s*号\s*(?:" + "|".join(_DEVICE_SUFFIXES) + r")"
+    r"|"
+    r"\d*\s*[kK][vV]\s*(?:" + "|".join(_DEVICE_SUFFIXES) + r")(?:\s*#\s*[A-Za-z0-9一二三四五六七八九十]+)?"
+    r"|"
+    r"(?:电缆|线路|母线)[^，。；;\s]{0,8}(?:\s*#\s*[A-Za-z0-9一二三四五六七八九十]+)?"
+    r")"
+)
+_PHENOMENON_TERMS = (
+    "停转",
+    "异响",
+    "烧蚀",
+    "焦糊",
+    "渗漏",
+    "油渍",
+    "油迹",
+    "过热",
+    "温升",
+    "电流",
+    "电压",
+    "发热",
+    "放电",
+    "冒烟",
+    "着火",
+    "断股",
+    "散股",
+    "破损",
+    "裂纹",
+    "异物",
+)
+
+
+def parse_fault_trace_query(query: str) -> FaultTraceQuery:
+    """按电力设备词与现象关键词规则解析故障描述。"""
+
+    normalized_query = query.strip()
+    if not normalized_query:
+        raise ValueError("故障描述不能为空")
+
+    device_name_match = _DEVICE_NAME_PATTERN.search(normalized_query)
+    device_name = device_name_match.group("name").replace(" ", "") if device_name_match else None
+    device_type = next((item for item in _DEVICE_TYPES if item in normalized_query), None)
+    voltage_match = _VOLTAGE_PATTERN.search(normalized_query)
+    voltage_level = f"{voltage_match.group('value')}kV" if voltage_match else None
+    phenomena = [term for term in _PHENOMENON_TERMS if term in normalized_query]
+
+    return FaultTraceQuery(
+        device_name=device_name,
+        device_type=device_type,
+        voltage_level=voltage_level,
+        phenomena=phenomena,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 模型识别
+# ---------------------------------------------------------------------------
+
+
+class FaultTraceIntentResult(BaseModel):
+    """表示模型从（文字/语音 + 图片识别结果）中识别出的故障溯源要素。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    question: str = Field(min_length=1)
+    device_name: str | None = None
+    device_type: str | None = None
+    voltage_level: str | None = None
+    phenomena: list[str] = Field(default_factory=list)
+
+    @field_validator("phenomena", mode="before")
+    @classmethod
+    def _coerce_phenomena(cls, value: Any) -> Any:
+        """容忍模型把现象写成字符串、分隔串或单个值。"""
+
+        if value is None or isinstance(value, (list, tuple)):
+            return value
+        return [part.strip() for part in re.split(r"[、,，;；/]", str(value)) if part.strip()]
+
+
+FaultTraceIntentModelCall = Callable[[str], Awaitable[str]]
+
+
+async def extract_fault_trace_intent(
+    query_text: str,
+    *,
+    image_result: dict[str, Any] | None,
+    model_call: FaultTraceIntentModelCall | None = None,
+    previous: FaultTraceQuery | None = None,
+    feedback: str | None = None,
+) -> FaultTraceQuery:
+    """优先由模型识别意图，模型不可用或输出非法时回退规则解析。
+
+    ``image_result`` 来自 `/api/fault/images` 的 YOLO 识别结果，与用户文字/语音
+    一起进入语义融合（SRS：统一语义表示层）。
+    """
+
+    if model_call is None:
+        query = parse_fault_trace_query(query_text)
+    else:
+        try:
+            raw = await model_call(
+                build_intent_prompt(query_text, image_result=image_result, previous=previous, feedback=feedback)
+            )
+            result = _parse_intent(raw)
+            query = build_fault_query(result)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"故障溯源意图识别失败，回退规则解析: {exc}")
+            query = parse_fault_trace_query(query_text)
+
+    query.image_fault_type = _clean_optional(image_result.get("fault_type")) if image_result else None
+    query.image_fault_name = _clean_optional(image_result.get("fault_name")) if image_result else None
+    return apply_input_constraints(query)
+
+
+def build_intent_prompt(
+    query_text: str,
+    *,
+    image_result: dict[str, Any] | None,
+    previous: FaultTraceQuery | None = None,
+    feedback: str | None = None,
+) -> str:
+    """构造意图识别提示词；重识别时带上上一轮结果与用户修正。"""
+
+    image_section = ""
+    if image_result and image_result.get("fault_type"):
+        image_section = (
+            f"\n图片识别结果（YOLO）：\n"
+            f"fault_type={image_result.get('fault_type')}，fault_name={image_result.get('fault_name')}。\n"
+        )
+    sections = [
+        INTENT_PROMPT,
+        f"\n用户问题：\n{query_text}",
+        image_section,
+    ]
+    if previous is not None:
+        sections.append(
+            "\n上一轮识别结果：\n"
+            + json.dumps(
+                {
+                    "device_name": previous.device_name,
+                    "device_type": previous.device_type,
+                    "voltage_level": previous.voltage_level,
+                    "phenomena": previous.phenomena,
+                },
+                ensure_ascii=False,
+            )
+        )
+    if feedback:
+        sections.append(f"\n用户的修正说明：\n{feedback}\n请根据修正说明重新识别。")
+    return "".join(sections)
+
+
+def build_fault_query(result: FaultTraceIntentResult) -> FaultTraceQuery:
+    """把模型识别结果转换为下游使用的查询模型。"""
+
+    return FaultTraceQuery(
+        device_name=_clean_optional(result.device_name),
+        device_type=_clean_optional(result.device_type),
+        voltage_level=_clean_optional(result.voltage_level),
+        phenomena=[str(item).strip() for item in result.phenomena if str(item).strip()],
+    )
+
+
+def _parse_intent(raw: str | dict[str, Any]) -> FaultTraceIntentResult:
+    """解析模型输出，容忍代码块围栏和 JSON 语法瑕疵。"""
+
+    if isinstance(raw, dict):
+        payload = raw
+    else:
+        text = str(raw).strip()
+        if text.startswith("```"):
+            text = text.strip("`").strip()
+            if text.startswith("json"):
+                text = text[4:].strip()
+        payload = json_repair.loads(text)
+    if not isinstance(payload, dict):
+        raise ValueError("模型未返回意图 JSON 对象")
+    try:
+        return FaultTraceIntentResult.model_validate(payload)
+    except ValidationError as exc:
+        raise ValueError("意图 JSON 不符合契约") from exc
+
+
+def _clean_optional(value: Any) -> str | None:
+    """把模型给出的空值写法统一收敛为 None。"""
+
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in {"null", "none", "无", "未知", "未提及", "不明确"}:
+        return None
+    return text
+
+
+# ---------------------------------------------------------------------------
+# SRS 输入约束与澄清（方案二/方案三）
+# ---------------------------------------------------------------------------
+
+
+def apply_input_constraints(query: FaultTraceQuery) -> FaultTraceQuery:
+    """按 SRS 输入约束设置澄清：
+
+    - 设备名称应指向具体设备，仅输入设备类型视为不明确；
+    - 图像本身不可单独诊断，须配合文字或语音描述；
+    - 信息不完整时走方案三（反问澄清）话术。
+    """
+
+    if not query.has_specific_device():
+        if query.has_phenomenon():
+            query.clarification_required = True
+            query.clarification_message = "未能识别故障设备，请明确设备名称后重新提交。"
+        else:
+            query.clarification_required = True
+            query.clarification_message = "未能识别完整的故障信息，请明确故障设备和故障现象"
+        return query
+    if not query.has_phenomenon():
+        query.clarification_required = True
+        query.clarification_message = (
+            "已收到您的描述，但缺少故障现象，请补充具体故障现象（例如：冷却器风扇停转、触头烧蚀）。"
+        )
+        return query
+    return query
+
+
+def build_candidate_selection_payload(candidates: list[str]) -> dict[str, Any]:
+    """方案二：识别到设备类型但存在多个候选设备时，引导用户选择确认。"""
+
+    options = [{"label": f"{index + 1}）{name}", "value": name} for index, name in enumerate(candidates)]
+    question = "请选择具体设备：" + "；".join(f"{index + 1}）{name}" for index, name in enumerate(candidates))
+    return {
+        "source": "fault_trace_candidate_selection",
+        "questions": [
+            {
+                "question_id": FAULT_QUESTION_ID_CANDIDATE,
+                "question": question,
+                "options": options,
+                "multi_select": False,
+                "allow_other": True,
+            }
+        ],
+        "candidates": candidates,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 意图确认卡片与用户修正
+# ---------------------------------------------------------------------------
+
+MAX_INTENT_ATTEMPTS = 3
+INTENT_QUESTION_ID = "fault_trace_intent_confirm"
+CORRECTION_QUESTION_ID = "fault_trace_intent_correction"
+FAULT_QUESTION_ID_CANDIDATE = "fault_trace_device_select"
+
+
+def build_intent_plan(query: FaultTraceQuery) -> dict[str, Any]:
+    """构造展示给用户的意图计划。"""
+
+    return {
+        "device_name": query.device_name,
+        "device_type": query.device_type,
+        "voltage_level": query.voltage_level,
+        "phenomena": list(query.phenomena),
+        "image_fault_type": query.image_fault_type,
+        "image_fault_name": query.image_fault_name,
+    }
+
+
+def build_confirmation_payload(intent_plan: dict[str, Any]) -> dict[str, Any]:
+    """构造意图确认卡片，展示模型对设备与故障现象的理解。"""
+
+    parts = []
+    if intent_plan.get("device_name"):
+        parts.append(f"设备={intent_plan['device_name']}")
+    if intent_plan.get("device_type"):
+        parts.append(f"设备类型={intent_plan['device_type']}")
+    if intent_plan.get("voltage_level"):
+        parts.append(f"电压等级={intent_plan['voltage_level']}")
+    if intent_plan.get("phenomena"):
+        parts.append(f"故障现象={', '.join(intent_plan['phenomena'])}")
+    if intent_plan.get("image_fault_name"):
+        parts.append(f"图片识别={intent_plan['image_fault_name']}")
+    question = "我对故障现象的理解是：" + "；".join(parts) + "。是否正确？"
+    return {
+        "source": "fault_trace_intent_confirmation",
+        "questions": [
+            {
+                "question_id": INTENT_QUESTION_ID,
+                "question": question,
+                "options": [
+                    {"label": "正确，继续溯源", "value": "confirm"},
+                    {"label": "不正确，我要补充/修改", "value": "correct"},
+                ],
+                "multi_select": False,
+                "allow_other": True,
+            }
+        ],
+        "intent_plan": intent_plan,
+    }
+
+
+def build_correction_payload(intent_plan: dict[str, Any]) -> dict[str, Any]:
+    """用户只表示不正确时，追问需要修正的内容。"""
+
+    return {
+        "source": "fault_trace_intent_correction",
+        "questions": [
+            {
+                "question_id": CORRECTION_QUESTION_ID,
+                "question": "请补充需要修正的内容，例如设备名称、设备类型或具体故障现象。",
+                "options": [],
+                "multi_select": False,
+                "allow_other": True,
+            }
+        ],
+        "intent_plan": intent_plan,
+    }
+
+
+def parse_intent_confirmation(value: Any) -> tuple[str, str | None]:
+    """解析确认结果，返回 (决定, 用户修正文本)。决定取值 confirm、reject 或 invalid。"""
+
+    if isinstance(value, dict):
+        if INTENT_QUESTION_ID in value or CORRECTION_QUESTION_ID in value or FAULT_QUESTION_ID_CANDIDATE in value:
+            for key in (INTENT_QUESTION_ID, CORRECTION_QUESTION_ID, FAULT_QUESTION_ID_CANDIDATE):
+                if key in value:
+                    return parse_intent_confirmation(value[key])
+        text = str(value.get("text") or "").strip()
+        if text:
+            return "reject", text
+        selected = value.get("selected")
+        if isinstance(selected, (list, tuple)) and selected:
+            return parse_intent_confirmation(selected[0])
+        if value.get("value") is not None:
+            return "confirm", str(value["value"])
+        return "invalid", None
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            decision, correction = parse_intent_confirmation(item)
+            if decision != "invalid":
+                return decision, correction
+        return "invalid", None
+    if isinstance(value, str):
+        text = value.strip()
+        if text.lower() in {"confirm", "confirmed"} or text in {"正确，继续溯源", "正确"}:
+            return "confirm", None
+        if text.lower() in {"correct", "reject"} or text in {"不正确，我要补充/修改", "不正确"}:
+            return "reject", None
+        return ("reject", text) if text else ("invalid", None)
+    return "invalid", None
+
+
+def extract_correction_text(value: Any) -> str | None:
+    """从修正追问或候选选择中取出用户文本。"""
+
+    if isinstance(value, dict):
+        if CORRECTION_QUESTION_ID in value:
+            return extract_correction_text(value[CORRECTION_QUESTION_ID])
+        text = str(value.get("text") or "").strip()
+        if text:
+            return text
+        selected = value.get("selected")
+        if isinstance(selected, (list, tuple)) and selected:
+            return extract_correction_text(selected[0])
+        return None
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            text = extract_correction_text(item)
+            if text:
+                return text
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        return text if text and text not in {"__other__", "other", "其他"} else None
+    return None
+
+
+INTENT_PROMPT = """你是配电网故障原因溯源系统的意图识别器。
+请从用户对故障现象的描述中提取以下 JSON 字段（整段必须且只是一个 JSON 对象，以 { 开头）：
+{
+  "question": "对用户问题的简短重述",
+  "device_name": "具体设备名称，如 1号主变；没有则 null",
+  "device_type": "设备类型，如 变压器、开关柜；没有则 null",
+  "voltage_level": "电压等级，如 110kV、35kV、10kV；没有则 null",
+  "phenomena": ["故障现象列表，如 冷却器风扇停转、散热片积尘"]
+}
+要求：
+- 设备名称必须是具体设备（如“1号主变”），用户只写“变压器”这类类型词时 device_name 为 null。
+- 图片识别结果中的故障类别（如“绝缘子破损”）应并入 phenomena。
+- 只输出 JSON，不要输出其他解释。
+"""

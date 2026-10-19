@@ -22,7 +22,7 @@ def clean_discovery_test_modules():
 
 
 def test_preset_discovery_includes_shipping_roles():
-    """发布内容完整，深度研究与电力规范保持原有委派关系。"""
+    """发布内容完整，深度研究、电力规范与故障溯源保持原有委派关系。"""
     found = {preset.slug: preset for preset in presets.discover_agent_presets()}
     assert set(found) == {
         "default-chatbot",
@@ -34,6 +34,8 @@ def test_preset_discovery_includes_shipping_roles():
         "power-spec-agent",
         "power-spec-organizer",
         "power-spec-reviewer",
+        "fault-trace-agent",
+
     }
     assert found["deep-research"].context["subagents"] == ["research-explorer", "fact-verifier"]
     assert found["general-purpose"].context == {}
@@ -41,6 +43,8 @@ def test_preset_discovery_includes_shipping_roles():
     assert found["fact-verifier"].backend_id == "SubAgentBackend"
     assert found["power-spec-agent"].backend_id == "ChatbotAgent"
     assert found["power-spec-organizer"].backend_id == "SubAgentBackend"
+    assert found["fault-trace-agent"].backend_id == "ChatbotAgent"
+
 
 
 def test_new_preset_file_is_discovered_without_registry(tmp_path, monkeypatch):
@@ -183,6 +187,8 @@ def test_shipping_skills_keep_required_dependencies():
         "deep-research",
         "knowledge-base",
         "power-spec",
+        "fault-trace",
+
         "mysql-reporter",
     }
     assert found["knowledge-base"]["tool_dependencies"] == [
@@ -194,6 +200,8 @@ def test_shipping_skills_keep_required_dependencies():
         "search_file",
         "download_kb_file",
     ]
+    assert found["fault-trace"]["tool_dependencies"] == ["trace_fault"]
+
     assert found["deep-research"]["skill_dependencies"] == []
     assert found["mysql-reporter"]["mcp_dependencies"] == []
     assert found["html-preview"]["version"] == "2026.07.23"

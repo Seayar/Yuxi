@@ -83,7 +83,8 @@ export default defineConfig({
           { text: '沙盒与文件系统', link: '/mechanisms/sandbox' },
           { text: '上下文压缩', link: '/mechanisms/context-compression' },
           { text: '知识库', link: '/mechanisms/knowledge-base' },
-          { text: '电力规范检索', link: '/mechanisms/power-spec-retrieval' }
+          { text: '电力规范检索', link: '/mechanisms/power-spec-retrieval' },
+          { text: '故障溯源', link: '/mechanisms/fault-trace' }
         ]
       },
       {
@@ -111,6 +112,7 @@ export default defineConfig({
         items: [
           { text: '参与贡献', link: '/develop-guides/contributing' },
           { text: '并行工作树与隔离环境', link: '/develop-guides/parallel-worktree-environments' },
+          { text: '本地开发连接远端中间件', link: '/develop-guides/local-remote-middleware' },
           { text: '文档编写与维护', link: '/develop-guides/documentation-guidelines' },
           { text: '开发路线图', link: '/develop-guides/roadmap' },
           { text: '版本变更记录', link: '/develop-guides/changelog' },

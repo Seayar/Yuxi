@@ -19,6 +19,7 @@ from .sandbox import ProvisionerSandboxBackend
 _TOOL_RESULT_EVICTION_EXEMPT_TOOLS = frozenset(TOOLS_EXCLUDED_FROM_EVICTION) | {
     "open_kb_document",
     "search_power_spec",
+    "trace_fault",
 }
 
 # 文件工具 allowlist：显式排除 destructive delete。Yuxi backend 未实现 delete，

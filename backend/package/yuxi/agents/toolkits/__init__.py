@@ -7,6 +7,10 @@ from .kbs import get_common_kb_tools
 # 电力规范检索工具（导入即注册 search_power_spec）
 from yuxi.knowledge.power_spec import tool as _power_spec_tool  # noqa: F401
 
+# 故障溯源工具（导入即注册 trace_fault）
+from yuxi.knowledge.fault_trace import tool as _fault_trace_tool  # noqa: F401
+
+
 # 工具获取函数
 from .registry import (
     ToolExtraMetadata,

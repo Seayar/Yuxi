@@ -9,6 +9,7 @@ from server.routers.auth_router import auth
 from server.routers.chat_router import chat
 from server.routers.dashboard_router import dashboard
 from server.routers.external_kb_router import external_kb
+from server.routers.fault_router import fault_router
 from server.routers.filesystem_router import filesystem_router
 from server.routers.graph_router import graph
 from server.routers.knowledge_dashboard_router import knowledge_dashboard
@@ -38,6 +39,7 @@ router.include_router(agent_invocation_channel_router)  # /api/agent-invocation/
 router.include_router(agent_invocation_eval_router)  # /api/agent-invocation/eval/*
 router.include_router(chat)  # /api/chat/* 对话线程、消息历史与附件
 router.include_router(speech_router)  # /api/speech/* 语音识别
+router.include_router(fault_router)  # /api/fault/* 故障图片识别与故障溯源
 router.include_router(projects)  # /api/projects* 项目创建与选择
 router.include_router(scheduled_agents)  # /api/scheduled-tasks* 用户自建 Agent 定时任务
 

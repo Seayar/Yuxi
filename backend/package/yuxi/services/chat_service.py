@@ -499,6 +499,18 @@ def _is_power_spec_context(context) -> bool:
     return "power-spec" in set(getattr(context, "skills", []) or [])
 
 
+def _is_fault_trace_context(context) -> bool:
+    """判断当前上下文是否属于故障溯源智能体（按 skill 判定）。"""
+
+    return "fault-trace" in set(getattr(context, "skills", []) or [])
+
+
+def _is_maintenance_plan_context(context) -> bool:
+    """判断当前上下文是否属于处置方案生成智能体（按 skill 判定）。"""
+
+    return "maintenance-plan" in set(getattr(context, "skills", []) or [])
+
+
 def _message_field(message, name: str):
     """读取 checkpoint 消息字段；消息可能是 LangChain 对象或普通字典。"""
 
@@ -531,13 +543,48 @@ def _current_turn_tool_messages(messages, run_tool_call_ids: set[str]) -> list:
 
 
 def _resolve_power_spec_output(messages, fallback_content: str, *, run_tool_call_ids: set[str] | None = None) -> str:
-    """从本轮检索 Tool 的结果里取卡片，阻止模型改写卡片结构。
-
-    只认本轮的工具结果：checkpoint 里包含线程完整历史，跨轮次取用会把上一轮的卡片当成
-    本轮答案。本轮没有检索结果时回退到模型自己的内容。
-    """
+    """从本轮检索 Tool 的结果里取卡片，阻止模型改写卡片结构。"""
 
     from yuxi.knowledge.power_spec.contracts import PLAIN_TOOL_MESSAGES
+
+    return _resolve_tool_card_answer(
+        messages,
+        fallback_content,
+        plain_messages=PLAIN_TOOL_MESSAGES,
+        run_tool_call_ids=run_tool_call_ids,
+    )
+
+
+def _resolve_fault_trace_output(messages, fallback_content: str, *, run_tool_call_ids: set[str] | None = None) -> str:
+    """从本轮故障溯源 Tool 的结果里取报告卡片，阻止模型改写报告结构。"""
+
+    from yuxi.knowledge.fault_trace.contracts import PLAIN_TOOL_MESSAGES
+
+    return _resolve_tool_card_answer(
+        messages,
+        fallback_content,
+        plain_messages=PLAIN_TOOL_MESSAGES,
+        run_tool_call_ids=run_tool_call_ids,
+    )
+
+
+def _resolve_maintenance_plan_output(
+    messages, fallback_content: str, *, run_tool_call_ids: set[str] | None = None
+) -> str:
+    """从本轮处置方案 Tool 的结果里取方案卡片，只发布通过证据校验的方案。
+
+    本轮工具返回的报告载荷必须显式声明 ``answer_source="maintenance_plan"`` 且
+    ``answer_verified is True`` 才采用其 Markdown；校验未通过（False、缺失或非布尔）
+    一律返回 PLAN_VERIFICATION_FAILED_MESSAGE，不把未校验的方案发出去。固定文案原样透传，
+    其他普通文本与非报告 JSON 不发布；没有可信工具结果时只允许固定澄清或失败文案，
+    防止模型跳过工具后自行生成方案。只读本轮工具结果（复用 _current_turn_tool_messages）。
+    """
+
+    from yuxi.knowledge.maintenance_plan.contracts import (
+        CLARIFY_ALL_MESSAGE,
+        PLAN_VERIFICATION_FAILED_MESSAGE,
+        PLAIN_TOOL_MESSAGES,
+    )
 
     for message in reversed(_current_turn_tool_messages(messages, set(run_tool_call_ids or ()))):
         content = _message_field(message, "content")
@@ -546,7 +593,48 @@ def _resolve_power_spec_output(messages, fallback_content: str, *, run_tool_call
         try:
             payload = json.loads(content)
         except (TypeError, json.JSONDecodeError):
-            return content if content in PLAIN_TOOL_MESSAGES else fallback_content
+            return content if content in PLAIN_TOOL_MESSAGES else PLAN_VERIFICATION_FAILED_MESSAGE
+        if isinstance(payload, str):
+            return payload if payload in PLAIN_TOOL_MESSAGES else PLAN_VERIFICATION_FAILED_MESSAGE
+        if not isinstance(payload, dict) or not isinstance(payload.get("answer_markdown"), str):
+            continue
+        if payload.get("answer_source") == "maintenance_plan" and payload.get("answer_verified") is True:
+            return payload["answer_markdown"]
+        return PLAN_VERIFICATION_FAILED_MESSAGE
+    # 模型可能在信息全缺时直接反问而跳过工具；该分支仍按本轮原文输出固定澄清句。
+    from yuxi.knowledge.maintenance_plan.intent import apply_input_constraints, rule_extract
+
+    for message in reversed(messages):
+        if _message_field(message, "type") not in {"human", "user"}:
+            continue
+        content = _message_field(message, "content")
+        if isinstance(content, str) and apply_input_constraints(rule_extract(content)).clarification_required:
+            return CLARIFY_ALL_MESSAGE
+        break
+    return PLAN_VERIFICATION_FAILED_MESSAGE
+
+
+def _resolve_tool_card_answer(
+    messages,
+    fallback_content: str,
+    *,
+    plain_messages: frozenset[str],
+    run_tool_call_ids: set[str] | None = None,
+) -> str:
+    """从本轮工具结果里取卡片/报告 Markdown，阻止模型改写其结构。
+
+    只认本轮的工具结果：checkpoint 里包含线程完整历史，跨轮次取用会把上一轮的卡片当成
+    本轮答案。本轮没有检索结果时回退到模型自己的内容。
+    """
+
+    for message in reversed(_current_turn_tool_messages(messages, set(run_tool_call_ids or ()))):
+        content = _message_field(message, "content")
+        if not isinstance(content, str):
+            continue
+        try:
+            payload = json.loads(content)
+        except (TypeError, json.JSONDecodeError):
+            return content if content in plain_messages else fallback_content
         if isinstance(payload, dict) and isinstance(payload.get("answer_markdown"), str):
             return payload["answer_markdown"]
         if isinstance(payload, str):
@@ -814,6 +902,20 @@ async def save_messages_from_langgraph_state(
                 if _is_power_spec_context(agent_context):
                     msg_dict = dict(msg_dict)
                     msg_dict["content"] = _resolve_power_spec_output(
+                        messages,
+                        msg_dict.get("content", ""),
+                        run_tool_call_ids=current_tool_operation_ids,
+                    )
+                elif _is_fault_trace_context(agent_context):
+                    msg_dict = dict(msg_dict)
+                    msg_dict["content"] = _resolve_fault_trace_output(
+                        messages,
+                        msg_dict.get("content", ""),
+                        run_tool_call_ids=current_tool_operation_ids,
+                    )
+                elif _is_maintenance_plan_context(agent_context):
+                    msg_dict = dict(msg_dict)
+                    msg_dict["content"] = _resolve_maintenance_plan_output(
                         messages,
                         msg_dict.get("content", ""),
                         run_tool_call_ids=current_tool_operation_ids,
