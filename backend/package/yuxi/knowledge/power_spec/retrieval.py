@@ -25,6 +25,11 @@ from yuxi.utils import logger
 GraphSearch = Callable[[PowerSpecQuery], Awaitable[Sequence[SpecClauseEvidence]]]
 VectorSearch = Callable[[str], Awaitable[Sequence[SpecClauseEvidence]]]
 
+# 进入整理阶段的条款数上限。实测召回池里已包含正确条款、但 top-5 会把它丢掉
+# （50 题：召回池命中 96%，最终证据只有 72%）。条款级语料的正文很短（百字量级），
+# 放宽到 12 条的 prompt 成本可控，能覆盖只差 0.007 分被截掉的边缘排序损失。
+MAX_EVIDENCE_CLAUSES = 12
+
 
 class PowerSpecSearchResult(BaseModel):
     """表示一次电力规范检索的结构化结果。"""
@@ -45,7 +50,7 @@ class PowerSpecSearchService:
         self._graph_search = graph_search
         self._vector_search = vector_search
 
-    async def search(self, query: PowerSpecQuery, *, limit: int = 5) -> PowerSpecSearchResult:
+    async def search(self, query: PowerSpecQuery, *, limit: int = MAX_EVIDENCE_CLAUSES) -> PowerSpecSearchResult:
         """返回只经过图谱和向量共同确认的现行规范证据。"""
 
         if query.clarification_required:
@@ -71,25 +76,19 @@ class PowerSpecSearchService:
             if not graph_keys or item.citation_key in graph_keys
         ]
         candidates.sort(key=lambda item: item[0], reverse=True)
-        selected: list[SpecClauseEvidence] = []
-        selected_keys: set[str] = set()
-        for _score, item, matched_terms in candidates:
-            if item.citation_key in selected_keys:
-                continue
-            selected_keys.add(item.citation_key)
-            selected.append(
-                item.model_copy(
-                    update={
-                        "metadata": {
-                            **item.metadata,
-                            "graph_matched": bool(graph_keys),
-                            "matched_terms": matched_terms,
-                        }
-                    }
-                )
-            )
-            if len(selected) >= limit:
-                break
+        # 同一条款在语料里可能对应多个分块：大表格会被切分成多块，条款级重建也可能
+        # 产出多行碎片。这些分块必须合回一条证据再限量，否则同一条款的片段会互相挤占
+        # 名额、或被去重逻辑直接丢弃，用户只能看到同一条款的任意几行。
+        groups: dict[tuple[str, str], list[tuple[float, SpecClauseEvidence, list[str]]]] = {}
+        for score, item, matched_terms in candidates:
+            groups.setdefault((item.standard_no, item.clause_no), []).append((score, item, matched_terms))
+
+        ordered_groups = sorted(
+            (group for group in groups.values()),
+            key=lambda group: max(entry[0] for entry in group),
+            reverse=True,
+        )
+        selected = [_merge_clause_group(group, graph_matched=bool(graph_keys)) for group in ordered_groups[:limit]]
         if not selected:
             return PowerSpecSearchResult(query=query, no_result="未在现行规范中找到可验证的相关条款")
 
@@ -109,6 +108,73 @@ class PowerSpecSearchService:
             evidence=selected,
         )
         return PowerSpecSearchResult(query=query, evidence=selected, evidence_bundle=bundle)
+
+
+def _merge_clause_group(
+    group: Sequence[tuple[float, SpecClauseEvidence, list[str]]],
+    *,
+    graph_matched: bool,
+) -> SpecClauseEvidence:
+    """把同一条款的多个分块合成一条证据，正文按原文顺序拼接以保持可回溯。
+
+    分块顺序先取 chunk_index，再取源文件名：条款级分块用 chunk_index 表达顺序，
+    行级碎片语料用文件名里的表号/行号表达顺序。拼接后的正文同步写入 raw_clause_body，
+    使 `verify_evidence_projection` 仍能逐段回溯到拼接后的原文。
+    """
+
+    best = max(group, key=lambda entry: entry[0])[1]
+    if len(group) == 1:
+        return best.model_copy(
+            update={"metadata": {**best.metadata, "graph_matched": graph_matched, "matched_terms": group[0][2]}}
+        )
+
+    ordered = sorted(group, key=lambda entry: _chunk_order(entry[1]))
+    # 引用身份取原文顺序第一块（即展示正文开头的那一段），避免引用键指向正文里排在后
+    # 面的碎片文件；分数仍取整组最高分。
+    base = ordered[0][1]
+    bodies: list[str] = []
+    raw_bodies: list[str] = []
+    matched_terms: list[str] = []
+    aggregated_from: list[str] = []
+    for _score, item, terms in ordered:
+        if item.document_id not in aggregated_from:
+            aggregated_from.append(item.document_id)
+        body = item.clause_body.strip()
+        if body and body not in bodies:
+            bodies.append(body)
+        raw_body = str(item.metadata.get("raw_clause_body") or item.clause_body).strip()
+        if raw_body and raw_body not in raw_bodies:
+            raw_bodies.append(raw_body)
+        matched_terms.extend(term for term in terms if term not in matched_terms)
+
+    logger.debug(
+        f"聚合条款 {base.standard_no} {base.clause_no}：{len(group)} 个分块，"
+        f"{len(aggregated_from)} 个文档，{len(bodies)} 段正文"
+    )
+    return base.model_copy(
+        update={
+            "clause_body": "\n\n".join(bodies) or base.clause_body,
+            # rerank_score 保持重排模型的原始输出语义，不带上本地排序加分。
+            "rerank_score": max((item.rerank_score or 0.0) for _score, item, _terms in group),
+            "metadata": {
+                **base.metadata,
+                "raw_clause_body": "\n\n".join(raw_bodies) or base.clause_body,
+                "aggregated_from": aggregated_from,
+                "graph_matched": graph_matched,
+                "matched_terms": matched_terms,
+            },
+        }
+    )
+
+
+def _chunk_order(item: SpecClauseEvidence) -> tuple[int, str]:
+    """返回分块在原文中的顺序键，用于聚合时还原原文顺序。"""
+
+    try:
+        index = int(item.metadata.get("chunk_index"))
+    except (TypeError, ValueError):
+        index = 0
+    return (index, str(item.source_file or ""))
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +213,7 @@ def adapt_vector_results(
                     "parsed_clause_body": str(clause_metadata.get("clause_body") or ""),
                     "raw_clause_no": str(clause_metadata.get("clause_no") or ""),
                     "raw_clause_title": str(clause_metadata.get("clause_title") or ""),
+                    "keyword_only": bool(metadata.get("keyword_only")),
                 },
                 query_text=query_text,
             )

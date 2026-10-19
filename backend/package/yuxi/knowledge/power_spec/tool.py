@@ -55,7 +55,9 @@ POWER_SPEC_CLAUSE_REVIEW_ENABLED = os.getenv("POWER_SPEC_CLAUSE_REVIEW_ENABLED",
 }
 POWER_SPEC_INTENT_ENABLED = os.getenv("POWER_SPEC_INTENT_ENABLED", "true").strip().lower() not in {"0", "false", "no"}
 POWER_SPEC_INTENT_TIMEOUT_SECONDS = float(os.getenv("POWER_SPEC_INTENT_TIMEOUT", "300"))
-POWER_SPEC_INTENT_MAX_TOKENS = int(os.getenv("POWER_SPEC_INTENT_MAX_TOKENS", "65536"))
+# 输出额度与提示词共享服务端 max_model_len（当前 20480），需为提示词留出余量；
+# 超过上限的请求会被拒绝而不是截断。
+POWER_SPEC_INTENT_MAX_TOKENS = int(os.getenv("POWER_SPEC_INTENT_MAX_TOKENS", "4096"))
 
 
 class PowerSpecSearchInput(BaseModel):
@@ -256,14 +258,36 @@ def _keyword_query_text(query: PowerSpecQuery) -> str:
 
 
 def _merge_results(base: list[dict[str, Any]], extra: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """按 chunk 身份合并两路召回，保留重排分数更高的一条。"""
+    """按 chunk 身份合并两路召回，并标出「只来自关键词路」的条目。
+
+    两路的 rerank 分数是各自针对不同查询算出来的，不可直接比较：关键词路用模型给的
+    泛化词检索（如「操作顺序」「检查项目」），会让语义相邻的条款拿到高分，进而在最终
+    证据名额里挤掉真正回答问题的条款。实测「10kV 开关柜装设接地线应先接哪端」一题，
+    问题路第一位就是正确条款（DL/T 409 6.4.3「应先装接地端，后装导线端」），最终输出
+    却变成「操作顺序」类的无关内容。
+
+    但关键词路也有真实价值（关键词具有判别性时它能召回问题路漏掉的正确条款），所以
+    它独有
+    的条目仍然保留，只是分数被压到不高于问题路最低分——可进候选，不得占据问题路排名
+    之上。两路都命中时保留问题路的那份，不拿关键词路的分数改写问题路排名。
+    """
+
+    base_scores = sorted(float(item.get("rerank_score") or 0.0) for item in base)
+    floor = min(base_scores) if base_scores else 0.0
 
     merged: dict[str, dict[str, Any]] = {}
-    for item in [*base, *extra]:
+    for item in base:
+        merged[_result_identity(item)] = item
+    for item in extra:
         key = _result_identity(item)
-        current = merged.get(key)
-        if current is None or float(item.get("rerank_score") or 0.0) > float(current.get("rerank_score") or 0.0):
-            merged[key] = item
+        if key in merged:
+            continue
+        metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        merged[key] = {
+            **item,
+            "metadata": {**metadata, "keyword_only": True},
+            "rerank_score": min(float(item.get("rerank_score") or 0.0), floor),
+        }
     return list(merged.values())
 
 

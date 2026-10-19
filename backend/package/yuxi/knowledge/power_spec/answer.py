@@ -209,6 +209,9 @@ def build_organizer_message(
             [
                 f"### citation_key: {citation_key_of(evidence)}",
                 f"标准：{getattr(evidence, 'standard_no', '')}",
+                # 标准名称必须给出：DL/T 408（发电厂和变电站电气部分）与 DL/T 409（电力线路部分）
+                # 的验电/接地条款几乎同文，只给编号时模型无法判断该引哪一部。
+                f"标准名称：{getattr(evidence, 'standard_name', '')}",
                 f"当前条款编号：{display_clause_no(evidence)}",
                 f"当前条款标题：{display_clause_title(evidence)}",
                 f"原文：\n{body}",
@@ -224,7 +227,15 @@ def build_reviewer_message(question: str, evidences: Sequence[Any], answer: str)
     lines = [REVIEWER_INSTRUCTION, "", "## 用户问题", question, "", "## 原始条款原文"]
     for evidence in evidences:
         body = str(getattr(evidence, "clause_body", "") or "")[:MAX_EVIDENCE_BODY_CHARS]
-        lines.extend([f"### citation_key: {citation_key_of(evidence)}", body, ""])
+        lines.extend(
+            [
+                f"### citation_key: {citation_key_of(evidence)}",
+                f"出处：{getattr(evidence, 'standard_no', '')} "
+                f"{getattr(evidence, 'standard_name', '')} {display_clause_no(evidence)}",
+                body,
+                "",
+            ]
+        )
     lines.extend(["## 待审结论", answer, "", "请按你的审查规则输出审查意见 JSON。"])
     return "\n".join(lines)
 

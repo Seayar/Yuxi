@@ -29,6 +29,12 @@ _TOC_HEADING_PATTERN = re.compile(r"^#{1,6}\s*(?:目\s*次|目\s*录|contents)\s
 _PAGE_MARKER_PATTERN = re.compile(r"^<!--\s*source_pdf_page:\s*(?P<page>\d+)\s*-->$")
 # PDF 转 Markdown 时常见的旧式条款标题（无 Markdown 前缀）。
 _CLAUSE_PATTERN = re.compile(r"^\s*(?P<number>(?:[1-9]\d*\.)+\d+)\s*(?P<title>[^。；;\n]*)\s*$")
+# PDF 直出的纯文本里，条款正文就是那一行（以句号结尾、编号后可能无空格），如
+# `6.3.2 直接验电时，…确证验电器良好。`。上面的标题式写法匹配不到这类行。
+_CLAUSE_TEXT_PATTERN = re.compile(r"^(?P<number>(?:[1-9]\d*\.)+\d+)\s*(?P<title>\S.*)$")
+# 目录条目的引导点和尾页号；用于把目录行排除在条款之外。中文省略号常为两个 … 字符，
+# 故引导点下限取 2。
+_TOC_ENTRY_PATTERN = re.compile(r"[.·…]{2,}|\s\d+\s*$")
 _SCOPE_PATTERN = re.compile(r"^\s*(?:适用范围|范围)\s*[:：]\s*(?P<scope>.+?)\s*$")
 _REPLACED_STANDARD_NAME_PATTERN = re.compile(r"代替\s*[A-Za-z／/\s]*\d+\s*[—–-]\s*\d{4}\s*《(?P<name>[^》]+)》")
 _PUBLISH_YEAR_PATTERN = re.compile(r"(?P<year>(?:19|20)\d{2})\s*[-年]\s*\d{1,2}\s*[-月]\s*\d{1,2}\s*日?\s*发布")
@@ -37,6 +43,9 @@ _SUPERSEDED_MARKERS = ("代替", "被代替", "作废", "废止")
 _OCR_CELL_PATTERN = re.compile(r"</?(?:fcel|lcel|ecel|ucel|xcel|tcel|bcel|rcel)>")
 _OCR_LINE_BREAK_PATTERN = re.compile(r"<nl\s*/?>")
 _OCR_TABLE_GAP_PATTERN = re.compile(r"(?:\s*\|\s*){2,}")
+# 正文里的行首子条款（如 `6.3.2 直接验电时，…确证验电器良好。`）。
+# `_CLAUSE_PATTERN` 面向标题行、不允许句末标点，会漏掉这类完整句子，故单列一条。
+_CLAUSE_BODY_ITEM_PATTERN = re.compile(r"^(?P<number>(?:[1-9]\d*\.)+\d+)\s+(?P<text>\S.*)$")
 _FORMAT_TRANSLATION = str.maketrans({"／": "/", "∕": "/", "＋": "+", "–": "—"})
 _PAGE_HEADER_PATTERN = re.compile(r"中华人民共和国|^(?:国家|行业|地方|团体)标准$")
 
@@ -94,7 +103,13 @@ def parse_power_spec_text(
     # 注意这是「标题优先、行号兜底」的二选一：同一文档混排（部分 Markdown 标题 +
     # 部分行首编号）时只产出标题类条款，行号类条目被丢弃；目录块 skipped 只抑制
     # 标题识别，若目录块夹在两条条款标题之间会漏进前一条正文。边界场景，按现状取舍。
-    clauses = _extract_clause_headings(lines, document_scope) or _extract_clauses(lines, document_scope)
+    clauses = _extract_clause_headings(lines, document_scope)
+    if not clauses:
+        clauses = _extract_clauses(lines, document_scope)
+    # 人工整理的标准常在章标题下用行首编号写子条款（如 `6.3` 下的 `6.3.2 …`）。
+    # 只按标题切分会让引用停在父级，无法定位到题库要求的 6.3.2；这里再按「编号是
+    # 父条款编号的延伸」切一层。
+    clauses = [sub for clause in clauses for sub in _split_nested_items(clause)]
 
     if not clauses:
         raise ValueError("未识别到数字条款")
@@ -325,6 +340,61 @@ def _clause_body(lines: list[str], start: int, end: int) -> str:
     return _collapse_blank_lines("\n".join(body_lines)).strip()
 
 
+def _split_nested_items(clause: PowerSpecClause) -> list[PowerSpecClause]:
+    """把条款正文里行首编号的子条款再切成独立条款。
+
+    只切「编号是父条款编号的严格延伸」的行（父 `6.3` 切 `6.3.2`），避免把正文中引用的
+    其他条款号（如 `6.4.1`）当成子条款；父条款自身的引言在存在子条款时保留为一条，
+    否则原样返回，保证既有行为不倒退。
+    """
+
+    intro: list[str] = []
+    segments: list[tuple[str, str, list[str]]] = []
+    current: tuple[str, str, list[str]] | None = None
+    prefix = f"{clause.clause_no}."
+    for line in clause.clause_body.splitlines():
+        match = _CLAUSE_BODY_ITEM_PATTERN.match(line)
+        if match is not None and match.group("number").startswith(prefix):
+            text = match.group("text").strip()
+            if _is_numeric_table_line(text):
+                (current[2] if current else intro).append(line)
+                continue
+            if current is not None:
+                segments.append(current)
+            current = (match.group("number"), _item_title(text), [text])
+            continue
+        (current[2] if current else intro).append(line)
+    if current is not None:
+        segments.append(current)
+    if not segments:
+        return [clause]
+
+    results: list[PowerSpecClause] = []
+    intro_body = _collapse_blank_lines("\n".join(intro)).strip()
+    # 父条款引言过短（如只剩自己的标题词）时不再单独成条，避免产出噪声卡片。
+    if intro_body and len(intro_body) >= 20:
+        results.append(clause.model_copy(update={"clause_body": intro_body}))
+    for number, title, body_lines in segments:
+        body = _collapse_blank_lines("\n".join(body_lines)).strip()
+        if not body:
+            continue
+        results.append(clause.model_copy(update={"clause_no": number, "clause_title": title, "clause_body": body}))
+    return results or [clause]
+
+
+def _item_title(text: str, limit: int = 40) -> str:
+    """从子条款正文里取首句作为标题；子条款本身没有独立标题时避免用编号充当标题。"""
+
+    head = re.split(r"[。；;：:]", text, maxsplit=1)[0].strip(" ：:、")
+    return (head or text).strip()[:limit]
+
+
+def _is_toc_entry(text: str) -> bool:
+    """判断是否为目录条目（带引导点或结尾页码），目录行不得当成条款。"""
+
+    return bool(_TOC_ENTRY_PATTERN.search(text))
+
+
 def _extract_clauses(lines: list[str], document_scope: str | None) -> list[PowerSpecClause]:
     clauses: list[PowerSpecClause] = []
     current_number: str | None = None
@@ -349,17 +419,20 @@ def _extract_clauses(lines: list[str], document_scope: str | None) -> list[Power
             )
 
     for line in lines:
-        match = _CLAUSE_PATTERN.match(line)
+        match = _CLAUSE_PATTERN.match(line) or _CLAUSE_TEXT_PATTERN.match(line)
         if match:
-            candidate_title = match.group("title").strip(" ：:、")
-            if _is_numeric_table_line(candidate_title):
+            raw_title = match.group("title").strip()
+            if _is_toc_entry(raw_title) or _is_numeric_table_line(raw_title):
                 if current_number is not None and line:
                     body_lines.append(line)
                 continue
             flush_clause()
             current_number = match.group("number")
-            current_title = candidate_title or current_number
-            body_lines = []
+            # 没有标题文字时仍用编号充当标题，使「编号即标题 + 正文过短」的伪条款
+            # 继续被质量门按原规则剔除。
+            current_title = _item_title(raw_title) or current_number
+            # 纯文本直出时这一行就是条款正文，不能像标题那样丢掉。
+            body_lines = [raw_title]
             current_scope = document_scope
             continue
         if current_number is None:
