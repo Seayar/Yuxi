@@ -25,7 +25,7 @@ Yuxi 侧数据库配置未同步，导致：
 ## 替代方案
 
 - **迁移到 `Qwen3-Embedding-4B`（2560 维）**：需要全量重嵌并重建所有 Milvus 集合（含图谱集合），超出恢复范围，且旧 KB 数据全部失效；先保持 bge-m3 兼容。重新引入条件：经评估决定切换 embedding 模型时，以一次全量重索引为载体执行。
-- **关闭 rerank（`use_reranker=false`）**：会改变检索行为与卡片"相关度"语义，且新 reranker 服务协议兼容，没有理由降级。
+- **关闭 rerank（`use_reranker=false`）**：会改变检索行为与卡片"相关度"语义，且新 reranker 服务协议兼容，没有理由降级。2026-10-21 起，只有知识库未配置 `reranker_model` 时才关闭重排并降级排序，见[重排可选与 RRF 排序](2026-10-21-power-spec-rerank-optional-and-rrf.md)；正常配置下仍使用 reranker。
 - **回退到旧 `/opt/models-startup` 部署**：已被新栈与 systemd 服务取代，不回退。
 - **把输出额度做成动态值（窗口减提示词）**：需要引入 token 估算或读取服务端窗口配置，为三类短输出调用引入新依赖，当前固定值加环境变量覆盖已满足需求。
 

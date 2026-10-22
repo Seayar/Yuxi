@@ -8,13 +8,14 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from yuxi.repositories.agent_run_repository import AgentRunRepository
@@ -53,6 +54,20 @@ REQUEST_TERMINAL_STATUSES = frozenset({REQUEST_STATUS_CANCELLED, REQUEST_STATUS_
 DELIVERY_STATUS_QUEUED = "queued"
 DELIVERY_STATUS_DISPATCHED = "dispatched"
 DELIVERY_STATUS_REJECTED = "rejected"
+
+# 占用并发额度的 Run 状态：已投递但未开始、正在执行、以及已请求取消但尚未结束。
+CONCURRENT_RUN_STATUSES = ("pending", "running", "cancel_requested")
+
+
+def agent_max_concurrent_runs() -> int:
+    """读取同一 Agent 的在途 Run 上限；0 或非法值表示不限制。"""
+    raw = os.getenv("YUXI_AGENT_MAX_CONCURRENT_RUNS", "0").strip()
+    try:
+        limit = int(raw)
+    except ValueError:
+        logger.warning(f"忽略非法的 YUXI_AGENT_MAX_CONCURRENT_RUNS={raw!r}")
+        return 0
+    return max(limit, 0)
 
 
 @dataclass(frozen=True)
@@ -380,6 +395,8 @@ async def continue_thread_queue(
     if dispatched:
         return dispatched
 
+    if await _agent_at_capacity(db=db, agent_slug=agent_slug):
+        raise queue_conflict("agent_at_capacity", "该 Agent 的在途运行已达上限，请稍后再继续")
     active_run = await AgentRunRepository(db).get_active_run_by_thread_for_user(
         uid=str(uid),
         agent_slug=agent_slug,
@@ -549,6 +566,33 @@ async def _get_queue_state(
     return "ready", {"paused_reason": None, "blocking_run_id": None, "can_continue": False}
 
 
+async def _agent_at_capacity(*, db: AsyncSession, agent_slug: str) -> bool:
+    """判断该 Agent 的在途 Run 是否已达上限。
+
+    额度按 Agent 而不是按线程计算：同一线程本来就串行，真正会同时压到推理服务上的是
+    同一 Agent 的多个线程。计数前取事务级 advisory lock，把「计数 + 建 Run + 提交」
+    串行化，否则并发的多线程提交或恢复扫描会同时读到同一份旧计数而超限。
+    额度释放后由周期恢复扫描重新派发排队请求。
+    """
+    limit = agent_max_concurrent_runs()
+    if limit <= 0:
+        return False
+    if db.get_bind().dialect.name == "postgresql":
+        await db.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:scope))"),
+            {"scope": f"agent_capacity:{agent_slug}"},
+        )
+    in_flight = await db.scalar(
+        select(func.count())
+        .select_from(AgentRun)
+        .where(
+            AgentRun.agent_slug == agent_slug,
+            AgentRun.status.in_(CONCURRENT_RUN_STATUSES),
+        )
+    )
+    return int(in_flight or 0) >= limit
+
+
 async def dispatch_ready_head(
     *,
     db: AsyncSession,
@@ -558,7 +602,7 @@ async def dispatch_ready_head(
     workdir_binding: WorkdirBinding,
     expected_request_id: str | None = None,
 ) -> DispatchResult | None:
-    """只在 ready 状态派发 FIFO 队头。"""
+    """只在 ready 且 Agent 仍有并发额度时派发 FIFO 队头。"""
     repo = AgentRunRequestRepository(db)
     head = await repo.get_queue_head(
         uid=uid,
@@ -592,6 +636,12 @@ async def _dispatch_locked_head(
     workdir_binding: WorkdirBinding,
 ) -> DispatchResult | None:
     """将已锁定的 queued 队头转换为 AgentRun，不提交事务。"""
+    if await _agent_at_capacity(db=db, agent_slug=head.agent_slug):
+        logger.info(
+            f"Agent {head.agent_slug} 已达到在途 Run 上限 "
+            f"{agent_max_concurrent_runs()}，请求 {head.request_id} 保持排队"
+        )
+        return None
     repo = AgentRunRequestRepository(db)
     run_repo = AgentRunRepository(db)
     run_id = str(uuid.uuid4())

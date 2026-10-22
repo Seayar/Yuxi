@@ -11,13 +11,11 @@ PowerSpecIntent = Literal["设备参数查询", "检修标准查询", "安全规
 # 因此文案与集合定义在同一处，避免多处硬编码漏改。
 NO_EVIDENCE_MESSAGE = "未检索到资料"
 KNOWLEDGE_BASE_NOT_READY_MESSAGE = "电力规范知识库尚未完成条款级重建"
-RETRIEVAL_NOT_CONFIGURED_MESSAGE = "该知识库未配置重排模型，无法检索电力规范"
 INTENT_ATTEMPTS_EXHAUSTED_MESSAGE = "多次未确认问题意图，请重新描述您的电力规范问题"
 PLAIN_TOOL_MESSAGES = frozenset(
     {
         NO_EVIDENCE_MESSAGE,
         KNOWLEDGE_BASE_NOT_READY_MESSAGE,
-        RETRIEVAL_NOT_CONFIGURED_MESSAGE,
         INTENT_ATTEMPTS_EXHAUSTED_MESSAGE,
     }
 )
@@ -56,6 +54,7 @@ class SpecClauseEvidence(BaseModel):
     clause_body: str = Field(min_length=1)
     scope: str | None = None
     rerank_score: float | None = None
+    match_score: float | None = None
     source_file: str | None = None
     source_page: int | None = Field(default=None, ge=1)
     source_page_ref: str | None = None

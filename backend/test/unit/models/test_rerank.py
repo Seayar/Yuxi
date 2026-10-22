@@ -5,7 +5,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from yuxi.models.rerank import DashscopeReranker, OpenAIReranker
+import yuxi.models.rerank as rerank_module
+from yuxi.models.rerank import RERANK_MAX_DOCUMENT_CHARS, DashscopeReranker, OpenAIReranker
 
 
 @pytest.fixture(params=[OpenAIReranker, DashscopeReranker])
@@ -127,3 +128,30 @@ async def test_empty_input_does_not_request_provider(reranker):
     assert await reranker._batch_rerank("query", [], max_length=128) == []
     assert await reranker.acompute_score(["query", []]) == []
     reranker.session.post.assert_not_called()
+
+
+async def test_overlong_documents_are_truncated_before_provider_request(reranker):
+    """超长条款全文送排会打满客户端超时，必须按字符上限截断后再发请求。"""
+
+    _respond_with(reranker, [{"index": 0, "relevance_score": 0.9}, {"index": 1, "relevance_score": 0.8}])
+
+    scores = await reranker.acompute_score(["query", ["A" * 5000, "B"]], normalize=False)
+
+    assert scores == [0.9, 0.8]
+    payload = reranker.session.post.call_args.kwargs["json"]
+    documents = payload["input"]["documents"] if isinstance(reranker, DashscopeReranker) else payload["documents"]
+    assert documents == ["A" * RERANK_MAX_DOCUMENT_CHARS, "B"]
+
+
+async def test_degraded_batch_is_reported_as_warning(reranker, monkeypatch):
+    """兜底分数不是真实相关度，降级必须留下可检索记录，不能静默按 0.5 发布。"""
+
+    fake_logger = MagicMock()
+    monkeypatch.setattr(rerank_module, "logger", fake_logger)
+    _respond_with(reranker, [{"index": 1, "relevance_score": 0.2}])
+
+    scores = await reranker.acompute_score(["query", ["A", "B"]], normalize=False)
+
+    assert scores == [0.5, 0.5]
+    fake_logger.warning.assert_called_once()
+    assert "Rerank 降级" in fake_logger.warning.call_args.args[0]

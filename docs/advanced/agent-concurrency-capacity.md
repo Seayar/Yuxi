@@ -28,6 +28,9 @@ PostgreSQL 是 Run、Request 和终态的事实来源。Redis Stream、取消 ke
 | `POSTGRES_MAX_CONNECTIONS` | 600 | 上述单 worker 客户端预算共 450，余下 150 给迁移、健康检查和运维 |
 | `SANDBOX_DELETE_CONCURRENCY` | 32 | 有界并行回收 Sandbox，避免终态清理串行拖尾 |
 | `SANDBOX_DOCKER_ADDRESS_POOL` / `SANDBOX_DOCKER_SUBNET_PREFIX` | `10.253.240.0/20` / `28` | 最多提供 256 个独立 Sandbox 子网；部署前检查路由冲突 |
+| `YUXI_AGENT_MAX_CONCURRENT_RUNS` | 0 | 同一 `agent_slug` 的在途 Run 上限；`pending`、`running` 与 `cancel_requested` 都占额度，0 表示不限制 |
+
+`YUXI_AGENT_MAX_CONCURRENT_RUNS` 用于让单个 Agent 的并发不超过推理服务的舒适区，而不是替代 `ARQ_MAX_JOBS`。计数与建 Run 在同一事务内由 PostgreSQL advisory lock 串行化；达到上限时 ready 的队头保持 `queued`，由 worker 的 30 秒恢复扫描在额度释放后重派。多个进程共用同一个数据库时额度是全局的，因此开发环境与测试环境会共享同一份额度。
 
 Redis 256 是经过 100 并发验证的单个客户端池保护上限，并非进程总连接预算或取消协议的最低要求。API 和 worker 可按职责创建多个按需池；移除每 Run Pub/Sub 后，本次 100 并发只观察到 36 个 Redis 客户端连接。暂时保留 256 可以吸收 SSE、事件发布、缓存和控制面峰值，也避免为了降低一个不预分配的上限引入新的配置档位。资源受限部署可以压低它，但必须重新跑目标并发并确认没有连接池耗尽或事件缺失。
 

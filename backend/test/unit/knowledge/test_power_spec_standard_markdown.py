@@ -127,7 +127,7 @@ def test_standard_number_uses_publish_year_when_cover_only_shows_replaced_one():
 
     document = _parse()
 
-    assert document.standard_no == "DL/T393—2021"
+    assert document.standard_no == "DL/T 393-2021"
     assert document.version == "2021"
     assert document.status == "现行"
 

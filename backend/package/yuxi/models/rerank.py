@@ -1,5 +1,6 @@
 import asyncio
 import math
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Sequence
 from typing import Any
@@ -9,6 +10,10 @@ import numpy as np
 
 from yuxi.models.providers.cache import model_cache
 from yuxi.utils import get_docker_safe_url, logger
+
+# 重排只需要判断相关性的头部信号。超长条款全文送排会让单批耗时从秒级升到客户端超时，
+# 超时后整批按 0.5 兜底，排序和相关度一起失真；截断只影响排序，卡片正文仍取条款元数据。
+RERANK_MAX_DOCUMENT_CHARS = int(os.getenv("RERANK_MAX_DOCUMENT_CHARS", "600"))
 
 
 def sigmoid(x):
@@ -53,11 +58,17 @@ class BaseReranker(ABC):
         if not documents:
             return []
 
+        overlong = sum(1 for document in documents if len(str(document)) > RERANK_MAX_DOCUMENT_CHARS)
+        if overlong:
+            logger.info(f"Rerank 输入截断：{overlong}/{len(documents)} 条超过 {RERANK_MAX_DOCUMENT_CHARS} 字符")
+        documents = [str(document)[:RERANK_MAX_DOCUMENT_CHARS] for document in documents]
+
         await self._ensure_session()
 
         all_scores: list[float] = []
         batch_size = max(1, int(batch_size))
         total_batches = (len(documents) + batch_size - 1) // batch_size
+        degraded_batches = 0
 
         for batch_no, start in enumerate(range(0, len(documents), batch_size), start=1):
             batch = documents[start : start + batch_size]
@@ -67,7 +78,12 @@ class BaseReranker(ABC):
                 logger.debug(f"Reranking batch {batch_no}/{total_batches} completed")
             except Exception as exc:
                 logger.error(f"Reranking batch {batch_no} failed: {exc}")
+                degraded_batches += 1
                 all_scores.extend([0.5] * len(batch))
+
+        if degraded_batches:
+            # 兜底分数不可当真实相关度使用，必须留下可检索的降级记录。
+            logger.warning(f"Rerank 降级：{degraded_batches}/{total_batches} 批失败，相关度按 0.5 兜底，本次排序不可信")
 
         if normalize:
             all_scores = [float(sigmoid(score)) for score in all_scores]

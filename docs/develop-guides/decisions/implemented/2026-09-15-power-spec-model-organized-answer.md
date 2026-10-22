@@ -27,7 +27,7 @@ Owner：backend/package/yuxi/knowledge/power_spec/tool.py
 - **JSON 容错提取**：`model_output.parse_model_json` 提供提取式解析（```json 围栏倒序 → 整段 → 括号配对），各调用点共用，避免「散文+JSON」被严格整段解析静默丢弃。
 - **关注维度由意图识别给出**并直接带入整理任务，整理者不再自行判断；整理子智能体固定 `temperature=0`（声明字段，未声明的子智能体保持服务默认）。
 - **标准文档解析**：条款优先按 Markdown 标题（`## 6.1 …`）切分，无此类标题的旧式 PDF 文本回退行首编号；从 `## 目 次` 到同级标题整块跳过目录；条款页码取标题前最近的 `source_pdf_page` 标记；编号在封面只写「代替」时用发布年推导；名称优先取「代替《名称》」。
-- **缺重排模型不伪装成无资料**：知识库未配置重排模型时返回专用文案 `该知识库未配置重排模型，无法检索电力规范`，与「未检索到资料」分开，且该配置类失败不写入结果缓存。
+- **缺重排模型不伪装成无资料**：知识库未配置重排模型时返回专用文案 `该知识库未配置重排模型，无法检索电力规范`，与「未检索到资料」分开，且该配置类失败不写入结果缓存。此项已被[电力规范检索重排可选与 RRF 排序](2026-10-21-power-spec-rerank-optional-and-rrf.md)部分取代：缺重排模型改为降级检索并返回 `warnings`。
 - **发布门只发布本轮的检索结果**：`_resolve_power_spec_output` 只认本轮工具产生的 `answer_markdown`——归属优先按当前运行 `current_tool_operation_ids` 对账，运行归属不可用时按最后一条用户消息划界；本轮没有检索结果时回退模型自己的内容。`answer_source` 区分为 `model_composed` / `fixed_card`。
 - **可观测开关**：`POWER_SPEC_INTENT_ENABLED`、`POWER_SPEC_KEYWORD_QUERY_TERMS`、`POWER_SPEC_CLAUSE_REVIEW_ENABLED` 等环境变量控制模型路径开关与召回参数。
 
@@ -68,7 +68,7 @@ Owner：backend/package/yuxi/knowledge/power_spec/tool.py
 | 整理子智能体固定采样温度 | 温度未下发或波及未声明子智能体 | `agents/buildin/subagent/graph.py`、`presets/subagents/power_spec_organizer.py` | `test_subagent_model_temperature.py`、`test_power_spec_presets.py`；请求体实测 `temperature: 0.0` | 未声明的模型参数键被丢弃；未声明温度的子智能体请求体不带 `temperature` | 通过 |
 | 固定卡片作为降级输出 | 降级路径与模型结果混淆 | `power_spec/tool.py` | 模型不可用、输出为空或用户拒绝时 `answer_source=fixed_card` | 发布门仍只发布工具给出的 `answer_markdown` | 通过 |
 | 标准文档按 Markdown 标题切分且跳过目录 | 目录行被当成条款，正文跨章节累积 | `power_spec/ingestion.py` | `test_power_spec_standard_markdown.py`；真实文档 415 条、最大正文 3877 | 目录区块内的标题不得成为条款；无 Markdown 标题时回退旧规则 | 通过 |
-| 知识库缺重排模型时不被伪装成无资料 | 用户无法区分配置缺失与真的没有资料 | `power_spec/tool.py` | `test_power_spec_answer_organization.py`：缺重排返回专用文案，且有重排但无命中才返回「未检索到资料」 | 该文案必须原样透传，不被模型改写 | 通过 |
+| 知识库缺重排模型时不被伪装成无资料 | 用户无法区分配置缺失与真的没有资料 | `power_spec/tool.py` | 历史证据；2026-10-21 起改为降级检索并返回 `warnings`，见[重排可选与 RRF 排序](2026-10-21-power-spec-rerank-optional-and-rrf.md) | 该文案必须原样透传，不被模型改写 | 已被部分取代 |
 | 发布门只发布本轮的检索结果 | 第二轮未调用工具时重复发布上一轮卡片 | `services/chat_service.py` | `test_chat_service_power_spec_scope.py`：本轮无工具调用时回退模型内容；有调用时只用本轮结果 | 按原始实现注入缺陷（扫描整条历史）后该测试失败 | 通过 |
 | 真实运行中子智能体产出可用结论 | 父运行上下文不完整导致子 run 被回收 | `services/subagent_run_service.py` | 需要一次真实页面运行 | 父运行缺少 lease 时子 run 被取消 | 未验证 |
 

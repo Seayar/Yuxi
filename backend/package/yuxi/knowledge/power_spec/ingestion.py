@@ -16,13 +16,21 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 _STANDARD_PATTERN = re.compile(
-    r"\b(?P<base>(?:GB|DL|Q/GDW|Q\s*/\s*GDW|NB|JB|TB)\s*/?\s*T?\s*[-/]?\s*\d+)\s*(?P<dash>[—–-])\s*(?P<year>\d{4})\b",
+    r"\b(?P<prefix>GB|DL|Q/GDW|Q\s*/\s*GDW|NB|JB|TB)\s*/?\s*(?P<recommended>T?)"
+    r"\s*(?P<number>\d+(?:\.\d+)*)\s*(?P<dash>[—–-])\s*(?P<year>\d{4})\b",
     re.IGNORECASE,
 )
 # 人工整理的标准文档把条款标题写成 Markdown 标题，如 `## 6.1 油浸式电力变压器和电抗器`。
 # 部分文档的条款标题只有编号（`## 6.4.1.1`），标题写在下一级标题或正文里；
 # 单级编号仍需自带标题，否则 `## 6` 这类章节标题会把整章切成一条条款。
 _CLAUSE_HEADING_PATTERN = re.compile(r"^#{1,6}\s+(?P<number>\d+(?:\.\d+)*)(?:\s+(?P<title>.+?))?\s*$")
+# 附录内的条款标题，如 `## A.3 电子式互感器与合并单元`、`#### B.2.1 设备特性`。
+# 附录编号不是纯数字，只按数字标题切分时整段附录会并进上一条正文，实测最大 2 万字符以上。
+_APPENDIX_CLAUSE_PATTERN = re.compile(r"^#{1,6}\s+(?P<number>[A-Z]\.\d+(?:\.\d+)*)(?:\s+(?P<title>.+?))?\s*$")
+# 附录块标题，如 `## 附录 A`、`## 附 录 C`。它本身是边界：截断上一条正文，并在附录
+# 没有子条款标题时成为一条独立条款，避免整块附录正文既被吞并又无法被检索到。
+_APPENDIX_BLOCK_PATTERN = re.compile(r"^#{1,6}\s*附\s*录\s*(?P<label>[A-ZＡ-Ｚ]?)\s*(?P<title>.*?)\s*$")
+_APPENDIX_PREFIX = "附录"
 _HEADING_PATTERN = re.compile(r"^(?P<hashes>#{1,6})\s+(?P<text>\S.*?)\s*$")
 _TITLE_HEADING_PATTERN = re.compile(r"^#\s+(?P<text>\S.*?)\s*$")
 _TOC_HEADING_PATTERN = re.compile(r"^#{1,6}\s*(?:目\s*次|目\s*录|contents)\s*$", re.IGNORECASE)
@@ -35,6 +43,7 @@ _CLAUSE_TEXT_PATTERN = re.compile(r"^(?P<number>(?:[1-9]\d*\.)+\d+)\s*(?P<title>
 # 目录条目的引导点和尾页号；用于把目录行排除在条款之外。中文省略号常为两个 … 字符，
 # 故引导点下限取 2。
 _TOC_ENTRY_PATTERN = re.compile(r"[.·…]{2,}|\s\d+\s*$")
+_TOC_LEADER_PATTERN = re.compile(r"[.·…]{2,}")
 _SCOPE_PATTERN = re.compile(r"^\s*(?:适用范围|范围)\s*[:：]\s*(?P<scope>.+?)\s*$")
 _REPLACED_STANDARD_NAME_PATTERN = re.compile(r"代替\s*[A-Za-z／/\s]*\d+\s*[—–-]\s*\d{4}\s*《(?P<name>[^》]+)》")
 _PUBLISH_YEAR_PATTERN = re.compile(r"(?P<year>(?:19|20)\d{2})\s*[-年]\s*\d{1,2}\s*[-月]\s*\d{1,2}\s*日?\s*发布")
@@ -164,11 +173,17 @@ def _resolve_standard_number(text: str) -> tuple[str, str]:
 
 
 def _format_standard_no(match: re.Match[str], *, year: str | None = None) -> str:
-    """拼接标准编号，只统一短横线写法，保留原文用的是连字符还是破折号。"""
+    """按知识库既有口径拼接标准编号，如 `DL/T 409-2023`、`GB/T 1094.2-2013`。
 
-    base = re.sub(r"\s+", "", match.group("base"))
-    dash = "—" if match.group("dash") == "–" else match.group("dash")
-    return f"{base}{dash}{year or match.group('year')}"
+    卡片编号必须与已入库口径一致才可跨库比对，因此统一补 `/T` 标记、编号前留一个空格、
+    年份前用 ASCII 连字符，不保留原文的破折号或紧凑写法。分部号（`1094.2`）必须保留：
+    丢掉分部号会让编号退化成另一部标准。
+    """
+
+    prefix = re.sub(r"\s+", "", match.group("prefix")).upper()
+    recommended = (match.group("recommended") or "").upper()
+    label = f"{prefix}/{recommended}" if recommended else prefix
+    return f"{label} {match.group('number')}-{year or match.group('year')}"
 
 
 def _derive_standard_name(text: str, lines: list[str], fallback: str) -> str:
@@ -228,30 +243,55 @@ def _extract_clause_headings(lines: list[str], document_scope: str | None) -> li
 
     skipped = _toc_line_indexes(lines)
     headings: list[tuple[int, int, str, str]] = []
+    # 目录条目本身不产出条款，但它仍然截断上一条正文，否则目录文字会并进前一条条款。
+    boundaries: list[int] = []
     for index, line in enumerate(lines):
         if index in skipped:
             continue
-        match = _CLAUSE_HEADING_PATTERN.match(line)
-        if match is None:
-            continue
-        number = match.group("number")
-        title = (match.group("title") or "").strip(" ：:、")
-        body_start = index + 1
-        if not title:
-            if "." not in number:
-                # `## 6` 这类单级标题不带标题时与章节无法区分，仍按章节处理。
+        # 目录条目自带 Markdown 标题前缀时（`## 附录A（规范性）标示牌样式 27`），
+        # 它与目录标题同级，块级跳过规则拦不住；靠条目自身的页码/引导点识别。
+        match = _CLAUSE_HEADING_PATTERN.match(line) or _APPENDIX_CLAUSE_PATTERN.match(line)
+        if match is not None:
+            number = match.group("number")
+            title = (match.group("title") or "").strip(" ：:、")
+            if _is_heading_toc_entry(lines, index, title):
+                boundaries.append(index)
                 continue
-            title, body_start = _title_from_subheading(lines, index, skipped)
-        if _is_numeric_table_line(title):
+            body_start = index + 1
+            if not title:
+                if "." not in number:
+                    # `## 6` 这类单级标题不带标题时与章节无法区分，仍按章节处理。
+                    continue
+                title, body_start = _title_from_subheading(lines, index, skipped)
+            if _is_numeric_table_line(title):
+                continue
+            headings.append((index, body_start, number, title))
+            boundaries.append(index)
             continue
-        headings.append((index, body_start, number, title))
+        block = _APPENDIX_BLOCK_PATTERN.match(line)
+        if block is None:
+            continue
+        label = block.group("label").strip()
+        block_title = block.group("title").strip(" ：:、")
+        # 条款标题的正文首行常以数字结尾（如「不小于 100」），跨行判据只用于附录块标题。
+        if _is_heading_toc_entry(lines, index, block_title) or _continues_toc_entry(lines, index):
+            boundaries.append(index)
+            continue
+        headings.append((index, index + 1, f"{_APPENDIX_PREFIX}{label}" if label else _APPENDIX_PREFIX, block_title))
+        boundaries.append(index)
     if not headings:
         return []
 
     pages = _page_markers(lines)
+    boundaries.sort()
     clauses: list[PowerSpecClause] = []
     for order, (index, body_start, number, title) in enumerate(headings):
-        end = headings[order + 1][0] if order + 1 < len(headings) else len(lines)
+        end = next((stop for stop in boundaries if stop > index), len(lines))
+        if number.startswith(_APPENDIX_PREFIX) and order + 1 < len(headings):
+            # 附录块标题下面是该附录自己的条款时它只是容器，正文归子条款，不重复成条。
+            label = number[len(_APPENDIX_PREFIX) :]
+            if label and headings[order + 1][2].startswith(f"{label}."):
+                continue
         body = _clause_body(lines, body_start, end)
         if not body:
             # 只有标题、没有自身正文的章节（如仅用于分层的 6.1）不构成证据。
@@ -393,6 +433,38 @@ def _is_toc_entry(text: str) -> bool:
     """判断是否为目录条目（带引导点或结尾页码），目录行不得当成条款。"""
 
     return bool(_TOC_ENTRY_PATTERN.search(text))
+
+
+def _is_heading_toc_entry(lines: list[str], index: int, title: str) -> bool:
+    """判断 Markdown 标题是否为目录条目。
+
+    结尾页码判据也会命中正常条款标题（如 `15.2.2 … 见表 49`），因此标题必须带引导点，
+    或相邻行本身也是目录条目时才按目录处理；正常条款正文不以页码结尾，不会被误伤。
+    """
+
+    if not _is_toc_entry(title):
+        return False
+    if _TOC_LEADER_PATTERN.search(title):
+        return True
+    previous = lines[index - 1].strip() if index > 0 else ""
+    following = lines[index + 1].strip() if index + 1 < len(lines) else ""
+    return _is_toc_entry(previous) or _is_toc_entry(following)
+
+
+def _continues_toc_entry(lines: list[str], index: int) -> bool:
+    """判断标题是否为跨行目录条目：引导点和页码可能落在紧接着的下一行。
+
+    实测 `## 附录 D（资料性） 1 000 kV 级…感应电压试验` 这类目录条目的页码写在下一行，
+    单行判据识别不到，会把目录当成条款，并让正文一直延伸到下一个标题。
+    """
+
+    following = index + 1
+    if following >= len(lines):
+        return False
+    candidate = lines[following].strip()
+    if not candidate:
+        return False
+    return _is_toc_entry(candidate)
 
 
 def _extract_clauses(lines: list[str], document_scope: str | None) -> list[PowerSpecClause]:

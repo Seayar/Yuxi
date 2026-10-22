@@ -83,6 +83,7 @@ Get-Content docker/volumes/remote-dev/ssh/id_ed25519.pub
 | `MINERU_API_URI` | `http://remote-dev-tunnel:18786` |
 | `GRAPH_BACKEND`、`TUGRAPH_URI` | `tugraph` 与 `bolt://<远端主机>:7688` |
 | `SPEECH_ASR_BASE_URL` | `http://<远端主机>:8001` |
+| `YUXI_AGENT_MAX_CONCURRENT_RUNS` | 同一 Agent 的在途 Run 上限；与测试环境共用推理服务，额度按共享数据库全局计算 |
 
 模型供应商不需要在本机配置：供应商记录保存在共享数据库里，地址本身就是远端局域网地址，本机容器可以直接访问。
 

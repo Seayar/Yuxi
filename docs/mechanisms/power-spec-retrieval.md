@@ -1,6 +1,6 @@
 # 电力规范检索
 
-本页解释电力规范条文怎样从上传的 PDF 变成可检索的条款证据，以及一次提问怎样变成带引用的规范卡片。它面向需要阅读、评审或修改该链路的开发者，重点是每层的 Owner、数据形态和可逐步执行的调试入口。配置项清单见[文档处理](../advanced/document-processing.md)，Agent 配置方法见[配置和开发智能体](../agents/agents-config.md)。
+本页解释电力规范条文怎样从上传的 PDF 变成可检索的条款证据，以及一次提问怎样变成规范卡片。它面向需要阅读、评审或修改该链路的开发者，重点是每层的 Owner、数据形态和可逐步执行的调试入口。配置项清单见[文档处理](../advanced/document-processing.md)，Agent 配置方法见[配置和开发智能体](../agents/agents-config.md)。
 
 ## 适用范围
 
@@ -45,19 +45,18 @@ graph TD
 
 `parse_power_spec_text` 负责把解析后的 Markdown 转成 `PowerSpecDocument`。它按标准文档的写法提取三类信息：
 
-- **条款**：优先按 Markdown 条款标题（`## 6.1 油浸式电力变压器和电抗器`）切分，正文到下一个标题为止；没有这种标题的旧式 PDF 文本回退到行首编号规则（`6.1 上层油温限值`）。只有标题、没有自身正文的分层章节不产出条款。
-- **目录**：从 `## 目 次`／`## 目录` 这类标题到同级或更高级的 Markdown 标题之间整块跳过。人工整理的文档常把目录条目也写成标题，不跳过就会把目录当成条款，并把正文跨章节累积成巨块。
-- **标准编号与名称**：封面只写「代替 DL/T 393—2010」时，用发布日期年份推导本版编号（`DL/T393—2021`），避免把卡片上的编号写成上一版；名称优先取「代替…《名称》」，其次文档一级标题，都不成立时退回编号原文。
+- **条款**：优先按 Markdown 条款标题（`## 6.1 油浸式电力变压器和电抗器`）切分，正文到下一个标题为止；没有这种标题的旧式 PDF 文本回退到行首编号规则（`6.1 上层油温限值`）。只有标题、没有自身正文的分层章节不产出条款。`附录 X` 标题与附录子条款（`## A.3…`、`#### B.2.1…`）都是边界：附录正文不会并入上一条，附录子条款自身产出条款，附录块只在没有子条款时成条。
+- **目录**：从 `## 目 次`／`## 目录` 这类标题到同级或更高级的 Markdown 标题之间整块跳过。人工整理的文档常把目录条目也写成标题，此时同级规则拦不住，改按条目自身内容识别：带引导点的标题，或页码与相邻目录条目共同表明是目录的标题（含页码落在下一行的跨行条目）不产出条款，但仍截断上一条正文，避免目录文字并进条款。仅凭结尾数字不判定目录，否则 `…见表 49` 这类正常条款标题会被丢弃。
+- **标准编号与名称**：封面只写「代替 DL/T 393—2010」时，用发布日期年份推导本版编号（`DL/T 393-2021`），避免把卡片上的编号写成上一版；编号保留原文是否带 `/T`，统一编号前空格和年份前的 ASCII 连字符，并保留分部号（`GB/T 1094.2-2013`、`GB 50054-2011`），否则分部号会丢失并退化成正文引用的另一部标准。名称优先取「代替…《名称》」，其次文档一级标题，都不成立时退回编号原文。
 
-条款页码取自标题之前最近的 `<!-- source_pdf_page: N -->` 标记，写入 `clause.source_page`，卡片上的「源文件页码」由此得到。
+条款页码取自标题之前最近的 `<!-- source_pdf_page: N -->` 标记，写入 `clause.source_page`，保留在证据对象中供回溯；最新卡片契约不再把页码作为展示字段。
 
 质量门 `_quality_failure_reason`（写入）与 `is_power_spec_metadata_ready`（读取）共用 `_clause_quality_failure` 这一条规则，主要判据是过短正文占比（正文短于 20 字视为没拿到内容，占比超过 0.2 即拒绝）；标题只剩编号且正文也短时给出更具体的拒绝原因。未通过的文件不会写入元数据，检索时会把它们整体排除。
 
 条款标题写成 `## 6.4.1.1` 这类纯编号时，标题取紧邻的下一级标题（如 `### 表17 …`），正文从该标题之后开始；确实没有标题的条款用编号作标题，只要正文充分就是可用证据。单级编号（`## 6`）仍按章节处理。
 
-附录式编号（`D.3.2`、`E.1`）与标题为「表N」的纯表格片段目前不产出条款，这类文件需要按 `general` 分块，否则 `index_file` 会因解析失败而把文件置为 `error_indexing`。
-
-`PostgresPowerSpecExtractionStore` 把结果写入 `knowledge_files.processing_params["power_spec"]`，其中 `clauses` 是该文件全部条款的轻量投影。检索时的条款编号、标题、正文和适用范围都来自这里，而不是 chunk 内容。
+没有正文的分层标题与标题为「表N」的纯表格片段不产出条款；这类文件需要按 `general` 分块，否则 `index_file` 会因解析失败而把文件置为 `error_indexing`。
+`PostgresPowerSpecExtractionStore` 把结果写入 `knowledge_files.processing_params["power_spec"]`，其中 `clauses` 是该文件全部条款的轻量投影。检索时的条款编号、标题、正文和适用范围都来自这里，而不是 chunk 内容；卡片只发布规范名称、标准编号、条款编号和条款正文这四个字段。
 
 ### 分块与索引
 
@@ -101,15 +100,17 @@ sequenceDiagram
 
 ### 召回与编排
 
-`executor.aquery` 执行 Milvus hybrid 检索（稠密向量与 BM25 稀疏向量），再用知识库配置的 reranker 重排。`PowerSpecSearchService` 在这之后按现行状态过滤、按问题维度匹配、按重排分数排序并按引用键去重，最后组装 `EvidenceBundle`。
+`executor.aquery` 执行 Milvus hybrid 检索（稠密向量与 BM25 稀疏向量），再用知识库配置的 reranker 重排。送排前每条文档按 `RERANK_MAX_DOCUMENT_CHARS` 截断：超长条款全文送排会把单路召回拖到客户端超时，超时后整批按 0.5 兜底。知识库没有配置 `reranker_model` 时关闭重排，仍用问题路与关键词路的召回分数检索，并在工具结果 `warnings` 中记录降级。`PowerSpecSearchService` 在这之后按现行状态过滤、按问题维度匹配，再用 RRF 名次融合两路分数（关键词路独有条目的两路分数都不高于问题路最低分），最后按引用键去重并组装 `EvidenceBundle`。
 
 排序对同时命中多个维度的条款加权，因此问题里包含的设备、电压等级和维度词会直接影响卡片顺序。
 
 ### 渲染与校验
 
-`adapt_vector_results` 把召回 chunk 转成 `SpecClauseEvidence`，同时把原始正文字段和解析正文字段一起放进 `metadata`，供校验回溯。展示正文按行挑选，命中表格时整块保留，避免丢掉表头和分隔行。
+`adapt_vector_results` 把召回 chunk 转成 `SpecClauseEvidence`，同时把原始正文字段和解析正文字段一起放进 `metadata`，供校验回溯。展示正文按行挑选：命中行所在的连续内容块整块保留（表格与普通段落同等对待，避免丢掉表头、分隔行与引出语引出的条目），短于 `MAX_UNFILTERED_BODY_CHARS` 的条款不裁剪；分块渲染拼在首行的「编号 标题」在展示前去掉，避免与卡片的条款编号字段重复。原文全文始终留在 `metadata`。
 
-`verify_evidence_projection` 要求展示的条款编号、标题和正文都能回溯到原始证据。正文的判定粒度是「逐段、按序可回溯」，因此允许挑选不连续命中的原文行，但禁止编造内容或改变顺序。
+卡片载荷与 `answer_markdown` 只包含规范名称、标准编号、条款编号和条款正文。条款标题、适用范围、规范状态、替代关系与页码仍保留在证据对象中，供检索、校对和投影校验使用；相关度由 `rerank_score` 派生，引用键由 `document_id#clause_no` 生成，都不进入卡片。
+
+`verify_evidence_projection` 要求条款编号、标题和正文都能回溯到原始证据；卡片只展示其中的编号和正文。正文的判定粒度是「逐段、按序可回溯」，因此允许挑选不连续命中的原文行，但禁止编造内容或改变顺序。
 
 ### 模型组织答案
 
@@ -160,15 +161,18 @@ sequenceDiagram
 | 现象 | 含义 | 下一步 |
 | --- | --- | --- |
 | `未检索到资料` | 无可用证据，或证据未通过投影校验 | 分层确认召回数量与校验结论 |
-| `该知识库未配置重排模型，无法检索电力规范` | 知识库 `query_options.reranker_model` 为空 | 在知识库查询设置里选一个重排模型；这一条不会伪装成无资料 |
 | `电力规范知识库尚未完成条款级重建` | 有召回但全部被元数据过滤 | 检查 `processing_params.power_spec` |
 | 入库失败 `length of varchar field content exceeds max length` | 字节上限 | 检查字节切分是否生效 |
 | 卡片字段正确但文字被改写 | 发布门未生效 | 检查该轮上下文是否启用技能 |
+| 卡片正文只剩「…如下：」这类引出语 | 行级挑选把它引出的条目当作无关内容裁掉了 | 短条款不裁剪、长条款按块保留；确认 `MAX_UNFILTERED_BODY_CHARS` 未被改动 |
 | 第二轮重复出现上一轮的卡片 | 发布门跨轮取用了历史工具结果 | 检查该轮是否调用过检索工具；未调用时应当只输出模型自己的内容 |
 | 条款缺失 | 重建窗口或解析规则截断 | 对比全文行数与条款数 |
 | `answer_source=fixed_card` | 子智能体不可用，或整理/合并输出里找不到 JSON 对象 | 查看日志中的降级原因；对比子智能体线程里的原始输出 |
+| `Rerank 降级：N/M 批失败` | 重排批次在客户端超时内没有返回，该批按 0.5 兜底 | 查看当批文档长度与重排服务负载；本次排序与相关度不可信 |
 | `answer_verified=false` | 审查提出了意见，已合并进正文 | 查看日志中的审查意见条数 |
 | 子 run 立即变为 `cancelled` | 父运行缺少运行态（lease/owner） | 用真实页面运行复现，不要注入运行记录 |
+
+知识库没有配置 `reranker_model` 时，工具不返回配置错误，而是关闭重排继续检索，并在结果 `warnings` 中带上「未配置重排模型，已按召回分数排序」；日志同时记录一条 warning。此时排序只依赖问题路与关键词路的召回分数。
 
 工具会把结果缓存在运行上下文里，同一轮对话不会重复检索。排查时使用新的会话线程，避免读到上一轮的缓存结果。
 
@@ -178,7 +182,7 @@ sequenceDiagram
 - [条款解析与重建](https://github.com/xerrors/Yuxi/blob/main/backend/package/yuxi/knowledge/power_spec/ingestion.py)：标准信息、条款边界、范围识别、质量门与元数据重建
 - [意图分析](https://github.com/xerrors/Yuxi/blob/main/backend/package/yuxi/knowledge/power_spec/intent.py)：模型意图识别、规则兜底与确认卡片
 - [召回与校验](https://github.com/xerrors/Yuxi/blob/main/backend/package/yuxi/knowledge/power_spec/retrieval.py)：证据适配、现行过滤、维度匹配、投影校验与字段校对
-- [答案组织与渲染](https://github.com/xerrors/Yuxi/blob/main/backend/package/yuxi/knowledge/power_spec/answer.py)：整理、审查与最终合并编排、固定字段卡片渲染
+- [答案组织与渲染](https://github.com/xerrors/Yuxi/blob/main/backend/package/yuxi/knowledge/power_spec/answer.py)：整理、审查与最终合并编排、四字段卡片渲染
 - [检索工具](https://github.com/xerrors/Yuxi/blob/main/backend/package/yuxi/knowledge/power_spec/tool.py)：权限、意图确认、行为链编排与结果缓存
 - [数据契约](https://github.com/xerrors/Yuxi/blob/main/backend/package/yuxi/knowledge/power_spec/contracts.py)：查询、证据与验证结果模型
 - [Milvus executor](https://github.com/xerrors/Yuxi/blob/main/backend/package/yuxi/knowledge/implementations/milvus.py)：分块、字节切分、双写与召回
@@ -296,10 +300,11 @@ async def main():
     query = parse_power_spec_query(QUERY)
     config = await knowledge_base.get_kb_config(KB)
     reranker = config.query_options.get("reranker_model")
+    rerank_kwargs = {"use_reranker": True, "reranker_model": reranker} if reranker else {"use_reranker": False}
     executor = await knowledge_base.get_kb_executor(KB)
     raw = await executor.aquery(
         query.query, KB, config=config, agent_call=True,
-        use_graph_retrieval=False, use_reranker=True, reranker_model=reranker,
+        use_graph_retrieval=False, **rerank_kwargs,
         recall_top_k=30, bm25_top_k=30, final_top_k=20,
     )
     print("intent=", query.intent, "device=", query.device_type, "voltage=", query.voltage_level)
@@ -340,13 +345,14 @@ async def main():
     query = parse_power_spec_query(QUERY)
     config = await knowledge_base.get_kb_config(KB)
     reranker = config.query_options.get("reranker_model")
+    rerank_kwargs = {"use_reranker": True, "reranker_model": reranker} if reranker else {"use_reranker": False}
     executor = await knowledge_base.get_kb_executor(KB)
     async with pg_manager.get_async_session_context() as db:
         metadata_by_file_id = await PowerSpecRepository().list_power_spec_extractions(db, kb_id=KB)
 
     raw = await executor.aquery(
         query.query, KB, config=config, agent_call=True,
-        use_graph_retrieval=False, use_reranker=True, reranker_model=reranker,
+        use_graph_retrieval=False, **rerank_kwargs,
         recall_top_k=30, bm25_top_k=30, final_top_k=20,
     )
     ready = {fid for fid, md in metadata_by_file_id.items() if is_power_spec_metadata_ready(md)}
@@ -513,7 +519,7 @@ asyncio.run(main())
 | 配置 | 位置 | 作用 |
 | --- | --- | --- |
 | `chunk_preset_id = power_spec` | 知识库 `additional_params` | 启用条款分块与条款提取 |
-| `reranker_model` | 知识库 `query_options` | 缺失时工具直接返回「该知识库未配置重排模型」，不发起检索 |
+| `reranker_model` | 知识库 `query_options` | 缺失时关闭重排继续检索，按召回分数排序并在 `warnings` 中说明降级 |
 | `recall_top_k`、`bm25_top_k`、`final_top_k` | 工具内的检索选项 | 召回与候选宽度 |
 | `max_execution_steps` | Agent `config_json.context` | 电力规范 Agent 期望值 300 |
 | `POWER_SPEC_INTENT_ENABLED` | 环境变量 | 关闭后意图识别直接走规则解析 |
@@ -522,6 +528,8 @@ asyncio.run(main())
 | `POWER_SPEC_CLAUSE_REVIEW_ENABLED` | 环境变量 | 关闭后跳过条款编号与标题的模型校对 |
 | `POWER_SPEC_KEYWORD_QUERY_TERMS` | 环境变量 | 模型关键词召回使用的关键词数量上限（默认 8） |
 | `EMBEDDING_RETRYABLE_STATUS_CODES` | `models/embed.py` | 可重试的嵌入状态码 |
+| `RERANK_MAX_DOCUMENT_CHARS` | `models/rerank.py` | 送排单条文档的字符上限（默认 600），截断只影响排序 |
+| `MAX_UNFILTERED_BODY_CHARS` | `power_spec/retrieval.py` | 短于此长度的条款正文不做行级裁剪（默认 1200 字符） |
 | `MAX_MILVUS_CONTENT_CHARS` | `chunking/ragflow_like/dispatcher.py` | 分块阶段长度保护 |
 
 修改检索选项或质量门阈值会改变卡片数量与顺序。修改解析规则会同时改变元数据与 chunk，必须重建后重新验证召回与校验两层。

@@ -86,16 +86,14 @@ def test_apply_corrections_keeps_citation_key_on_original_clause_no():
     assert outcome.evidence[0].citation_key == "file-1#6.1"
 
 
-def test_applied_correction_changes_rendered_card_fields():
-    correction = parse_corrections(
-        {"items": [{"citation_key": "file-1#6.1", "clause_title": "油浸式电力变压器", "clause_no": "6.1"}]}
-    )
+def test_applied_correction_changes_rendered_clause_no_only():
+    correction = parse_corrections({"items": [{"citation_key": "file-1#6.1", "clause_no": "６．１"}]})
     outcome = apply_corrections([_evidence()], correction)
 
     item = format_power_spec_results("温升", outcome.evidence)["items"][0]
 
-    assert item["clause_title"] == "油浸式电力变压器"
-    assert item["citation_key"] == "file-1#6.1"
+    assert item["clause_no"] == "６．１"
+    assert set(item) == {"standard_name", "standard_no", "clause_no", "clause_body"}
 
 
 @pytest.mark.asyncio

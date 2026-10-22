@@ -358,25 +358,24 @@ def test_parse_review_issues_extracts_json_after_prose():
     assert [issue.kind for issue in parse_review_issues(raw)] == ["事实错误"]
 
 
-def test_parse_organized_draft_accepts_optional_fields():
+def test_parse_organized_draft_accepts_clause_no():
     draft = parse_organized_draft(
-        json.dumps({"clauses": [{"citation_key": "file-1#6.1", "body": "内容", "clause_title": "标题"}]})
+        json.dumps({"clauses": [{"citation_key": "file-1#6.1", "body": "内容", "clause_no": "6.1"}]})
     )
 
-    assert draft.clauses[0].clause_title == "标题"
-    assert draft.clauses[0].clause_no is None
+    assert draft.clauses[0].clause_no == "6.1"
 
 
 def test_render_draft_for_review_contains_fields_and_notes():
     draft = parse_organized_draft(
-        json.dumps({"clauses": [{"citation_key": "file-1#6.1", "body": "内容", "scope": "适用范围"}], "notes": "说明"})
+        json.dumps({"clauses": [{"citation_key": "file-1#6.1", "body": "内容", "clause_no": "6.1"}], "notes": "说明"})
     )
 
     text = render_draft_for_review(draft)
 
     assert "file-1#6.1" in text
+    assert "条款编号：6.1" in text
     assert "整理内容：内容" in text
-    assert "适用范围：适用范围" in text
     assert "说明：说明" in text
 
 

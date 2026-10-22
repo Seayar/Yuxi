@@ -52,7 +52,7 @@ async def test_repository_merges_power_spec_metadata_without_overwriting_other_p
     )
 
     assert knowledge_file.processing_params["parser"] == {"name": "existing"}
-    assert knowledge_file.processing_params["power_spec"]["standard_no"] == "DL/T572—2021"
+    assert knowledge_file.processing_params["power_spec"]["standard_no"] == "DL/T 572-2021"
     assert knowledge_file.processing_params["power_spec"]["clauses"][0]["clause_no"] == "6.2.1"
     assert knowledge_file.updated_by == "power_spec"
     assert session.flushed is True

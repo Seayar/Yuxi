@@ -4,6 +4,10 @@
 网络类异常(连接拒绝/超时/DNS)按指数退避持续重试，总预算内不向 graph 抛错；
 预算耗尽显式抛出，Run 以 failed 结束，不再出现"假完成"。
 
+流停滞不是网络错误：``StreamChunkTimeoutError`` 表示连接还在、推理端在超时窗口内
+没有产出任何 chunk。此时重发同一份 prompt 只会继续压垮推理端，因此在两类重试里
+都直接放行，让 Run 以 failed 结束。
+
 网络重试通过 handler 包装实现：wrapped handler 在预算内吞掉网络异常退避重试，
 预算耗尽或非网络异常原样抛出，交给父类的 wrap_model_call/awrap_model_call 按
 retry_on(排除网络异常)处理。预算起点在包装创建时固定，跨父类非网络重试保持，
@@ -25,6 +29,11 @@ from langchain_core.exceptions import ModelAPIError, ModelConnectionError, Model
 from langgraph.errors import GraphBubbleUp
 
 from yuxi.utils.logging_config import logger
+
+try:  # 兼容不带该异常的 langchain_openai 版本
+    from langchain_openai.chat_models._client_utils import StreamChunkTimeoutError
+except ImportError:  # pragma: no cover - 仅版本兜底
+    StreamChunkTimeoutError = ()
 
 # 网络恢复类异常：特点是"网络/服务端恢复后重试大概率成功"。
 # 未知 SDK 异常的文本兜底；已知类型和 HTTP 状态码优先。
@@ -152,12 +161,30 @@ class NetworkRetryMiddleware(ModelRetryMiddleware):
 
 
 def _retry_non_network_errors(exc: BaseException) -> bool:
-    """父类 retry_on 谓词：网络异常已由 handler 包装处理，这里排除；其余按默认语义。"""
+    """父类 retry_on 谓词：网络异常与流停滞已由 handler 包装处理，这里排除；其余按默认语义。"""
+    if _is_stream_stall(exc):
+        return False
     if _is_network_error(exc):
         return False
     if isinstance(exc, ModelError):
         return exc.is_retryable
     return True
+
+
+def _is_stream_stall(exc: BaseException) -> bool:
+    """流在超时窗口内没有产出任何 chunk：推理端饱和，重发只会继续加重。
+
+    SDK 可能把 stall 包进 ModelError 或其他包装层，因此沿异常链判断。
+    """
+
+    seen: set[int] = set()
+    cursor: BaseException | None = exc
+    while cursor is not None and id(cursor) not in seen:
+        seen.add(id(cursor))
+        if isinstance(cursor, StreamChunkTimeoutError) or type(cursor).__name__ == "StreamChunkTimeoutError":
+            return True
+        cursor = cursor.__cause__ or cursor.__context__
+    return False
 
 
 def _is_network_error(exc: BaseException) -> bool:
@@ -167,6 +194,8 @@ def _is_network_error(exc: BaseException) -> bool:
     cursor: BaseException | None = exc
     while cursor is not None and id(cursor) not in seen:
         seen.add(id(cursor))
+        if _is_stream_stall(cursor):
+            return False
         status = getattr(cursor, "status_code", None)
         if status is None and isinstance(cursor, httpx.HTTPStatusError):
             status = cursor.response.status_code

@@ -154,7 +154,9 @@ def test_adapt_vector_results_does_not_use_table_decimal_as_clause_title():
     assert evidence[0].clause_title == "变压器温升限值"
 
 
-def test_adapt_vector_results_keeps_only_query_relevant_original_segments():
+def test_adapt_vector_results_keeps_whole_block_around_matching_segment():
+    """命中行所在的连续块整体保留：只留命中行会让「…如下：」失去它引出的条目。"""
+
     evidence = adapt_vector_results(
         [
             {
@@ -178,11 +180,11 @@ def test_adapt_vector_results_keeps_only_query_relevant_original_segments():
         "温升限值是多少",
     )
 
-    assert evidence[0].clause_body == "温升限值：绕组平均温升为65K。"
+    assert evidence[0].clause_body == "额定容量按表14确定。\n温升限值：绕组平均温升为65K。\n本条还规定外观检查。"
     assert "raw_clause_body" in evidence[0].metadata
 
 
-def test_adapt_vector_results_keeps_whole_table_when_row_matches():
+def test_adapt_vector_results_keeps_table_with_its_block_when_row_matches():
     metadata = {
         **DOCUMENT_METADATA,
         "clauses": [
@@ -206,8 +208,10 @@ def test_adapt_vector_results_keeps_whole_table_when_row_matches():
         "红外测温",
     )
 
+    # 命中表格行时表头与分隔行必须保留；表格与紧随其后的正文属于同一连续块，一起保留。
     assert evidence[0].clause_body.splitlines() == [
         "序号 | 项目 | 周期",
         "---|---|---",
         "1 | 红外测温 | 1年",
+        "本节内容与查询无关。",
     ]

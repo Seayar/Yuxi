@@ -15,6 +15,12 @@
 
 顺序由服务端保存的创建顺序决定，不使用浏览器时间。只有当前线程的队头请求可以被派发。
 
+## Agent 并发额度
+
+线程之间可以并行，但同一个 Agent 的在途 Run 总数受 `YUXI_AGENT_MAX_CONCURRENT_RUNS` 限制。计数覆盖 `pending`、`running` 与 `cancel_requested` 三种状态，等待人工回答的 `interrupted` Run 不占额度。计数与建 Run 在同一事务内由 PostgreSQL advisory lock 串行化，并发提交或恢复扫描不会同时越过上限。达到上限时，ready 的队头保持在 `queued`，不创建 Run；worker 的周期恢复扫描每 30 秒重试派发，额度释放后自动接力；人工继续队列时如果额度已满会返回 `agent_at_capacity` 冲突，而不是绕过闸门。
+
+上限按 `agent_slug` 计算，默认 0 表示不限制。它的用途是让单个 Agent 的并发不超过后端推理服务的舒适区：多个线程同时发起重型请求时，排队比让推理端降速更可控。多个进程（例如开发环境与测试环境）共用同一个数据库时，额度是全局的。`queue_policy=reject` 的同步调用在额度已满时按该策略直接拒绝，不进入排队。
+
 ## Request 和 Run
 
 - **Request** 表示输入已被系统接收。它先保存到 PostgreSQL，可以处于排队、已派发、已取消、已拒绝或派发前失败。

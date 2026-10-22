@@ -15,7 +15,6 @@ from yuxi.knowledge.power_spec.contracts import (
     INTENT_ATTEMPTS_EXHAUSTED_MESSAGE,
     KNOWLEDGE_BASE_NOT_READY_MESSAGE,
     NO_EVIDENCE_MESSAGE,
-    RETRIEVAL_NOT_CONFIGURED_MESSAGE,
     PowerSpecQuery,
 )
 from yuxi.knowledge.power_spec.ingestion import is_power_spec_metadata_ready
@@ -114,13 +113,12 @@ async def search_power_spec(
         }
 
     config = await knowledge_base.get_kb_config(kb_id)
-    reranker_model = config.query_options.get("reranker_model")
+    reranker_model = config.query_options.get("reranker_model") or None
+    degradation_warnings: list[str] = []
     if not reranker_model:
-        # 缺重排模型时排分无法计算，后续所有候选都会被丢掉；这里必须报出真实原因，
-        # 不能给用户一个“未检索到资料”而让他以为知识库里没有内容。
-        # 这是配置类失败，不写入结果缓存：配置修好后同一次运行里应当能重新生效。
-        logger.warning(f"知识库 {kb_id} 未配置 reranker_model，电力规范检索不可用")
-        return RETRIEVAL_NOT_CONFIGURED_MESSAGE
+        # 重排是可选能力：没有它仍然检索，排序退化为召回分数，并把降级原因带进结果。
+        logger.warning(f"知识库 {kb_id} 未配置 reranker_model，按召回分数排序")
+        degradation_warnings.append("未配置重排模型，已按召回分数排序")
 
     executor = await knowledge_base.get_kb_executor(kb_id)
     async with pg_manager.get_async_session_context() as db:
@@ -174,10 +172,8 @@ async def search_power_spec(
         call_compose=_context_model_call(context),
         tool_call_id=getattr(runtime, "tool_call_id", None),
     )
-    retrieval_mode = (
-        "graph+vector+rerank"
-        if any(item.metadata.get("graph_score") is not None for item in reviewed)
-        else "vector+rerank"
+    retrieval_mode = ("graph+" if any(item.metadata.get("graph_score") is not None for item in reviewed) else "") + (
+        "vector+rerank" if reranker_model else "vector"
     )
     result_payload = {
         "status": "ok",
@@ -188,6 +184,7 @@ async def search_power_spec(
         "evidence_verified": True,
         "answer_source": organized["answer_source"],
         "answer_verified": organized["answer_verified"],
+        "warnings": degradation_warnings,
     }
     setattr(context, "_power_spec_search_result", result_payload)
     return result_payload
@@ -209,22 +206,24 @@ async def _retrieve_for_query(
     config: Any,
     kb_id: str,
     query: PowerSpecQuery,
-    reranker_model: str,
+    reranker_model: str | None,
 ) -> list[dict[str, Any]]:
     """按模型给出的问题与关键词召回，多路结果按 chunk 合并。
 
     模型已经判断过应该用什么词检索，因此除重述后的完整问题外，再用关键词召回一路，
-    弥补长问题在稠密检索中语义被稀释的情况。
+    弥补长问题在稠密检索中语义被稀释的情况。未配置重排模型时两路都关闭重排。
     """
 
+    rerank_kwargs = (
+        {"use_reranker": True, "reranker_model": reranker_model} if reranker_model else {"use_reranker": False}
+    )
     base = await executor.aquery(
         query.query,
         kb_id,
         config=config,
         agent_call=True,
         use_graph_retrieval=False,
-        use_reranker=True,
-        reranker_model=reranker_model,
+        **rerank_kwargs,
         **POWER_SPEC_RETRIEVAL_OPTIONS,
     )
     keyword_query = _keyword_query_text(query)
@@ -237,8 +236,7 @@ async def _retrieve_for_query(
             config=config,
             agent_call=True,
             use_graph_retrieval=False,
-            use_reranker=True,
-            reranker_model=reranker_model,
+            **rerank_kwargs,
             **POWER_SPEC_RETRIEVAL_OPTIONS,
         )
     except Exception as exc:  # noqa: BLE001
@@ -272,7 +270,7 @@ def _merge_results(base: list[dict[str, Any]], extra: list[dict[str, Any]]) -> l
     之上。两路都命中时保留问题路的那份，不拿关键词路的分数改写问题路排名。
     """
 
-    base_scores = sorted(float(item.get("rerank_score") or 0.0) for item in base)
+    base_scores = sorted(float(item.get("rerank_score") or item.get("score") or 0.0) for item in base)
     floor = min(base_scores) if base_scores else 0.0
 
     merged: dict[str, dict[str, Any]] = {}
@@ -286,7 +284,7 @@ def _merge_results(base: list[dict[str, Any]], extra: list[dict[str, Any]]) -> l
         merged[key] = {
             **item,
             "metadata": {**metadata, "keyword_only": True},
-            "rerank_score": min(float(item.get("rerank_score") or 0.0), floor),
+            "rerank_score": min(float(item.get("rerank_score") or item.get("score") or 0.0), floor),
         }
     return list(merged.values())
 

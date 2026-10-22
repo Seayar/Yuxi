@@ -74,8 +74,6 @@ class OrganizedClause(BaseModel):
     citation_key: str = Field(min_length=1)
     body: str = Field(min_length=1)
     clause_no: str | None = None
-    clause_title: str | None = None
-    scope: str | None = None
 
 
 class OrganizedDraft(BaseModel):
@@ -106,7 +104,7 @@ ORGANIZER_INSTRUCTION = """你是电力规范内容整理子智能体。
 
 输出格式：整段回答必须是且只是一个 JSON 对象，以 { 开头、以 } 结尾。
 不要输出分析、推理、说明或英文叙述，不要用 Markdown 代码块包裹。
-{"clauses":[{"citation_key":"原样返回","clause_no":"本条款展示编号","clause_title":"本条款展示标题","body":"整理后的条款内容","scope":"适用范围，原文没有就留空"}],"notes":"可选的一句话说明"}
+{"clauses":[{"citation_key":"原样返回","clause_no":"本条款展示编号","body":"整理后的条款内容"}],"notes":"可选的一句话说明"}
 
 整理规则：
 1. 关注维度由调用方给出，直接使用，不要自行判断、收窄或扩大维度。
@@ -123,11 +121,9 @@ ORGANIZER_INSTRUCTION = """你是电力规范内容整理子智能体。
 期限、判据的含义，不得新增原文没有的数字、页码或结论。
 7. clause_no 只允许修复字符级错误（全角数字、多余空格、错误的标点）。
 禁止重新编号，禁止改变数字含义。
-8. clause_title 必须是原文出现过的文字；原文标题缺失或标题实际是页码、
-表格标记时，从原文中挑出真正的章节标题；确实没有就留空。
-9. 每条输入条款都必须出现在输出中，citation_key 必须与输入完全一致。
+8. 每条输入条款都必须出现在输出中，citation_key 必须与输入完全一致。
 缺少任何一条都视为输出不完整。
-10. body 中不要出现省略号（如 ... 或 ……），省略内容通过少写内容表达。"""
+9. body 中不要出现省略号（如 ... 或 ……），省略内容通过少写内容表达。"""
 
 REVIEWER_INSTRUCTION = """你是电力规范内容审查子智能体，负责对另一智能体整理的规范结论提出审查意见。
 调用方会同时给你原始条款原文和待审结论。
@@ -156,32 +152,24 @@ COMPOSE_INSTRUCTION = """你是电力规范答案的最终整理者。调用方�
 
 输出格式：整段回答必须是且只是一个 JSON 对象，以 { 开头、以 } 结尾。
 不要输出分析、推理、说明或英文叙述，不要用 Markdown 代码块包裹。
-{"clauses":[{"citation_key":"原样返回","clause_no":"展示编号","clause_title":"展示标题","body":"最终条款内容","scope":"适用范围，没有就留空"}],"notes":"可选的一句话说明"}
+{"clauses":[{"citation_key":"原样返回","clause_no":"展示编号","body":"最终条款内容"}],"notes":"可选的一句话说明"}
 
 规则：
 1. 逐条输出，citation_key 必须与输入完全一致，不要新增或删除条款。
-2. 只修改审查意见指出、且你判断确实成立的错误（数值、单位、条件、期限、判据、编号、标题）；
+2. 只修改审查意见指出、且你判断确实成立的错误（数值、单位、条件、期限、判据、编号）；
 审查意见没提到的内容保持原样。
 3. 审查意见与整理内容冲突、或看起来是审查自身理解有误时，保留整理内容，不要跟着改错。
 4. 不得新增整理内容和审查意见都没有的数字、页码或结论，不得为了「看起来完整」补写内容。
 5. body 不得为空，也不得只写「本条款未涉及该问题」这类占位说明。
 6. body 中不要出现省略号（如 ... 或 ……）。"""
 
-# 需求规格说明书 4.1 规定的卡片字段顺序，代码拥有格式，模型只提供字段值。
+# 最新需求规格说明书规定的卡片字段与顺序，代码拥有格式，模型只提供字段值。
 SRS_CARD_FIELDS: tuple[tuple[str, str], ...] = (
     ("standard_name", "规范名称"),
     ("standard_no", "标准编号"),
     ("clause_no", "条款编号"),
-    ("clause_title", "条款标题"),
     ("clause_body", "条款正文"),
-    ("scope", "适用范围"),
-    ("standard_status", "规范状态"),
-    ("replaced_by", "替代规范"),
-    ("relevance", "相关度"),
-    ("source_page", "源文件页码"),
-    ("source_page_ref", "条款在源文件中的位置"),
 )
-CONDITIONAL_SRS_FIELDS = frozenset({"replaced_by"})
 
 
 def build_organizer_message(
@@ -264,11 +252,7 @@ def build_compose_message(
         lines.append(f"### citation_key: {clause.citation_key}")
         if clause.clause_no:
             lines.append(f"条款编号：{clause.clause_no}")
-        if clause.clause_title:
-            lines.append(f"条款标题：{clause.clause_title}")
         lines.append(f"整理内容：{clause.body}")
-        if clause.scope:
-            lines.append(f"适用范围：{clause.scope}")
         lines.append("")
     lines.append("## 审查意见")
     if issues:
@@ -290,11 +274,7 @@ def render_draft_for_review(draft: OrganizedDraft) -> str:
         lines.append(f"### {clause.citation_key}")
         if clause.clause_no:
             lines.append(f"条款编号：{clause.clause_no}")
-        if clause.clause_title:
-            lines.append(f"条款标题：{clause.clause_title}")
         lines.append(f"整理内容：{clause.body}")
-        if clause.scope:
-            lines.append(f"适用范围：{clause.scope}")
         lines.append("")
     if draft.notes:
         lines.extend([f"说明：{draft.notes}", ""])
@@ -309,7 +289,7 @@ def draft_content_text(draft: OrganizedDraft) -> str:
 
     parts: list[str] = []
     for clause in draft.clauses:
-        parts.extend([clause.body, clause.clause_title or "", clause.scope or ""])
+        parts.append(clause.body)
     if draft.notes:
         parts.append(draft.notes)
     return "\n".join(part for part in parts if part)
@@ -584,33 +564,28 @@ async def produce_power_spec_answer(
 
 
 def format_power_spec_results(query: str, evidence: Sequence[SpecClauseEvidence]) -> dict:
-    """返回规范卡片数据和按需求书字段顺序展示的 Markdown。"""
+    """返回规范卡片数据和按最新需求书字段顺序展示的 Markdown。"""
 
     items = [_format_item(query, item) for item in evidence]
-    return {"items": items, "answer_markdown": render_srs_cards(query, items)}
+    return {"items": items, "answer_markdown": render_srs_cards(items)}
 
 
-def render_srs_cards(query: str, items: Sequence[dict]) -> str:
-    """按需求书 4.1 的字段与顺序渲染卡片，正文独立成块以便表格显示。"""
+def render_srs_cards(items: Sequence[dict]) -> str:
+    """按最新需求书规定的四个字段与顺序渲染卡片，正文独立成块以便表格显示。"""
 
     lines: list[str] = []
     for index, item in enumerate(items, start=1):
-        lines.append(f"### 规范卡片 {index} · {item['standard_no']} 条款 {item['clause_no']}")
+        lines.append(f"### 规范卡片 {index}")
         lines.append("")
         for key, label in SRS_CARD_FIELDS:
             value = item.get(key)
-            if key in CONDITIONAL_SRS_FIELDS and not value:
-                continue
             if key == "clause_body":
                 # 标签写成独立列表项、与正文之间保留空行：缺前者会被 Markdown 懒续
-                # 行并进上一条「条款标题」，缺后者则正文并进列表项、表格无法渲染。
+                # 行并进上一条「条款编号」，缺后者则正文并进列表项、表格无法渲染。
                 lines.extend([f"- **{label}**", "", str(value or "未提供"), ""])
                 continue
             lines.append(f"- **{label}**：{value if value else '未提供'}")
-        lines.extend([f"- **引用**：[source:{item['citation_key']}]", ""])
-        if item.get("relevance_label"):
-            lines.append(f"> {item['relevance_label']}；查询：{query}")
-            lines.append("")
+        lines.append("")
     return "\n".join(lines).rstrip()
 
 
@@ -639,42 +614,21 @@ def apply_organized_clauses(
         body = str(getattr(clause, "body", "") or "").strip()
         if body:
             item["clause_body"] = _highlight(body, _highlight_terms(query))
-        title = str(getattr(clause, "clause_title", "") or "").strip()
-        if title:
-            item["clause_title"] = title
         clause_no = str(getattr(clause, "clause_no", "") or "").strip()
         if clause_no:
             item["clause_no"] = clause_no
-        scope = str(getattr(clause, "scope", "") or "").strip()
-        if scope:
-            item["scope"] = scope
         items.append(item)
-    return {"items": items, "answer_markdown": render_srs_cards(query, items)}
+    return {"items": items, "answer_markdown": render_srs_cards(items)}
 
 
 def _format_item(query: str, item: SpecClauseEvidence) -> dict:
-    """渲染单张卡片，字段优先使用条款字段校对结果。"""
+    """渲染单张卡片，只保留最新需求书规定的四个字段。"""
 
-    score = round(max(float(item.rerank_score or 0.0), 0.0) * 100, 2)
     return {
         "standard_name": item.standard_name,
         "standard_no": item.standard_no,
-        "standard_version": item.version,
-        "standard_status": item.status,
-        "replaced_by": item.replaced_by if item.status == "废止" else None,
         "clause_no": display_clause_no(item),
-        "clause_title": display_clause_title(item),
         "clause_body": _highlight(item.clause_body, _highlight_terms(query)),
-        "scope": item.scope,
-        "relevance": f"{score}（{'高度相关' if score >= 80 else '相关'}）",
-        "relevance_score": score,
-        "relevance_label": "高度相关" if score >= 80 else "相关",
-        "source_file": item.source_file,
-        "source_page": item.source_page,
-        "source_page_ref": item.source_page_ref,
-        "source_page_url": item.metadata.get("source_page_url"),
-        "matched_terms": [term for term in _highlight_terms(query) if term in item.clause_body],
-        "citation_key": item.citation_key,
     }
 
 

@@ -15,11 +15,7 @@ from yuxi.knowledge.power_spec.answer import (
 )
 from yuxi.knowledge.power_spec.contracts import SpecClauseEvidence
 from yuxi.knowledge.power_spec.intent import parse_power_spec_query
-from yuxi.knowledge.power_spec.tool import (
-    NO_EVIDENCE_MESSAGE,
-    RETRIEVAL_NOT_CONFIGURED_MESSAGE,
-    search_power_spec,
-)
+from yuxi.knowledge.power_spec.tool import NO_EVIDENCE_MESSAGE, search_power_spec
 
 RAW_BODY = "220kV:6个月；35kV～110kV：1年；总烃：150"
 QUESTION = "220kV变压器油中溶解气体分析的周期"
@@ -35,7 +31,7 @@ def _draft(body: str) -> str:
     """构造整理（或最终整理）返回的结构化 JSON。"""
 
     return json.dumps(
-        {"clauses": [{"citation_key": "file-1#6.1", "clause_title": "油浸式电力变压器", "body": body}]},
+        {"clauses": [{"citation_key": "file-1#6.1", "body": body}]},
         ensure_ascii=False,
     )
 
@@ -281,15 +277,44 @@ async def test_confirmed_intent_path_returns_organized_answer(monkeypatch):
     assert result["answer_source"] == ANSWER_SOURCE_MODEL
     assert result["answer_verified"] is True
     assert result["evidence_found"] is True
+    assert set(result["spec_results"][0]) == {"standard_name", "standard_no", "clause_no", "clause_body"}
 
 
 @pytest.mark.asyncio
-async def test_missing_reranker_reports_not_configured(monkeypatch):
-    """负向：知识库没有重排模型时必须报出配置缺失，不能伪装成「未检索到资料」。"""
+async def test_missing_reranker_keeps_results_and_reports_warning(monkeypatch):
+    """重排是可选能力：没有重排模型时仍返回卡片，并把降级原因写进 warnings。"""
+
+    calls = []
+
+    class Executor:
+        async def aquery(self, *_args, **kwargs):
+            calls.append(kwargs)
+            return [
+                {
+                    "content": RAW_BODY,
+                    "score": 0.82,
+                    "metadata": {"file_id": "file-1", "chunk_id": "chunk-1"},
+                }
+            ]
 
     class KnowledgeBase:
         async def get_kb_config(self, _kb_id):
             return type("Config", (), {"query_options": {}})()
+
+        async def get_kb_executor(self, _kb_id):
+            return Executor()
+
+    class Repository:
+        async def list_power_spec_extractions(self, _db, *, kb_id):
+            return {
+                "file-1": {
+                    "standard_no": "DL/T 596-2021",
+                    "standard_name": "DL/T 596-2021",
+                    "version": "2021",
+                    "status": "现行",
+                    "clauses": [{"clause_no": "6.1", "clause_title": "油浸式电力变压器", "clause_body": RAW_BODY}],
+                }
+            }
 
     async def visible(_context):
         return [{"kb_id": "kb1"}]
@@ -297,14 +322,36 @@ async def test_missing_reranker_reports_not_configured(monkeypatch):
     async def fake_intent(query_text, **_kwargs):
         return parse_power_spec_query(query_text)
 
+    async def fake_answer(**_kwargs):
+        return {
+            "items": [
+                {
+                    "standard_name": "DL/T 596-2021",
+                    "standard_no": "DL/T 596-2021",
+                    "clause_no": "6.1",
+                    "clause_body": RAW_BODY,
+                }
+            ],
+            "answer_markdown": "### 规范卡片 1",
+            "answer_source": ANSWER_SOURCE_FIXED_CARD,
+            "answer_verified": True,
+        }
+
     monkeypatch.setattr(tool_module, "resolve_visible_knowledge_bases_for_context", visible)
     monkeypatch.setattr(tool_module, "knowledge_base", KnowledgeBase())
+    monkeypatch.setattr(tool_module, "PowerSpecRepository", Repository)
     monkeypatch.setattr(tool_module, "extract_power_spec_intent", fake_intent)
+    monkeypatch.setattr(tool_module, "produce_power_spec_answer", fake_answer)
+    monkeypatch.setattr(tool_module, "POWER_SPEC_CLAUSE_REVIEW_ENABLED", False)
+    monkeypatch.setattr(tool_module, "pg_manager", _SessionStub())
 
     result = await search_power_spec.coroutine(query_text=QUESTION, confirmed_intent=True, runtime=Runtime())
 
-    assert result == RETRIEVAL_NOT_CONFIGURED_MESSAGE
-    assert result != NO_EVIDENCE_MESSAGE
+    assert calls, "未配置重排模型时仍应发起检索"
+    assert all(call["use_reranker"] is False for call in calls)
+    assert result["warnings"] == ["未配置重排模型，已按召回分数排序"]
+    assert result["spec_results"][0]["clause_no"] == "6.1"
+    assert result["evidence_found"] is True
 
 
 @pytest.mark.asyncio

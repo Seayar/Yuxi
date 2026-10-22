@@ -792,6 +792,84 @@ async def test_terminal_status_loser_does_not_change_message_delivery_status(mon
         await _cleanup_queue_test_thread(session_factory, engine, thread_id)
 
 
+async def test_agent_capacity_serializes_concurrent_intake(monkeypatch: pytest.MonkeyPatch):
+    """并发 intake 必须串行计数：limit=1 时只能有一个线程创建 Run，另一个保持排队。"""
+    agent_slug = f"pytest-capacity-agent-{uuid.uuid4()}"
+    uid = f"pytest-user-{uuid.uuid4()}"
+    thread_ids = [f"pytest-capacity-{uuid.uuid4()}", f"pytest-capacity-{uuid.uuid4()}"]
+    request_ids = [f"capacity-{uuid.uuid4()}", f"capacity-{uuid.uuid4()}"]
+    engine = create_async_engine(os.environ["POSTGRES_URL"], pool_pre_ping=True)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    monkeypatch.setenv("YUXI_AGENT_MAX_CONCURRENT_RUNS", "1")
+    monkeypatch.setattr(
+        agent_request_service,
+        "resolve_agent_run_config",
+        AsyncMock(return_value=("model", "default")),
+    )
+
+    async with session_factory() as db:
+        conversations = [
+            await _queue_test_conversation(db, thread_id=thread_id, uid=uid, agent_id=agent_slug)
+            for thread_id in thread_ids
+        ]
+        db.add_all(conversations)
+        await db.commit()
+
+    async def submit(thread_id: str, request_id: str):
+        async with session_factory() as db:
+            try:
+                result, _ = await agent_request_service._persist_request(
+                    db=db,
+                    agent_item=MagicMock(),
+                    agent_backend=MagicMock(),
+                    request_input=AgentRequestInput(
+                        request_id=request_id,
+                        agent_slug=agent_slug,
+                        thread_id=thread_id,
+                        input_message=build_chat_input_message(request_id),
+                        queue_policy="enqueue",
+                        origin=RunOrigin(source="chat", channel="web"),
+                    ),
+                    current_user=SimpleNamespace(uid=uid),
+                )
+                await db.commit()
+                return result
+            except Exception:
+                await db.rollback()
+                raise
+
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(*(submit(thread_id, request_id) for thread_id, request_id in zip(thread_ids, request_ids))),
+            timeout=10,
+        )
+
+        assert sorted(result.status for result in results) == ["dispatched", "queued"]
+
+        async with session_factory() as db:
+            runs = (await db.scalars(select(AgentRun).where(AgentRun.request_id.in_(request_ids)))).all()
+        assert len(runs) == 1
+    finally:
+        async with session_factory() as db:
+            project_ids = list(
+                (await db.scalars(select(Conversation.project_id).where(Conversation.thread_id.in_(thread_ids)))).all()
+            )
+            conversation_ids = list(
+                (await db.scalars(select(Conversation.id).where(Conversation.thread_id.in_(thread_ids)))).all()
+            )
+            await db.execute(delete(AgentRunRequest).where(AgentRunRequest.conversation_thread_id.in_(thread_ids)))
+            if conversation_ids:
+                await db.execute(delete(Message).where(Message.conversation_id.in_(conversation_ids)))
+            await db.execute(delete(AgentRun).where(AgentRun.conversation_thread_id.in_(thread_ids)))
+            await db.execute(delete(Conversation).where(Conversation.thread_id.in_(thread_ids)))
+            if project_ids:
+                await db.execute(delete(Project).where(Project.id.in_(project_ids)))
+            await db.execute(delete(User).where(User.uid == uid))
+            await db.commit()
+        await engine.dispose()
+
+
 async def test_concurrent_request_id_reuse_across_threads_returns_scope_conflict(monkeypatch: pytest.MonkeyPatch):
     thread_ids = [f"pytest-idem-a-{uuid.uuid4()}", f"pytest-idem-b-{uuid.uuid4()}"]
     uid = f"pytest-user-{uuid.uuid4()}"

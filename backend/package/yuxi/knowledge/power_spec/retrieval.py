@@ -29,6 +29,12 @@ VectorSearch = Callable[[str], Awaitable[Sequence[SpecClauseEvidence]]]
 # （50 题：召回池命中 96%，最终证据只有 72%）。条款级语料的正文很短（百字量级），
 # 放宽到 12 条的 prompt 成本可控，能覆盖只差 0.007 分被截掉的边缘排序损失。
 MAX_EVIDENCE_CLAUSES = 12
+# 秩融合常数：与候选排名同量级，避免首位过权，行业常用 60。
+RRF_K = 60
+
+# 短条款不做行级裁剪：裁剪只为超长条款的可读性存在，而「引出语 + 空行 + 条目块」的短条款
+# 一旦只留命中块就会变成「…如下：」这种没有内容的正文。实测语料里条款正文中位数不足百字。
+MAX_UNFILTERED_BODY_CHARS = 1200
 
 
 class PowerSpecSearchResult(BaseModel):
@@ -61,14 +67,33 @@ class PowerSpecSearchService:
         vector_evidence = await self._vector_search(query.query)
         dimension_terms = query.answer_dimensions
         ranking_terms = query.normalized_terms or dimension_terms
-        scored_evidence = []
+        collected: list[tuple[SpecClauseEvidence, list[str], float, float]] = []
         for item in vector_evidence:
-            if item.rerank_score is None or item.status != "现行":
+            if item.status != "现行":
+                continue
+            # 重排是可选能力：没有重排分数时用召回分数排序，不能把候选整批丢弃。
+            base_score = item.rerank_score if item.rerank_score is not None else item.match_score
+            if base_score is None:
                 continue
             matched_terms = [term for term in ranking_terms if term in item.clause_body or term in item.clause_title]
             if len(dimension_terms) >= 2 and not matched_terms:
                 continue
-            score = (item.rerank_score or 0.0) + min(len(matched_terms), 5) * 0.02
+            match_score = item.match_score if item.match_score is not None else base_score
+            if item.metadata.get("keyword_only"):
+                # 关键词路独有条目只按已压低的 rerank 分数参与融合，召回名次固定排到问题路之后；
+                # 否则它用自身查询的相似度拿到 match 路第一名，会重新触发关键词路劫持。
+                match_score = -1.0
+            collected.append((item, matched_terms, base_score, match_score))
+        # 两路分数尺度不同（重排 logits vs 0–1 相似度），直接相加会互相压制。
+        # 按名次融合：任何一路都不能独占排序，也不会因为某一路的单位不同而放大权重。
+        by_base = sorted(collected, key=lambda row: row[2], reverse=True)
+        by_match = sorted(collected, key=lambda row: row[3], reverse=True)
+        base_rank = {id(row[0]): rank for rank, row in enumerate(by_base)}
+        match_rank = {id(row[0]): rank for rank, row in enumerate(by_match)}
+        scored_evidence = []
+        for item, matched_terms, _base_score, _match_score in collected:
+            fusion = 1 / (RRF_K + base_rank[id(item)]) + 1 / (RRF_K + match_rank[id(item)])
+            score = fusion + min(len(matched_terms), 5) * 0.001
             scored_evidence.append((score, item, matched_terms))
         candidates = [
             (score, item, matched_terms)
@@ -155,7 +180,12 @@ def _merge_clause_group(
         update={
             "clause_body": "\n\n".join(bodies) or base.clause_body,
             # rerank_score 保持重排模型的原始输出语义，不带上本地排序加分。
-            "rerank_score": max((item.rerank_score or 0.0) for _score, item, _terms in group),
+            "rerank_score": max(
+                (
+                    item.rerank_score if item.rerank_score is not None else (item.match_score or 0.0)
+                    for _score, item, _terms in group
+                )
+            ),
             "metadata": {
                 **base.metadata,
                 "raw_clause_body": "\n\n".join(raw_bodies) or base.clause_body,
@@ -206,6 +236,7 @@ def adapt_vector_results(
                 clause_metadata=clause_metadata,
                 clause_body=str(result.get("content") or ""),
                 rerank_score=_as_float(result.get("rerank_score")),
+                match_score=_as_float(result.get("score")),
                 metadata={
                     "chunk_id": metadata.get("chunk_id"),
                     "graph_score": _as_float(result.get("graph_score")),
@@ -288,13 +319,20 @@ def _build_evidence(
     rerank_score: float | None,
     metadata: dict[str, Any],
     query_text: str | None = None,
+    match_score: float | None = None,
 ) -> SpecClauseEvidence:
     clause_no = str(clause_metadata.get("clause_no") or "未知条款")
-    resolved_body = _resolve_clause_body(clause_metadata, clause_body)
-    matched = query_text and any(term in clause_body for term in _line_match_terms(query_text))
-    display_source = clause_body if matched else resolved_body
+    # 分块渲染会把「编号 标题」拼在正文首行，卡片已单列这两个字段，正文里不再重复。
+    content = _strip_clause_header(
+        clause_body,
+        clause_no,
+        str(clause_metadata.get("clause_title") or "").strip(),
+    )
+    resolved_body = _resolve_clause_body(clause_metadata, content)
+    matched = query_text and any(term in content for term in _line_match_terms(query_text))
+    display_source = content if matched else resolved_body
     display_body = _select_relevant_clause_text(display_source, query_text)
-    clause_title = _resolve_clause_title(clause_metadata, clause_body, clause_no)
+    clause_title = _resolve_clause_title(clause_metadata, content, clause_no)
     return SpecClauseEvidence(
         document_id=document_id,
         standard_name=str(document_metadata.get("standard_name") or "未命名规范"),
@@ -307,6 +345,7 @@ def _build_evidence(
         clause_body=display_body or "条款正文缺失",
         scope=clause_metadata.get("scope") or document_metadata.get("scope"),
         rerank_score=rerank_score,
+        match_score=match_score,
         source_file=document_metadata.get("source_file"),
         source_page=clause_metadata.get("source_page"),
         source_page_ref=clause_metadata.get("source_page_ref"),
@@ -321,10 +360,28 @@ def _resolve_clause_body(clause_metadata: Mapping[str, Any], result_content: str
     return extracted_body or result_content.strip()
 
 
-def _select_relevant_clause_text(body: str, query_text: str | None) -> str:
-    """只展示命中问题维度的原文行；命中表格时保留整张表，原文全文保存在 metadata。"""
+def _strip_clause_header(content: str, clause_no: str, clause_title: str) -> str:
+    """去掉分块首行的「编号 标题」，避免它作为正文重复出现在卡片里。"""
 
-    if not body or not query_text:
+    if not content or not clause_no:
+        return content
+    lines = content.splitlines()
+    if not lines:
+        return content
+    header = lines[0].strip()
+    if header == f"{clause_no} {clause_title}".strip():
+        return "\n".join(lines[1:]).lstrip("\n")
+    return content
+
+
+def _select_relevant_clause_text(body: str, query_text: str | None) -> str:
+    """只展示命中问题维度的原文行；命中行所在的连续内容块整块保留，原文全文保存在 metadata。
+
+    短条款不裁剪：引出语与它引出的条目被空行或页码行分开时，裁掉未命中块会让卡片只剩
+    一句「…如下：」。裁剪只服务于超长条款的可读性，短条款整段展示不会有这个问题。
+    """
+
+    if not body or not query_text or len(body) <= MAX_UNFILTERED_BODY_CHARS:
         return body
     terms = _line_match_terms(query_text)
     if not terms:
@@ -333,20 +390,25 @@ def _select_relevant_clause_text(body: str, query_text: str | None) -> str:
     keep = [any(term in line for term in terms) for line in lines]
     if not any(keep):
         return body
-    for block in _table_blocks(lines):
+    for block in _content_blocks(lines):
         if any(keep[index] for index in block):
             for index in block:
                 keep[index] = True
     return "\n".join(line for line, keep_line in zip(lines, keep) if keep_line)
 
 
-def _table_blocks(lines: list[str]) -> list[list[int]]:
-    """返回连续表格行的索引分组，保证命中时表头与分隔行不被裁掉。"""
+def _content_blocks(lines: list[str]) -> list[list[int]]:
+    """返回连续内容行的索引分组；表格与普通段落同等对待。
+
+    引出语（`…如下：`）与它引出的枚举条目几乎总在同一段连续行里。只保留命中行会让卡片
+    出现「视配置情况，辅助设备巡检内容和要求如下：」这类没有内容的自相矛盾正文，或让某
+    一条目脱离它所属的检查项列表，因此命中即整块保留；跨块的无关内容仍会被裁掉。
+    """
 
     blocks: list[list[int]] = []
     current: list[int] = []
     for index, line in enumerate(lines):
-        if "|" in line:
+        if line.strip():
             current.append(index)
             continue
         if current:

@@ -24,7 +24,7 @@ def test_build_document_extraction_is_versioned(parsed_document):
         "schema": POWER_SPEC_EXTRACTION_SCHEMA,
         "document_id": "file-1",
         "standard_name": "电力变压器运行规程",
-        "standard_no": "DL/T572—2021",
+        "standard_no": "DL/T 572-2021",
         "version": "2021",
         "status": "现行",
         "replaced_by": None,

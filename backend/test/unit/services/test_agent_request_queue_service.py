@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from yuxi.services.agent_request_service import AgentRequestInput, RunOrigin, _persist_request
-from yuxi.services import agent_request_service
+from yuxi.services import agent_request_queue_service, agent_request_service
 
 from contextlib import asynccontextmanager
 from datetime import timedelta
@@ -1628,3 +1628,155 @@ async def test_submission_publishes_committed_request_and_replays_same_view(
     assert replay == result
     assert (await session.get(Message, result["message_id"])).content == "first input"
     assert effects == (["materialize", "enqueue"] if expected == "dispatched" or older else ["materialize"])
+
+
+# ── Agent 在途 Run 上限 ──
+
+
+def _workdir_binding() -> WorkdirBinding:
+    return WorkdirBinding(
+        conversation_id=10,
+        thread_id="t1",
+        uid="user-1",
+        project_id="project-user-1-t1",
+        workdir_path="projects/workdir-user-1-t1",
+        directory_mode="managed",
+    )
+
+
+async def _seed_in_flight_run(session, *, run_id: str, status: str = "running", agent_slug: str = "main") -> None:
+    """插入一条占用并发额度的 Run，线程与待派发线程分开。"""
+    from yuxi.storage.postgres.models_business import AgentRun
+
+    session.add(
+        AgentRun(
+            id=run_id,
+            conversation_thread_id=f"thread-{run_id}",
+            runtime_scope_id=f"thread-{run_id}",
+            agent_slug=agent_slug,
+            uid="user-1",
+            status=status,
+            request_id=f"request-{run_id}",
+            conversation_id=10,
+            run_type="chat",
+            input_payload={},
+        )
+    )
+    await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_agent_capacity_keeps_queued_head_undispatched(session, monkeypatch: pytest.MonkeyPatch):
+    """达到在途上限时，ready 的队头必须留在队列里，不创建 Run。"""
+    from yuxi.storage.postgres.models_business import AgentRun
+
+    monkeypatch.setenv("YUXI_AGENT_MAX_CONCURRENT_RUNS", "1")
+    await _seed_thread(session)
+    await _seed_in_flight_run(session, run_id="busy-run")
+    await _create_request(session, request_id="queued-request")
+
+    result = await agent_request_queue_service.dispatch_ready_head(
+        db=session,
+        uid="user-1",
+        agent_slug="main",
+        thread_id="t1",
+        workdir_binding=_workdir_binding(),
+    )
+
+    assert result is None
+    request = await agent_request_queue_service.get_request(db=session, request_id="queued-request", uid="user-1")
+    assert request["status"] == "queued"
+    created = await session.scalar(
+        select(sa_func.count()).select_from(AgentRun).where(AgentRun.request_id == "queued-request")
+    )
+    assert created == 0
+
+
+@pytest.mark.asyncio
+async def test_agent_capacity_dispatches_below_limit(session, monkeypatch: pytest.MonkeyPatch):
+    """未达上限时照常派发队头。"""
+    monkeypatch.setenv("YUXI_AGENT_MAX_CONCURRENT_RUNS", "2")
+    await _seed_thread(session)
+    await _seed_in_flight_run(session, run_id="busy-run")
+    await _create_request(session, request_id="queued-request")
+
+    result = await agent_request_queue_service.dispatch_ready_head(
+        db=session,
+        uid="user-1",
+        agent_slug="main",
+        thread_id="t1",
+        workdir_binding=_workdir_binding(),
+    )
+
+    assert result is not None
+    assert result.request_id == "queued-request"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["completed", "failed", "cancelled", "interrupted"])
+async def test_agent_capacity_ignores_terminal_and_interrupted_runs(
+    session, monkeypatch: pytest.MonkeyPatch, status: str
+):
+    """终态与等待人工回答的 Run 不占用并发额度。"""
+    monkeypatch.setenv("YUXI_AGENT_MAX_CONCURRENT_RUNS", "1")
+    await _seed_thread(session)
+    await _seed_in_flight_run(session, run_id="past-run", status=status)
+    await _create_request(session, request_id="queued-request")
+
+    result = await agent_request_queue_service.dispatch_ready_head(
+        db=session,
+        uid="user-1",
+        agent_slug="main",
+        thread_id="t1",
+        workdir_binding=_workdir_binding(),
+    )
+
+    assert result is not None
+
+
+@pytest.mark.asyncio
+async def test_cancel_requested_run_occupies_capacity(session, monkeypatch: pytest.MonkeyPatch):
+    """已请求取消但尚未结束的 Run 仍在执行，必须继续占用额度。"""
+    monkeypatch.setenv("YUXI_AGENT_MAX_CONCURRENT_RUNS", "1")
+    await _seed_thread(session)
+    await _seed_in_flight_run(session, run_id="cancelling-run", status="cancel_requested")
+
+    assert (await agent_request_queue_service._agent_at_capacity(db=session, agent_slug="main")) is True
+
+
+@pytest.mark.asyncio
+async def test_continue_reports_capacity_conflict(session, monkeypatch: pytest.MonkeyPatch):
+    """人工继续不能绕过额度闸门。"""
+    from fastapi import HTTPException
+
+    monkeypatch.setenv("YUXI_AGENT_MAX_CONCURRENT_RUNS", "1")
+    await _seed_thread(session)
+    now = utc_now_naive()
+    await _seed_queued_request(session, request_id="request-b", message_id=101, created_at=now - timedelta(seconds=2))
+    await _seed_terminal_run(
+        session,
+        run_id="run-a",
+        status="cancelled",
+        created_at=now - timedelta(seconds=3),
+        finished_at=now,
+    )
+    await _seed_in_flight_run(session, run_id="busy-run")
+    await session.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        await agent_request_queue_service.continue_thread_queue(
+            db=session,
+            uid="user-1",
+            agent_slug="main",
+            thread_id="t1",
+        )
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail["code"] == "agent_at_capacity"
+
+
+@pytest.mark.parametrize(("raw", "expected"), [("3", 3), ("0", 0), ("-1", 0), ("abc", 0), ("", 0)])
+def test_agent_max_concurrent_runs_env(monkeypatch: pytest.MonkeyPatch, raw: str, expected: int):
+    """上限解析：0 与非法值表示不限制。"""
+    monkeypatch.setenv("YUXI_AGENT_MAX_CONCURRENT_RUNS", raw)
+    assert agent_request_queue_service.agent_max_concurrent_runs() == expected

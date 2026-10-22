@@ -9,7 +9,7 @@ import pytest
 from langchain_core.exceptions import ModelError
 from langchain_core.messages import AIMessage
 
-from yuxi.agents.middlewares.network_retry import NetworkRetryMiddleware, _is_network_error
+from yuxi.agents.middlewares.network_retry import NetworkRetryMiddleware, _is_network_error, _retry_non_network_errors
 
 pytestmark = [pytest.mark.unit]
 
@@ -311,3 +311,38 @@ async def test_invalid_model_request_with_timeout_text_is_not_retried():
         await mw.awrap_model_call(object(), handler)
     assert raised.value is error
     assert calls == 1
+
+
+# ── 流停滞不重试 ──
+
+
+def _stream_stall_error():
+    """构造流停滞异常；langchain_openai 版本不带该类型时按同名类型兜底。"""
+    from yuxi.agents.middlewares.network_retry import StreamChunkTimeoutError as stall_cls
+
+    if isinstance(stall_cls, type):
+        return stall_cls(120.0, model_name="m", chunks_received=0)
+    fallback = type("StreamChunkTimeoutError", (TimeoutError,), {})
+    return fallback("No streaming chunk received for 120.0s")
+
+
+def test_stream_stall_is_not_a_network_error():
+    """流停滞不是可恢复的网络抖动：既不走网络预算重试，也不走次数重试。"""
+    stall = _stream_stall_error()
+    assert _is_network_error(stall) is False
+    assert _retry_non_network_errors(stall) is False
+
+
+def test_generic_timeout_still_treated_as_network_error():
+    """普通超时仍按网络错误处理，避免把流停滞的例外扩大到连接抖动。"""
+    assert _is_network_error(TimeoutError("read timed out")) is True
+
+
+def test_wrapped_stream_stall_is_not_retried():
+    """异常链里的流停滞也不能重试：包装层不应把它变回次数重试。"""
+    stall = _stream_stall_error()
+    wrapper = RuntimeError("model call failed")
+    wrapper.__cause__ = stall
+
+    assert _is_network_error(wrapper) is False
+    assert _retry_non_network_errors(wrapper) is False
