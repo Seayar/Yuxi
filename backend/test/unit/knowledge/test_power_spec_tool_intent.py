@@ -187,6 +187,8 @@ def test_tool_schema_hides_confirmation_from_model():
     """模型不能通过工具参数自行确认意图；确认结论只来自确认卡片。"""
 
     assert "confirmed_intent" not in tool_module.PowerSpecSearchInput.model_fields
+    parsed = tool_module.PowerSpecSearchInput.model_validate({"query_text": QUESTION, "confirmed_intent": True})
+    assert parsed.model_dump() == {"query_text": QUESTION, "kb_id": None}
 
 
 @pytest.mark.asyncio

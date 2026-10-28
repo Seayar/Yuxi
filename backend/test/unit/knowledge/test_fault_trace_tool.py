@@ -217,6 +217,11 @@ def test_tool_schema_hides_confirmation_from_model():
 
     assert "confirmed_intent" not in tool_module.FaultTraceInput.model_fields
     assert "image_result" not in tool_module.FaultTraceInput.model_fields
+    # 即便调用参数里塞了这两个键，schema 校验也会丢弃它们，服务端函数拿不到。
+    parsed = tool_module.FaultTraceInput.model_validate(
+        {"query_text": "3B-7Y 故障", "confirmed_intent": True, "image_result": {"fault": True}}
+    )
+    assert parsed.model_dump() == {"query_text": "3B-7Y 故障"}
 
 
 @pytest.mark.asyncio
