@@ -31,7 +31,7 @@ Owner：backend/package/yuxi/agents/thinking.py
 
 ## 后果
 
-- 新增智能体只需注册自己的步骤并在工具内发射事件，平台代码不需要改动。
+- 新增智能体只需注册自己的步骤并在工具内发射事件，平台侧（`chat_service`）不需要改动。前端有一处例外：`web/src/utils/messageGrouping.js` 的 `THINKING_TOOL_NAMES` 目前列了 `search_power_spec`/`trace_fault`，用于隐藏重复的工具卡片；新增思考型智能体时要同步这份清单，否则会同时出现工具卡片与思考面板。
 - 步骤清单成为前端契约：标题与顺序由后端注册表覆盖，前端伪造或错序的步骤会被拒绝。
 - 整轮思考绑定在本 Run 的输出消息上，跨轮次不会复用上一轮的步骤。
 - 事件写入失败只记录日志，不影响业务结果；流结束时的遗留步骤由前端收尾为 `skipped`。

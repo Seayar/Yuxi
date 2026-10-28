@@ -34,6 +34,8 @@ Owner：backend/package/yuxi/knowledge/fault_trace/graph_kg3.py
 - 前端不再有故障图片的独立接口，图片随聊天请求上传，由 Run 内的工具消费。
 - 设备类型解析要求目标设备或台账 ID 至少有一个非空标识；空值不参与等值匹配，避免命中其他设备的类型。
 - 实时值告警只在服务不可用（`unavailable`/`not_configured`）时触发，缺 key 只表示该设备缺这项数据。
+- `answer_verified` 表示“没有未经证据校验的定位结论”：未定位任何原因时为 `true`，报告仍按确定性推理发布；模型文本只影响简述与推理依据，且必须通过各自证据门。
+- 历史 `kg` 迁移脚本保留为 `fault_trace/seed.py`，`--graph` 改为必填：默认值会让“想跑迁移”的命令误写运行时图。
 
 ## 验证
 

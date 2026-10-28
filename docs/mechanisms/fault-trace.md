@@ -7,7 +7,7 @@
 故障溯源由六条相互独立的链路组成，修改其中一条不会自动修复另外五条。
 
 - **图片识别链路**：故障溯源 Agent 的 `image_input_mode="server"` 由 `AgentImageInputMiddleware` 执行：模型调用前移除图片块，原始图片保留在会话状态里；`trace_fault` 从 `runtime.state` 读取图片并调用 YOLO，模型只接收文字。没有上传图时，`fault_trace/images.py` 按台账设备名称从 MinIO 取图（`fault-assets/device-images/{设备名称}.{jpg|jpeg|png|webp}`）再交给同一个 YOLO 客户端。没有独立的图片上传或健康探针 HTTP 接口。
-- **图谱数据链路**：数据团队维护独立的 TuGraph 知识图谱 `kg3`，运行时由 `fault_trace/graph_kg3.py` 只读查询；`kg`、`kg2` 已废弃，代码不连接也不回退。`seed.py` 只保留历史迁移对照，不参与当前运行。
+- **图谱数据链路**：数据团队维护独立的 TuGraph 知识图谱 `kg3`，运行时由 `fault_trace/graph_kg3.py` 只读查询；`kg`、`kg2` 已废弃，运行时不连接也不回退。`seed.py` 仅用于历史 `kg` 数据迁移对照，必须显式指定目标图名，不参与当前运行。
 - **台账链路**：`fault_trace/ledger.py` 从 MinIO `fault-assets/ledger/devices.json` 加载三区台账，按设备名与祖先路径找到台账设备 ID，作为实时值 key 前缀。
 - **实时值链路**：`fault_trace/realtime.py` 按设备台账 ID 从 Redis（`FAULT_TRACE_REDIS_URL`）只读批量读取属性；缺值/超时映射为 `unknown`。
 - **文本生成链路**：`fault_trace/report_text.py` 让模型生成故障现象简述与原因定位推理依据，两段文本都要通过证据门；模型失败或证据门不通过时回退确定性文案。
@@ -46,7 +46,7 @@ graph TD
 
 ## 配置边界
 
-图谱连接、图片识别服务地址与实时值 Redis 的变量、缺省值与回退顺序见[配置参考](../advanced/configuration.md#故障溯源)。运行期的关键约束：系统配置优先于同名环境变量；图谱地址、图名、用户名或密码任一缺失时工具返回固定文案，不静默换图；Redis 地址缺失记为 `not_configured` 而不是 `missing`；`FAULT_TRACE_INTENT_ENABLED`、`FAULT_TRACE_INTENT_TIMEOUT`、`FAULT_TRACE_INTENT_MAX_TOKENS` 只影响意图识别与文本生成的模型调用，不改变控制流。
+图谱连接、图片识别服务地址与实时值 Redis 的变量、缺省值与回退顺序见[配置参考](../advanced/configuration.md#故障溯源)。运行期的关键约束：系统配置优先于同名环境变量；图谱地址、图名、用户名或密码任一缺失时工具返回固定文案，不静默换图；Redis 地址缺失记为 `not_configured` 而不是 `missing`。`FAULT_TRACE_INTENT_ENABLED` 只决定意图识别是否调用模型（关闭后走规则解析），`FAULT_TRACE_INTENT_TIMEOUT` 与 `FAULT_TRACE_INTENT_MAX_TOKENS` 作用于意图识别与两段文本生成的模型调用，都不改变控制流。
 
 智能体侧只有一个开关影响链路形状：预设里的 `image_input_mode="server"`。改成 `"model"` 会把图片交给模型，同时 `trace_fault` 仍只读会话状态里的上传图片，两条链路不共享识别结果。
 
@@ -103,7 +103,7 @@ graph TD
 | `uv_photon_rate` | float | 光子/s | 紫外成像仪 |
 | `line_protection_trip` | bool | — | 保护装置（SCADA） |
 
-属性名来自触发条件 `表达式` 中出现的标识符，上表只是当前线路数据集的示例，不是白名单；表达式引用未列出的属性同样读取。`image_*` 属性不读 Redis，由 YOLO/人工输入提供，读取状态固定为 `not_collected`；缺失时按 `image_required` 处理。读取结果按状态区分：`missing`（key 不存在）、`invalid`（值无法解析或为 `nan`/`inf`）、`unavailable`（连接失败或超时）、`not_configured`（未配置地址）、`not_collected`（图像类属性不来自 Redis）；除 `ok` 外都映射为 `unknown`，**不当作 `false`**。`unavailable` 与 `not_configured` 会触发“实时数据服务暂时不可用”告警，`missing` 只表示该设备缺这项数据。
+属性名来自触发条件 `表达式` 中出现的标识符，上表只是当前线路数据集的示例，不是白名单；表达式引用未列出的属性同样读取。`image_*` 属性不读 Redis：配置了实时值地址时状态为 `not_collected`，未配置地址时与其他属性一样返回 `not_configured`；缺失时按 `image_required` 处理。读取结果按状态区分：`missing`（key 不存在）、`invalid`（值无法解析或为 `nan`/`inf`）、`unavailable`（连接失败或超时）、`not_configured`（未配置地址）、`not_collected`（图像类属性不来自 Redis）；除 `ok` 外都映射为 `unknown`，**不当作 `false`**。`unavailable` 与 `not_configured` 会触发“实时数据服务暂时不可用”告警，`missing` 只表示该设备缺这项数据。
 
 触发条件的 `表达式` 使用受限 AST：标识符、数字/布尔字面量、比较、`and`/`or`/`not`、括号与四则运算；不支持函数调用、属性访问或下标，不使用 `eval`。任一必需属性不 `ok` 时结果为 `unknown`；表达式非法或超长（>500 字符）为 `expression_invalid`。
 
@@ -132,6 +132,8 @@ graph TD
 - ⑤ **处置建议**：只列成立原因及其处置措施，措施取图谱节点的 `说明` 内容（不是节点名称），换行在表格内转为 `<br>`；没有成立原因时显示“未定位成立原因，暂无处置建议”。
 
 报告 JSON 的 `reasoning[].causes[]` 带 `measures`，`location` 带 `causes`、`phenomena` 与 `rule`，`suggestions` 带成立原因与措施说明；`answer_markdown` 由这些字段确定性渲染，卡片与发布消息共用同一份内容。
+
+`answer_verified` 的含义是“报告里没有未经证据校验的定位结论”，不是“报告已给出结论”。每个定位原因都必须由非定性、结果为真的判据支持；未定位任何原因时没有待校验的结论，该字段仍为 `true`，报告按确定性推理发布。模型文本只能替换故障现象简述与推理依据，且必须通过各自的证据门；未定位时模型推理依据一律不采纳。
 
 ## 四步思考过程
 
