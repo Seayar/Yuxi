@@ -13,6 +13,7 @@ from dataclasses import dataclass
 
 from minio.error import S3Error
 from yuxi.storage.minio import get_minio_client
+from yuxi.storage.minio.client import StorageError
 from yuxi.utils import logger
 
 IMAGE_BUCKET = os.getenv("FAULT_TRACE_IMAGE_BUCKET", "fault-assets")
@@ -64,7 +65,8 @@ async def resolve_device_image(device_name: str) -> DeviceImage | None:
         extension = object_key.rsplit(".", 1)[-1].lower()
         try:
             data = await client.adownload_file(IMAGE_BUCKET, object_key)
-        except S3Error as exc:
+        except (S3Error, StorageError) as exc:
+            # storage 客户端把 S3Error 包装成自己的 StorageError，两者都要按“存储不可用”降级。
             logger.warning(f"下载设备图片失败: {IMAGE_BUCKET}/{object_key}: {exc}")
             raise DeviceImageError("storage_unavailable", "设备图片存储暂不可用") from exc
         return DeviceImage(

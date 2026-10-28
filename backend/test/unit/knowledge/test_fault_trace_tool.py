@@ -503,7 +503,10 @@ async def test_trace_fault_confirms_after_device_validation(monkeypatch):
     monkeypatch.setattr(
         workflow_module,
         "interrupt",
-        lambda payload: {"fault_trace_intent_confirm": "confirm"},
+        # 模拟前端点“正确，继续溯源”：把卡片上展示的选项值原样回传，含计划指纹。
+        lambda payload: {
+            payload["questions"][0]["question_id"]: payload["questions"][0]["options"][0]["value"]
+        },
     )
 
     result = await FAULT_FN(

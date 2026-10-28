@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import HTTPException
@@ -437,6 +438,86 @@ async def test_save_messages_binds_thinking_to_run_output_message(monkeypatch: p
     )
 
     assert conv_repo.saved_messages[0]["extra_metadata"]["thinking_steps"] == steps
+
+
+@pytest.mark.asyncio
+async def test_run_with_model_audit_attaches_thinking_to_reconciled_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """生产分支：model audit 非空时输出消息来自对账对象，thinking 必须挂到同一对象上。
+
+    这是 Run 路径的真实走向（`chat_service` 在有 audit 时用
+    `_reconcile_model_audit_message` 的返回值作为最终输出），与无 audit 的前置分支不同。
+    """
+
+    class FakeDB:
+        async def commit(self):
+            pass
+
+        async def rollback(self):
+            pass
+
+    class FakeGraph:
+        async def aget_state(self, _config):
+            return SimpleNamespace(
+                values={
+                    "messages": [
+                        HumanMessage(content="question"),
+                        AIMessage(content="answer", id="audit-op-1"),
+                    ]
+                }
+            )
+
+    audited_message = SimpleNamespace(id="audit-op-1", extra_metadata={}, message_type="assistant")
+
+    class FakeModelAuditRepo:
+        def __init__(self, _db):
+            pass
+
+        async def list_for_run(self, _run_id):
+            return [SimpleNamespace(operation_id="audit-op-1")]
+
+    class FakeRunRepo:
+        def __init__(self, _db):
+            pass
+
+        async def lock_output_persistence(self, *_args, **_kwargs):
+            return object()
+
+        async def set_output_message(self, *_args, **_kwargs):
+            return object()
+
+        async def set_terminal_status(self, *_args, **_kwargs):
+            return object(), True
+
+        async def cancel_active_execution_tree_descendants(self, _run):
+            return []
+
+    async def fake_reconcile(_conv_repo, *, run_id, operation_id, msg_dict, trace_info):
+        del run_id, operation_id, msg_dict, trace_info
+        return audited_message
+
+    conv_repo = _FakeConvRepo(FakeDB())
+    steps = [{"step_id": "parse_query", "step_index": 1, "state": "completed"}]
+    monkeypatch.setattr(svc, "AgentRunRepository", FakeRunRepo)
+    monkeypatch.setattr(svc, "ModelMessageAuditRepository", FakeModelAuditRepo)
+    monkeypatch.setattr(svc, "ToolMessageAuditRepository", _EmptyToolAuditRepo)
+    monkeypatch.setattr(svc, "_reconcile_model_audit_message", fake_reconcile)
+    monkeypatch.setattr(svc, "publish_cancel_signals", AsyncMock())
+
+    await svc.save_messages_from_langgraph_state(
+        state=await FakeGraph().aget_state({}),
+        thread_id="thread-1",
+        conv_repo=conv_repo,
+        trace_info=None,
+        run_id="run-1",
+        request_id="req-1",
+        worker_id="worker-1",
+        complete_run=True,
+        thinking_steps=steps,
+    )
+
+    assert audited_message.extra_metadata["thinking_steps"] == steps
 
 
 @pytest.mark.asyncio

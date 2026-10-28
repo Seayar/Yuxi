@@ -48,6 +48,19 @@ async def test_image_attributes_are_not_read_from_redis(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_unconfigured_url_reports_not_configured_for_image_attributes(monkeypatch):
+    """没有实时值地址时，图像类属性与其他属性一样是 not_configured，而不是 not_collected。"""
+
+    monkeypatch.delenv("FAULT_TRACE_REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_URL", raising=False)
+
+    values = await realtime.read_realtime_values("dev-1", ["image_tree_fall_detected", "leakage_current"])
+
+    assert values["image_tree_fall_detected"].status == "not_configured"
+    assert values["leakage_current"].status == "not_configured"
+
+
+@pytest.mark.asyncio
 async def test_unregistered_attributes_are_read_and_parsed(monkeypatch):
     async def fake_mget(url, device_id, attributes):
         assert device_id == "dev-1"

@@ -200,61 +200,68 @@ def test_collect_evidence_supports_type_level_phenomena_without_mode():
 FOREIGN_TYPE = {"名称": "电流互感器", "id": "DEV#电流互感器"}
 
 
-def _empty_ledger_responder(cypher: str, params: dict):
-    """模拟真实图：无台账 ID 的设备之间也有 ``属于`` 边。"""
+class _GraphFakeClient:
+    """按 ``id`` / ``台账ID列表`` 参数真的过滤，而不是按 cypher 文本猜答案。
 
-    if params.get("rel") == "属于":
-        # 只有把空 ledger_id 拼进等值条件时，才会命中他设备；修复后不应出现该查询。
-        if "台账ID列表" in cypher and params.get("ledger_id") == "":
-            return [{"b": FOREIGN_TYPE}]
+    ``belongs_to`` 是 ``{设备 id: 类型节点}``，``ledger_belongs_to`` 是
+    ``{台账ID列表: 类型节点}``；查询里出现哪个参数就用哪个键过滤。
+    """
+
+    def __init__(self, *, belongs_to=None, ledger_belongs_to=None) -> None:
+        self.belongs_to = belongs_to or {}
+        self.ledger_belongs_to = ledger_belongs_to or {}
+        self.queries: list[tuple[str, dict]] = []
+
+    def run(self, cypher: str, **params):
+        self.queries.append((cypher, params))
+        if params.get("rel") != "属于":
+            return []
+        if "$device_id" in cypher and params.get("device_id") in self.belongs_to:
+            return [{"b": self.belongs_to[params["device_id"]]}]
+        if "$ledger_id" in cypher and params.get("ledger_id") in self.ledger_belongs_to:
+            return [{"b": self.ledger_belongs_to[params["ledger_id"]]}]
         return []
-    return []
 
 
-def _ledger_match_responder(cypher: str, params: dict):
-    if params.get("rel") == "属于":
-        if "台账ID列表" in cypher and params.get("ledger_id") == "3b7y":
-            return [{"b": TYPE}]
-        return []
-    return []
+def test_resolve_device_type_filters_other_devices_without_ledger_id():
+    """真实过滤语义：目标设备没有台账 ID 时，他设备的“属于”边不会被返回。"""
 
+    target = {"id": "LGR#target", "name": "目标设备", "type": "device", "properties": {"名称": "目标设备"}}
+    client = _GraphFakeClient(
+        # 只有“另一个无台账 ID 的设备”有类型边：查询若把空台账 ID 拼进条件就会命中它。
+        belongs_to={"LGR#other": FOREIGN_TYPE},
+        ledger_belongs_to={"": FOREIGN_TYPE},
+    )
 
-def test_resolve_device_type_ignores_empty_ledger_id_match():
-    """目标设备没有台账 ID 时不能命中他设备的类型。"""
-
-    client = _FakeClient(_empty_ledger_responder)
-    device = {
-        "id": "LGR#target",
-        "name": "目标设备",
-        "type": "device",
-        "properties": {"名称": "目标设备", "id": "LGR#target", "设备分类": "未映射分类"},
-    }
-
-    assert resolve_device_type(client, device) == (None, None)
-    belongs_queries = [cypher for cypher, params in client.queries if params.get("rel") == "属于"]
-    assert belongs_queries, "目标设备有 id 时仍应查询属于边"
-    assert all("台账ID列表" not in cypher for cypher in belongs_queries)
+    assert resolve_device_type(client, target) == (None, None)
+    # 参数总是成对传入；关键是 cypher 里不能出现台账条件，否则空值会命中他设备。
+    assert all("台账ID列表" not in cypher for cypher, _params in client.queries)
 
 
 def test_resolve_device_type_skips_edge_lookup_without_any_identifier():
     """设备既无 id 也无台账 ID 时没有可靠匹配键，不做等值查询。"""
 
-    client = _FakeClient(_empty_ledger_responder)
+    client = _GraphFakeClient()
     device = {"name": "无标识设备", "type": "device", "properties": {"设备分类": "中压线路"}}
 
     assert resolve_device_type(client, device) == (None, None)
     assert all(params.get("rel") != "属于" for _, params in client.queries)
 
 
-def test_resolve_device_type_matches_ledger_id_when_present():
-    """有台账 ID 时仍按台账 ID 匹配，并使用稳定排序。"""
+def test_resolve_device_type_falls_back_to_ledger_id_edge():
+    """设备 id 没有类型边时仍可按台账 ID 命中，并使用稳定排序。"""
 
-    client = _FakeClient(_ledger_match_responder)
-    device = {"id": "LGR#x", "name": "x", "type": "device", "properties": {"台账ID列表": "3b7y"}}
+    target = {"id": "LGR#x", "name": "x", "type": "device", "properties": {"台账ID列表": "3b7y"}}
+    client = _GraphFakeClient(
+        belongs_to={},
+        ledger_belongs_to={"3b7y": {"名称": "架空线路", "id": "DEV#架空线路"}},
+    )
 
-    name, node = resolve_device_type(client, device)
+    name, node = resolve_device_type(client, target)
 
     assert name == "架空线路"
     assert node["id"] == "DEV#架空线路"
     belongs_queries = [cypher for cypher, params in client.queries if params.get("rel") == "属于"]
     assert all("ORDER BY" in cypher for cypher in belongs_queries)
+    # 空台账 ID 只在设备没有台账 ID 时才会被排除；这里有值，两个条件都应出现在同一条查询里。
+    assert all("$device_id" in cypher and "$ledger_id" in cypher for cypher in belongs_queries)

@@ -890,9 +890,9 @@ async def _prepare_device(
         decision, correction = parse_intent_confirmation(answer)
         if decision == "confirm":
             # resume 会重新识别意图；用户确认的计划指纹随选项值持久化在 checkpoint 里，
-            # 重算结果与它不一致时不能静默执行另一份计划。
-            confirmed_token = parse_confirmation_token(answer)
-            if confirmed_token is not None and confirmed_token != plan_token(intent_plan):
+            # 重算结果与它不一致时不能静默执行另一份计划。指纹缺失同样不能放行：
+            # 无法证明用户确认过哪份计划时按不一致处理。
+            if parse_confirmation_token(answer) != plan_token(intent_plan):
                 emitter.emit(
                     "parse_fault",
                     "failed",

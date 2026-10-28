@@ -2380,10 +2380,12 @@ const conversationRows = computed(() => {
       hasActiveThinking)
   const rows = conversations.value.map((conv, index) => {
     const isLiveThinking = showLiveThinking && index === liveThinkingIndex
-    // 流式期间工具卡片由思考面板表达，隐藏同样的工具卡片，避免重复与结束后跳变。
+    const persistedThinkingSteps = isLiveThinking ? [] : getPersistedThinkingSteps(conv)
+    // 已展示思考过程的轮次同样隐藏这些工具卡片：否则流式结束、live 容器移除后，
+    // 被隐藏的检索卡片会重新出现，产生一次视觉跳变。
     const displayItems = getDisplayItems(conv, {
-      thinkingSteps: isLiveThinking ? [] : getPersistedThinkingSteps(conv),
-      hideThinkingTools: isLiveThinking
+      thinkingSteps: persistedThinkingSteps,
+      hideThinkingTools: isLiveThinking || persistedThinkingSteps.length > 0
     })
     if (isLiveThinking) {
       const liveThinkingItem = {

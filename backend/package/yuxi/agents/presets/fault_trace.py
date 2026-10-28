@@ -1,10 +1,10 @@
 """故障溯源 Agent 预设。"""
 
 from yuxi.agents.presets import AgentPreset
-from yuxi.agents.thinking import register_thinking_steps
-from yuxi.knowledge.fault_trace.contracts import FAULT_TRACE_AGENT_SLUG, FAULT_TRACE_THINKING_STEPS
+from yuxi.knowledge.fault_trace.contracts import FAULT_TRACE_AGENT_SLUG
 
-register_thinking_steps(FAULT_TRACE_AGENT_SLUG, FAULT_TRACE_THINKING_STEPS)
+# 四步思考过程由 ``fault_trace/contracts.py`` 在导入时注册一次；这里不再重复注册，
+# 避免同一 slug 出现第二个写入点。
 
 
 SYSTEM_PROMPT = """你是「故障原因溯源」智能体，专注于基于故障知识图谱与图片识别结果定位电力设备故障原因。

@@ -6,6 +6,7 @@ import pytest
 from minio.error import S3Error
 from yuxi.knowledge.fault_trace import images as images_module
 from yuxi.knowledge.fault_trace.images import DeviceImageError, resolve_device_image
+from yuxi.storage.minio.client import StorageError
 
 pytestmark = pytest.mark.unit
 
@@ -31,15 +32,18 @@ class _FakeMinio:
 
 
 class _FakeStorage:
-    def __init__(self, minio: _FakeMinio) -> None:
+    def __init__(self, minio: _FakeMinio, *, download_error: Exception | None = None) -> None:
         self.client = minio
+        self.download_error = download_error
 
     async def adownload_file(self, _bucket: str, object_key: str) -> bytes:
+        if self.download_error is not None:
+            raise self.download_error
         return f"data:{object_key}".encode()
 
 
-def _patch(monkeypatch, minio: _FakeMinio) -> None:
-    monkeypatch.setattr(images_module, "get_minio_client", lambda: _FakeStorage(minio))
+def _patch(monkeypatch, minio: _FakeMinio, *, download_error: Exception | None = None) -> None:
+    monkeypatch.setattr(images_module, "get_minio_client", lambda: _FakeStorage(minio, download_error=download_error))
 
 
 @pytest.mark.asyncio
@@ -96,6 +100,30 @@ async def test_resolve_device_image_rejects_oversized(monkeypatch):
 async def test_resolve_device_image_maps_storage_error(monkeypatch):
     minio = _FakeMinio(error=S3Error(None, "AccessDenied", "denied", "bucket", "req", "host"))
     _patch(monkeypatch, minio)
+
+    with pytest.raises(DeviceImageError) as excinfo:
+        await resolve_device_image("#1主变压器")
+
+    assert excinfo.value.code == "storage_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_download_failure_is_reported_as_storage_unavailable(monkeypatch):
+    """stat 成功但下载失败时必须降级为 DeviceImageError，不能把原始异常透出工具。"""
+
+    minio = _FakeMinio({"device-images/#1主变压器.jpg": 10})
+    _patch(monkeypatch, minio, download_error=StorageError("下载文件失败: boom"))
+
+    with pytest.raises(DeviceImageError) as excinfo:
+        await resolve_device_image("#1主变压器")
+
+    assert excinfo.value.code == "storage_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_s3_error_on_download_also_degrades(monkeypatch):
+    minio = _FakeMinio({"device-images/#1主变压器.jpg": 10})
+    _patch(monkeypatch, minio, download_error=S3Error(None, "NoSuchKey", "gone", "bucket", "req", "host"))
 
     with pytest.raises(DeviceImageError) as excinfo:
         await resolve_device_image("#1主变压器")

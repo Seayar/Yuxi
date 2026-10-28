@@ -19,6 +19,13 @@ from yuxi.knowledge.power_spec.tool import _confirm_intent_with_user
 QUESTION = "220 的变压器色谱多久做一回？"
 
 
+def _confirm(interrupt_value: dict) -> dict:
+    """模拟用户点“正确，继续检索”：回传卡片上展示的选项值（含计划指纹）。"""
+
+    question = interrupt_value["questions"][0]
+    return {question["question_id"]: question["options"][0]["value"]}
+
+
 class _State(TypedDict, total=False):
     result: str
 
@@ -76,7 +83,7 @@ async def test_langgraph_interrupt_repeats_confirmation_after_correction(monkeyp
     assert second_interrupt["intent_plan"]["attempt"] == 2
     assert second_interrupt["intent_plan"]["voltage_level"] == "110kV"
 
-    third = await app.ainvoke(Command(resume={"power_spec_intent_confirm": "confirm"}), config=config)
+    third = await app.ainvoke(Command(resume=_confirm(second_interrupt)), config=config)
     assert "__interrupt__" not in third
     assert third["result"] == "110kV 变压器色谱试验周期"
     # 节点在每次 resume 时重新执行，历次识别会重跑：1 + 2 + 2 = 5 次。
@@ -97,9 +104,10 @@ async def test_langgraph_interrupt_asks_for_details_then_reidentifies(monkeypatc
         Command(resume={"power_spec_intent_correction": {"type": "other", "text": "电压等级是 110kV", "selected": []}}),
         config=config,
     )
-    assert reidentified["__interrupt__"][0].value["intent_plan"]["voltage_level"] == "110kV"
+    confirm_payload = reidentified["__interrupt__"][0].value
+    assert confirm_payload["intent_plan"]["voltage_level"] == "110kV"
 
-    final = await app.ainvoke(Command(resume={"power_spec_intent_confirm": "confirm"}), config=config)
+    final = await app.ainvoke(Command(resume=_confirm(confirm_payload)), config=config)
     assert final["result"] == "110kV 变压器色谱试验周期"
 
 

@@ -1,10 +1,9 @@
 """电力规范检索 Agent 预设。"""
 
 from yuxi.agents.presets import AgentPreset
-from yuxi.agents.thinking import register_thinking_steps
-from yuxi.knowledge.power_spec.contracts import POWER_SPEC_THINKING_STEPS
+from yuxi.knowledge.power_spec.contracts import POWER_SPEC_AGENT_SLUG
 
-register_thinking_steps("power-spec-agent", POWER_SPEC_THINKING_STEPS)
+# 四步思考过程由 ``power_spec/contracts.py`` 在导入时注册一次；这里不再重复注册。
 
 
 SYSTEM_PROMPT = """你是「电力规范检索」智能体，专注于基于已启用的电力规范知识库回答问题。
@@ -29,7 +28,7 @@ SYSTEM_PROMPT = """你是「电力规范检索」智能体，专注于基于已�
 """
 
 PRESET = AgentPreset(
-    slug="power-spec-agent",
+    slug=POWER_SPEC_AGENT_SLUG,
     name="电力规范检索",
     description="基于电力规范知识库、知识图谱和条款证据检索现行电力规范。",
     backend_id="ChatbotAgent",

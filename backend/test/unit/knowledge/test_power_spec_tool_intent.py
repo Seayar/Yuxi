@@ -60,8 +60,15 @@ class _SessionStub:
         return _Context()
 
 
+ECHO_CONFIRM = "echo-confirm"
+
+
 class _InterruptQueue:
-    """按顺序回放用户答案并记录每次向用户展示的载荷。"""
+    """按顺序回放用户答案并记录每次向用户展示的载荷。
+
+    ``ECHO_CONFIRM`` 表示“用户点了卡片上展示的确认项”，用于回显计划指纹；
+    其他值原样返回，可用来模拟缺少指纹或自由文本。
+    """
 
     def __init__(self, *answers):
         self._answers = list(answers)
@@ -69,7 +76,11 @@ class _InterruptQueue:
 
     def __call__(self, payload):
         self.payloads.append(payload)
-        return self._answers.pop(0) if self._answers else None
+        answer = self._answers.pop(0) if self._answers else None
+        if answer == ECHO_CONFIRM:
+            question = payload["questions"][0]
+            return {question["question_id"]: question["options"][0]["value"]}
+        return answer
 
 
 def _install(monkeypatch, *answers, intent_calls=None):
@@ -93,7 +104,7 @@ def _install(monkeypatch, *answers, intent_calls=None):
 
 @pytest.mark.asyncio
 async def test_confirming_intent_once_continues_to_retrieval(monkeypatch):
-    queue = _install(monkeypatch, {"power_spec_intent_confirm": "confirm"})
+    queue = _install(monkeypatch, ECHO_CONFIRM)
 
     result = await search_power_spec.coroutine(query_text=QUESTION, confirmed_intent=False, runtime=Runtime())
 
@@ -111,7 +122,7 @@ async def test_rejecting_intent_with_correction_asks_for_confirmation_again(monk
     queue = _install(
         monkeypatch,
         {"power_spec_intent_confirm": {"type": "other", "text": "电压等级是 110kV", "selected": []}},
-        {"power_spec_intent_confirm": "confirm"},
+        ECHO_CONFIRM,
         intent_calls=intent_calls,
     )
 
@@ -133,7 +144,7 @@ async def test_rejecting_intent_without_correction_asks_for_details(monkeypatch)
         monkeypatch,
         {"power_spec_intent_confirm": "correct"},
         {"power_spec_intent_correction": {"type": "other", "text": "我要问 110kV 开关柜", "selected": []}},
-        {"power_spec_intent_confirm": "confirm"},
+        ECHO_CONFIRM,
         intent_calls=intent_calls,
     )
 
@@ -189,6 +200,18 @@ def test_tool_schema_hides_confirmation_from_model():
     assert "confirmed_intent" not in tool_module.PowerSpecSearchInput.model_fields
     parsed = tool_module.PowerSpecSearchInput.model_validate({"query_text": QUESTION, "confirmed_intent": True})
     assert parsed.model_dump() == {"query_text": QUESTION, "kb_id": None}
+
+
+@pytest.mark.asyncio
+async def test_confirm_without_plan_token_is_rejected(monkeypatch):
+    """恢复值里没有计划指纹时无法证明确认过哪份计划，按不一致处理而不是静默执行。"""
+
+    queue = _install(monkeypatch, {"power_spec_intent_confirm": "confirm"})
+
+    result = await search_power_spec.coroutine(query_text=QUESTION, confirmed_intent=False, runtime=Runtime())
+
+    assert result == INTENT_PLAN_CHANGED_MESSAGE
+    assert len(queue.payloads) == 1
 
 
 @pytest.mark.asyncio

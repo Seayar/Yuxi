@@ -16,7 +16,7 @@ from neo4j import GraphDatabase, Query
 from yuxi.utils import logger
 
 CONNECT_TIMEOUT_SECONDS = float(os.getenv("TUGRAPH_CONNECT_TIMEOUT", "5"))
-# 单条查询的事务超时（毫秒），由 bolt 事务配置下发给服务端。
+# 单条查询的事务超时（秒），通过 bolt 事务配置下发给服务端。
 QUERY_TIMEOUT_SECONDS = float(os.getenv("TUGRAPH_QUERY_TIMEOUT", "10"))
 
 
