@@ -362,14 +362,19 @@ CONFIRM_VALUE_PREFIX = "confirm#"
 
 
 def intent_plan_signature(intent_plan: dict[str, Any]) -> tuple[str, ...]:
-    """确认计划的可比对字段；只保留用户实际确认的语义（含图片识别结果）。"""
+    """确认计划的可比对字段：只覆盖确认卡片上用户实际看到并确认的设备与现象。
 
+    现象按集合比较，不因模型输出顺序或重复而判为不一致；图片识别结果属于用户确认过的
+    内容，一并纳入。
+    """
+
+    phenomena = intent_plan.get("phenomena") or ()
     return (
-        str(intent_plan.get("device_name") or ""),
-        str(intent_plan.get("device_type") or ""),
-        str(intent_plan.get("voltage_level") or ""),
-        str(intent_plan.get("image_fault_name") or ""),
-        *(str(item) for item in (intent_plan.get("phenomena") or ())),
+        f"device_name={str(intent_plan.get('device_name') or '')!r}",
+        f"device_type={str(intent_plan.get('device_type') or '')!r}",
+        f"voltage_level={str(intent_plan.get('voltage_level') or '')!r}",
+        f"image_fault_name={str(intent_plan.get('image_fault_name') or '')!r}",
+        f"phenomena={tuple(sorted({str(item) for item in phenomena}))!r}",
     )
 
 

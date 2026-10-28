@@ -101,15 +101,33 @@ def test_input_constraint_image_only_still_needs_text():
     assert applied.clarification_required is False
 
 
+def test_plan_token_tracks_device_and_phenomena_only():
+    """指纹覆盖用户确认的设备与现象，现象顺序与重复不影响结果。"""
+
+    base = {
+        "device_name": "3B-7Y",
+        "device_type": "架空线路",
+        "voltage_level": "10kV",
+        "phenomena": ["树木倒伏", "放电"],
+        "image_fault_name": "异物",
+    }
+
+    assert intent_module.plan_token(base) == intent_module.plan_token(
+        {**base, "phenomena": ["放电", "树木倒伏", "树木倒伏"]}
+    )
+    assert intent_module.plan_token(base) != intent_module.plan_token({**base, "device_name": "3B-8Y"})
+    assert intent_module.plan_token(base) != intent_module.plan_token({**base, "phenomena": ["树木倒伏"]})
+
+
 def test_confirmation_payload_and_parse():
     query = FaultTraceQuery(device_name="1号主变", phenomena=["过热"], image_fault_name="冒烟/着火")
     payload = build_confirmation_payload(intent_module.build_intent_plan(query))
 
     assert payload["source"] == "fault_trace_intent_confirmation"
     assert "1号主变" in payload["questions"][0]["question"]
-    assert parse_intent_confirmation(
-        {"fault_trace_intent_confirm": {"selected": [{"value": "confirm"}]}}
-    )[0] == "confirm"
+    assert (
+        parse_intent_confirmation({"fault_trace_intent_confirm": {"selected": [{"value": "confirm"}]}})[0] == "confirm"
+    )
     assert parse_intent_confirmation({"fault_trace_intent_confirm": {"text": "设备是2号主变"}}) == (
         "reject",
         "设备是2号主变",
@@ -166,9 +184,7 @@ async def test_model_missing_device_is_backfilled_from_rules():
 def test_rule_parse_keeps_full_device_name_for_numbered_transformer():
     """带编号的主变压器名必须整体命中，避免截成“#1主变”后匹配到间隔/开关柜。"""
 
-    query = parse_fault_trace_query(
-        "35kV#1变电站#1主变压器运行中绕组区域冒烟，本体温度报警，请分析原因。"
-    )
+    query = parse_fault_trace_query("35kV#1变电站#1主变压器运行中绕组区域冒烟，本体温度报警，请分析原因。")
 
     assert query.device_name == "#1主变压器"
     assert query.voltage_level == "35kV"

@@ -350,9 +350,20 @@ CONFIRM_VALUE_PREFIX = "confirm#"
 
 
 def intent_plan_signature(intent_plan: dict[str, Any]) -> tuple[str, ...]:
-    """确认计划的可比对字段；只保留用户实际确认的语义。"""
+    """确认计划的可比对字段：只覆盖确认卡片上用户实际看到并确认的语义。
 
-    return tuple(f"{key}={intent_plan[key]!r}" for key in sorted(intent_plan) if key != "attempt")
+    检索关键词（``normalized_terms``/``unknown_terms``）与重述句（``normalized_query``）
+    由模型生成，同一提示词重跑也会变化；把它们算进指纹会让恢复正常失败。维度按集合比较，
+    不因模型输出顺序不同而判为不一致。
+    """
+
+    dimensions = intent_plan.get("answer_dimensions") or ()
+    return (
+        f"intent={intent_plan.get('intent')!r}",
+        f"device_type={intent_plan.get('device_type')!r}",
+        f"voltage_level={intent_plan.get('voltage_level')!r}",
+        f"answer_dimensions={tuple(sorted(str(item) for item in dimensions))!r}",
+    )
 
 
 def plan_token(intent_plan: dict[str, Any]) -> str:

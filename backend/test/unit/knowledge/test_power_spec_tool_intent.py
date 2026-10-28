@@ -10,6 +10,7 @@ from yuxi.knowledge.power_spec.intent import (
     extract_correction_text,
     parse_intent_confirmation,
     parse_power_spec_query,
+    plan_token,
 )
 from yuxi.knowledge.power_spec.tool import NO_EVIDENCE_MESSAGE, search_power_spec
 
@@ -247,6 +248,43 @@ async def test_replay_with_changed_plan_is_rejected(monkeypatch):
 
     assert result == INTENT_PLAN_CHANGED_MESSAGE
     assert shown[0]["questions"][0]["options"][0]["value"].startswith("confirm#")
+
+
+def test_plan_token_tracks_only_fields_the_user_confirmed():
+    """指纹只覆盖确认卡片上的语义；模型每次都会变的关键词与重述句不能参与。"""
+
+    base = {
+        "intent": "检修标准查询",
+        "device_type": "变压器",
+        "voltage_level": "220kV",
+        "answer_dimensions": ["周期"],
+        "normalized_terms": ["周期", "变压器", "DGA"],
+        "unknown_terms": ["DGA"],
+        "normalized_query": "220kV 变压器色谱周期",
+    }
+    volatile = {
+        **base,
+        "normalized_terms": ["周期", "变压器", "检修规程"],
+        "unknown_terms": ["检修规程"],
+        "normalized_query": "220kV 变压器色谱试验多久一次？",
+    }
+
+    assert plan_token(base) == plan_token(volatile)
+    assert plan_token(base) != plan_token({**base, "voltage_level": "110kV"})
+    assert plan_token(base) != plan_token({**base, "answer_dimensions": ["周期", "限值"]})
+
+
+def test_plan_token_ignores_dimension_order():
+    """同一组维度按集合比较，不因模型输出顺序不同而判为不一致。"""
+
+    base = {
+        "intent": "检修标准查询",
+        "device_type": "变压器",
+        "voltage_level": "220kV",
+        "answer_dimensions": ["周期", "限值"],
+    }
+
+    assert plan_token(base) == plan_token({**base, "answer_dimensions": ["限值", "周期"]})
 
 
 def test_parse_intent_confirmation_accepts_frontend_answer_shapes():
