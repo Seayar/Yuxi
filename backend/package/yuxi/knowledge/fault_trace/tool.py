@@ -22,8 +22,11 @@ from yuxi.knowledge.fault_trace.contracts import (
     FAULT_TRACE_THINKING_STEPS,
     NO_FAULT_GRAPH_MESSAGE,
 )
-from yuxi.knowledge.fault_trace.workflow import FaultTraceState, run_fault_trace
 from yuxi.utils import logger
+
+# ``workflow`` 在函数内延迟导入：本模块由 ``yuxi.agents.toolkits`` 在包初始化时导入，
+# 而 ``workflow`` 又依赖 ``yuxi.agents``；模块级互相导入会让
+# ``import yuxi.knowledge.fault_trace.workflow`` 先失败于循环导入。
 
 __all__ = ["FaultTraceInput", "trace_fault"]
 
@@ -53,6 +56,8 @@ async def trace_fault(
 
     if not query_text.strip():
         return "请提供故障描述"
+
+    from yuxi.knowledge.fault_trace.workflow import FaultTraceState, run_fault_trace
 
     context = getattr(runtime, "context", None) if runtime is not None else None
     if context is None:

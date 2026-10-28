@@ -203,15 +203,14 @@ def test_tool_schema_hides_confirmation_from_model():
 
 
 @pytest.mark.asyncio
-async def test_confirm_without_plan_token_is_rejected(monkeypatch):
-    """恢复值里没有计划指纹时无法证明确认过哪份计划，按不一致处理而不是静默执行。"""
+async def test_confirm_without_plan_token_is_accepted(monkeypatch):
+    """不回传选项值的客户端（预构建前端）按已确认放行，不能被永久挡在确认循环里。"""
 
-    queue = _install(monkeypatch, {"power_spec_intent_confirm": "confirm"})
+    _install(monkeypatch, {"power_spec_intent_confirm": "confirm"})
 
     result = await search_power_spec.coroutine(query_text=QUESTION, confirmed_intent=False, runtime=Runtime())
 
-    assert result == INTENT_PLAN_CHANGED_MESSAGE
-    assert len(queue.payloads) == 1
+    assert result == NO_EVIDENCE_MESSAGE
 
 
 @pytest.mark.asyncio

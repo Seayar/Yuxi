@@ -473,9 +473,13 @@ async def _confirm_intent_with_user(query_text: str, *, context: Any) -> PowerSp
         answer = interrupt(build_confirmation_payload(intent_plan))
         decision, correction = parse_intent_confirmation(answer)
         if decision == "confirm":
-            # resume 会重新识别意图；用户确认的计划指纹随选项值持久化在 checkpoint 里，
-            # 重算结果与它不一致（或指纹缺失、无法证明确认过哪份计划）时拒绝执行。
-            if parse_confirmation_token(answer) != plan_token(intent_plan):
+            # 会回传选项值的客户端（web/ 的确认卡片）带计划指纹，与重算结果不一致时拒绝执行；
+            # 未回传指纹的客户端（预构建的 new-web）只能按既有行为放行，并留下可观察的告警，
+            # 不能因为它们不认指纹就把用户永久挡在确认循环里。
+            confirmed_token = parse_confirmation_token(answer)
+            if confirmed_token is None:
+                logger.warning("意图确认恢复值缺少计划指纹，按已确认处理（客户端未回传选项值）")
+            elif confirmed_token != plan_token(intent_plan):
                 return INTENT_PLAN_CHANGED_MESSAGE
             return query
         if decision == "invalid" or not correction:

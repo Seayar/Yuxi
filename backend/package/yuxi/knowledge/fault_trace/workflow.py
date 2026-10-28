@@ -889,10 +889,13 @@ async def _prepare_device(
         answer = interrupt(build_confirmation_payload(intent_plan))
         decision, correction = parse_intent_confirmation(answer)
         if decision == "confirm":
-            # resume 会重新识别意图；用户确认的计划指纹随选项值持久化在 checkpoint 里，
-            # 重算结果与它不一致时不能静默执行另一份计划。指纹缺失同样不能放行：
-            # 无法证明用户确认过哪份计划时按不一致处理。
-            if parse_confirmation_token(answer) != plan_token(intent_plan):
+            # 会回传选项值的客户端（web/ 的确认卡片）带计划指纹，与重算结果不一致时拒绝执行；
+            # 未回传指纹的客户端只能按既有行为放行，并留下可观察的告警，不能把用户永久挡在
+            # 确认循环里。
+            confirmed_token = parse_confirmation_token(answer)
+            if confirmed_token is None:
+                logger.warning("故障溯源确认恢复值缺少计划指纹，按已确认处理（客户端未回传选项值）")
+            elif confirmed_token != plan_token(intent_plan):
                 emitter.emit(
                     "parse_fault",
                     "failed",
