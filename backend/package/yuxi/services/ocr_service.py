@@ -159,9 +159,7 @@ async def _build_processor_kwargs(db: AsyncSession, engine_id: str) -> dict[str,
             raise ValueError("未找到已启用的本地模型供应商，无法使用 PaddleOCR-VL")
         extra = provider.extra_json if isinstance(provider.extra_json, dict) else {}
         vision_base_url = str(
-            extra.get("ocr_vision_base_url")
-            or os.getenv("PADDLEOCR_VL_BASE_URL")
-            or "http://192.168.138.10:8006/v1"
+            extra.get("ocr_vision_base_url") or os.getenv("PADDLEOCR_VL_BASE_URL") or "http://192.168.138.10:8006/v1"
         ).rstrip("/")
         return {
             "api_key": resolve_api_key(provider) or "",

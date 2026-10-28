@@ -594,17 +594,10 @@ class MilvusKB(KnowledgeBase):
         if not chunks:
             return
 
-        max_content_bytes = max(
-            len(str(chunk.get("content") or "").encode("utf-8")) for chunk in chunks
-        )
-        logger.info(
-            f"Preparing chunk insert for {file_id}: count={len(chunks)} "
-            f"max_content_bytes={max_content_bytes}"
-        )
+        max_content_bytes = max(len(str(chunk.get("content") or "").encode("utf-8")) for chunk in chunks)
+        logger.info(f"Preparing chunk insert for {file_id}: count={len(chunks)} max_content_bytes={max_content_bytes}")
         if max_content_bytes > 65535:
-            raise ValueError(
-                f"Chunk content exceeds Milvus byte limit before insert: {max_content_bytes}"
-            )
+            raise ValueError(f"Chunk content exceeds Milvus byte limit before insert: {max_content_bytes}")
 
         entities = [
             [chunk["id"] for chunk in chunks],

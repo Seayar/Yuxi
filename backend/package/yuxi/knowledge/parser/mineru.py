@@ -33,12 +33,8 @@ class MinerUParser(BaseDocumentProcessor):
         vlm_server_url: str | None = None,
     ):
         self.server_url = (server_url or os.getenv("MINERU_API_URI") or "http://localhost:30001").rstrip("/")
-        self.backend = (
-            backend or os.getenv("MINERU_API_BACKEND") or "hybrid-auto-engine"
-        ).strip()
-        self.vlm_server_url = (
-            vlm_server_url or os.getenv("MINERU_VLM_SERVER_URL") or ""
-        ).rstrip("/")
+        self.backend = (backend or os.getenv("MINERU_API_BACKEND") or "hybrid-auto-engine").strip()
+        self.vlm_server_url = (vlm_server_url or os.getenv("MINERU_VLM_SERVER_URL") or "").rstrip("/")
         self.parse_endpoint = f"{self.server_url}/file_parse"
 
     def check_health(self) -> dict:
@@ -148,11 +144,7 @@ class MinerUParser(BaseDocumentProcessor):
             "return_images": True,
         }
 
-        server_url = (
-            params.get("vlm_server_url")
-            or params.get("server_url")
-            or self.vlm_server_url
-        )
+        server_url = params.get("vlm_server_url") or params.get("server_url") or self.vlm_server_url
         if server_url:
             data["server_url"] = server_url
 

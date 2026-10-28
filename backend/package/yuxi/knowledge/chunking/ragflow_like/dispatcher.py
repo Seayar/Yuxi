@@ -20,8 +20,7 @@ def _build_chunk_records(
         if not text:
             continue
         pieces = [
-            text[index : index + MAX_MILVUS_CONTENT_CHARS]
-            for index in range(0, len(text), MAX_MILVUS_CONTENT_CHARS)
+            text[index : index + MAX_MILVUS_CONTENT_CHARS] for index in range(0, len(text), MAX_MILVUS_CONTENT_CHARS)
         ]
         for piece_index, piece in enumerate(pieces):
             start_char_pos = None
