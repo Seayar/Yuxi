@@ -1,6 +1,6 @@
-import MessageProcessor from '@/utils/messageProcessor'
-import { enrichTaskToolCalls } from '@/components/ToolCallingResult/toolRegistry'
-import { collapseConversationProcess } from '@/utils/conversationProcessGrouping'
+import MessageProcessor from './messageProcessor.js'
+import { enrichTaskToolCalls } from '../components/ToolCallingResult/toolRegistry.js'
+import { collapseConversationProcess } from './conversationProcessGrouping.js'
 
 const hasVisibleAssistantBody = (message) => {
   if (!message || message.type !== 'ai') return true
@@ -13,15 +13,27 @@ const hasVisibleAssistantBody = (message) => {
 
 const defaultEnrichToolCalls = (message) => enrichTaskToolCalls(message?.tool_calls)
 
+// 这两个工具的过程已经由智能体的四步思考区表达，保留原始工具卡片会重复且容易停留在“正在检索”。
+const THINKING_TOOL_NAMES = new Set(['search_power_spec', 'trace_fault'])
+
+const getToolCallName = (toolCall) => toolCall?.name || toolCall?.function?.name || ''
+
 /** 将相邻推理和工具调用按顺序归组，正文保持独立。 */
 export const getConversationDisplayItems = (
   conv,
-  { enrichToolCalls = defaultEnrichToolCalls, collapseIntermediate = false, runTiming = null } = {}
+  {
+    enrichToolCalls = defaultEnrichToolCalls,
+    collapseIntermediate = false,
+    runTiming = null,
+    thinkingSteps = [],
+    hideThinkingTools = false
+  } = {}
 ) => {
   if (!Array.isArray(conv?.messages) || conv.messages.length === 0) return []
 
   const items = []
   let pendingToolGroup = null
+  const lastAiIndex = conv.messages.findLastIndex((message) => message.type === 'ai')
 
   const flushToolGroup = () => {
     if (pendingToolGroup && pendingToolGroup.entries.length > 0) {
@@ -58,6 +70,17 @@ export const getConversationDisplayItems = (
       return pendingToolGroup
     }
 
+    // 四步思考过程属于本轮处理过程，归入同一个思考/工具面板；
+    // 只挂到本轮最后一条 AI 消息，避免历史轮次重复显示。
+    if (thinkingSteps.length && index === lastAiIndex) {
+      const group = ensureToolGroup('thinking')
+      group.entries.push({
+        type: 'thinking',
+        key: `thinking-${message.id || index}`,
+        steps: thinkingSteps
+      })
+    }
+
     if (reasoningContent) {
       ensureToolGroup('reasoning').entries.push({
         type: 'reasoning',
@@ -76,11 +99,15 @@ export const getConversationDisplayItems = (
       })
     }
 
-    if (toolCalls.length > 0) {
+    const visibleToolCalls = hideThinkingTools
+      ? toolCalls.filter((toolCall) => !THINKING_TOOL_NAMES.has(getToolCallName(toolCall)))
+      : toolCalls
+
+    if (visibleToolCalls.length > 0) {
       const group = ensureToolGroup('tools')
-      group.toolCalls.push(...toolCalls)
+      group.toolCalls.push(...visibleToolCalls)
       group.entries.push(
-        ...toolCalls.map((toolCall, toolIndex) => ({
+        ...visibleToolCalls.map((toolCall, toolIndex) => ({
           type: 'tool',
           key: `tool-${message.id || index}-${toolCall.id || toolIndex}`,
           toolCall

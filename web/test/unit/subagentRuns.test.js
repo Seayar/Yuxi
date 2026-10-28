@@ -3,9 +3,17 @@ import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
 import {
+  isInternalSubagentRun,
   isSubagentLaunchToolName,
   mergeSubagentRunsForDisplay
 } from '../../src/utils/subagentRuns.js'
+
+test('内部子智能体被识别，普通子智能体与缺省标记仍可展示', () => {
+  assert.equal(isInternalSubagentRun({ internal: true }), true)
+  assert.equal(isInternalSubagentRun({ internal: false }), false)
+  assert.equal(isInternalSubagentRun({}), false)
+  assert.equal(isInternalSubagentRun(null), false)
+})
 
 test('同步 task 和异步 subagent_start 都属于子智能体启动调用', () => {
   assert.equal(isSubagentLaunchToolName('task'), true)

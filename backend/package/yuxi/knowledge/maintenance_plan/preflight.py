@@ -1,6 +1,6 @@
 """处置方案 seed 数据的离线预检（不连接图谱 / 数据库 / 大模型）。
 
-预检在把 ``data/`` 下的六份 JSON 写入 TuGraph ``kg`` 图之前运行，只做纯离线校验：
+预检在把 ``data/`` 下的六份 JSON 写入 TuGraph ``kg3`` 图之前运行，只做纯离线校验：
 键名齐全、id 唯一、模板/备件的设备类型都在契约 ``DEVICE_TYPES`` 内、班组管辖区域都在
 ``ref/kg_ref.json`` 的台账名称中、模板占位符只用四个合法占位符、每个模板至少 1 条依据条款。
 
@@ -92,24 +92,6 @@ class PreflightError(Exception):
     """预检数据无法读取（文件缺失 / 非法 JSON）。"""
 
 
-def read_json_list(path: str | Path, *, what: str) -> list[dict]:
-    """读取一个顶层为数组的 JSON 文件并校验元素为对象。"""
-
-    file_path = Path(path)
-    if not file_path.is_file():
-        raise PreflightError(f"{what} 文件不存在: {file_path}")
-    try:
-        with file_path.open(encoding="utf-8") as handle:
-            payload = json.load(handle)
-    except json.JSONDecodeError as exc:
-        raise PreflightError(f"{what} 不是合法 JSON: {exc}") from exc
-    if not isinstance(payload, list):
-        raise PreflightError(f"{what} 顶层必须是 JSON 数组")
-    if not all(isinstance(item, dict) for item in payload):
-        raise PreflightError(f"{what} 的元素必须是对象")
-    return payload
-
-
 def load_kg_ref_names(kg_ref: dict[str, Any] | None) -> set[str]:
     """从 kg_ref.json 收集全部已知台账/区域名称（名称与层级路径逐段拆分）。"""
 
@@ -135,8 +117,8 @@ def load_kg_ref_names(kg_ref: dict[str, Any] | None) -> set[str]:
 def preflight_seed(seed: dict[str, list[dict]], *, kg_ref: dict[str, Any] | None = None) -> dict[str, Any]:
     """对已加载的 seed 数据做全部离线检查，返回 ``{"ok","checks","issues"}``。
 
-    ``kg_ref`` 为 None 时跳过“班组管辖区域在台账中”的检查（该检查需要 ``ref/kg_ref.json``，
-    仅离线开发环境提供；集成后由连图写入阶段的 ``unmatched_areas`` 兜底）。
+    ``kg_ref`` 为 None 时“班组管辖区域在台账中”无法被证明，按未通过处理：调用方要么提供
+    ``ref/kg_ref.json``，要么显式接受预检失败，不能静默跳过。
     """
 
     templates = seed.get("templates") or []
@@ -167,9 +149,9 @@ def preflight_seed(seed: dict[str, list[dict]], *, kg_ref: dict[str, Any] | None
         ],
     )
 
-    # 4) 班组管辖区域都在台账（kg_ref.json）中
+    # 4) 班组管辖区域都在台账（kg_ref.json）中；缺少台账时该检查无法证明，按未通过处理
     if kg_ref is None:
-        record("班组管辖区域在台账中", [], note="未提供 kg_ref.json，跳过")
+        record("班组管辖区域在台账中", ["未提供 kg_ref.json，无法证明班组管辖区域在台账中"])
     else:
         known = load_kg_ref_names(kg_ref)
         record(
@@ -206,7 +188,10 @@ def preflight_seed(seed: dict[str, list[dict]], *, kg_ref: dict[str, Any] | None
 
 
 def run_preflight(data_dir: str | Path, *, kg_ref_path: str | Path | None = None) -> dict[str, Any]:
-    """读取 ``data_dir`` 下的六份 JSON（可选读 kg_ref.json）后运行预检。"""
+    """读取 ``data_dir`` 下的六份 JSON 与可选 kg_ref.json 后运行预检。
+
+    显式给出 ``kg_ref_path`` 但文件不存在时直接失败，避免“想校验台账却静默跳过”。
+    """
 
     # 延迟导入，避免 seed ↔ preflight 的模块级循环依赖
     from yuxi.knowledge.maintenance_plan.seed import load_plan_seed
@@ -215,9 +200,13 @@ def run_preflight(data_dir: str | Path, *, kg_ref_path: str | Path | None = None
     kg_ref: dict[str, Any] | None = None
     if kg_ref_path is not None:
         ref_path = Path(kg_ref_path)
-        if ref_path.is_file():
+        if not ref_path.is_file():
+            raise PreflightError(f"kg_ref 文件不存在: {ref_path}")
+        try:
             with ref_path.open(encoding="utf-8") as handle:
                 kg_ref = json.load(handle)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise PreflightError(f"kg_ref 文件不是合法 JSON: {ref_path}: {exc}") from exc
     return preflight_seed(seed, kg_ref=kg_ref)
 
 

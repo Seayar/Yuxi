@@ -27,6 +27,13 @@ from yuxi.agents.buildin import get_agent_backend
 from yuxi.agents.callbacks.model_request_timing import FirstModelRequestRecorder
 from yuxi.agents.context import BaseContext
 from yuxi.agents.state import AgentStatePayload
+from yuxi.agents.thinking import (
+    ThinkingStepSpec,
+    get_thinking_steps,
+    normalize_thinking_event,
+    parse_thinking_event,
+    upsert_thinking_step,
+)
 from yuxi.models.utils import parse_assistant_message_body
 from yuxi.repositories.agent_repository import AgentRepository
 from yuxi.repositories.agent_run_repository import AgentRunRepository
@@ -366,6 +373,46 @@ def _context_compression_payload(payload: Any) -> dict | None:
     return None
 
 
+def _thinking_specs(context: Any) -> tuple[ThinkingStepSpec, ...]:
+    """读取当前智能体注册的思考步骤；步骤由智能体模块在导入时注册。"""
+
+    slug = str(getattr(context, "agent_slug", "") or "")
+    return get_thinking_steps(slug) if slug else ()
+
+
+def _accept_thinking_payload(payload: Any, context: Any) -> dict | None:
+    thinking = parse_thinking_event(payload)
+    if thinking is None:
+        return None
+    return normalize_thinking_event(thinking, _thinking_specs(context))
+
+
+def _is_internal_model_metadata(metadata: Any) -> bool:
+    """识别工具内部模型调用，避免意图/校对/整理 JSON 进入主回答流。"""
+
+    if not isinstance(metadata, dict):
+        return False
+    if metadata.get("yuxi_internal_model") is True:
+        return True
+    if str(metadata.get("langgraph_node") or "") in {"tools", "search_power_spec", "trace_fault"}:
+        return True
+    nested = metadata.get("metadata")
+    if isinstance(nested, dict) and nested.get("yuxi_internal_model") is True:
+        return True
+    tags = metadata.get("tags")
+    if isinstance(tags, (list, tuple)) and "yuxi_internal_model" in tags:
+        return True
+    configurable = metadata.get("configurable")
+    if isinstance(configurable, dict):
+        configurable_metadata = configurable.get("metadata")
+        if isinstance(configurable_metadata, dict) and configurable_metadata.get("yuxi_internal_model") is True:
+            return True
+        configurable_tags = configurable.get("tags")
+        if isinstance(configurable_tags, (list, tuple)) and "yuxi_internal_model" in configurable_tags:
+            return True
+    return False
+
+
 def _stream_event_response(event: dict[str, Any]) -> str:
     if event.get("type") != "message_delta":
         return ""
@@ -542,6 +589,18 @@ def _current_turn_tool_messages(messages, run_tool_call_ids: set[str]) -> list:
     return [message for message in history[last_user_index + 1 :] if _message_field(message, "type") == "tool"]
 
 
+def _last_output_ai_position(messages) -> int:
+    """最后一条 AI 消息在 state 里的下标；只有它是本轮最终输出，思考步骤只挂这一条。"""
+
+    history = list(messages or [])
+    for position in range(len(history) - 1, -1, -1):
+        message = history[position]
+        kind = _message_field(message, "type")
+        if kind == "ai" or (kind == "unknown" and _message_field(message, "role") in {"assistant", "ai"}):
+            return position
+    return -1
+
+
 def _resolve_power_spec_output(messages, fallback_content: str, *, run_tool_call_ids: set[str] | None = None) -> str:
     """从本轮检索 Tool 的结果里取卡片，阻止模型改写卡片结构。"""
 
@@ -556,15 +615,20 @@ def _resolve_power_spec_output(messages, fallback_content: str, *, run_tool_call
 
 
 def _resolve_fault_trace_output(messages, fallback_content: str, *, run_tool_call_ids: set[str] | None = None) -> str:
-    """从本轮故障溯源 Tool 的结果里取报告卡片，阻止模型改写报告结构。"""
+    """从本轮故障溯源 Tool 的结果里取报告卡片，只发布通过证据校验的报告。"""
 
-    from yuxi.knowledge.fault_trace.contracts import PLAIN_TOOL_MESSAGES
+    from yuxi.knowledge.fault_trace.contracts import (
+        PLAIN_TOOL_MESSAGES,
+        REPORT_VERIFICATION_FAILED_MESSAGE,
+    )
 
     return _resolve_tool_card_answer(
         messages,
         fallback_content,
         plain_messages=PLAIN_TOOL_MESSAGES,
         run_tool_call_ids=run_tool_call_ids,
+        verified_source="fault_trace",
+        failure_message=REPORT_VERIFICATION_FAILED_MESSAGE,
     )
 
 
@@ -620,11 +684,14 @@ def _resolve_tool_card_answer(
     *,
     plain_messages: frozenset[str],
     run_tool_call_ids: set[str] | None = None,
+    verified_source: str | None = None,
+    failure_message: str = "",
 ) -> str:
     """从本轮工具结果里取卡片/报告 Markdown，阻止模型改写其结构。
 
     只认本轮的工具结果：checkpoint 里包含线程完整历史，跨轮次取用会把上一轮的卡片当成
-    本轮答案。本轮没有检索结果时回退到模型自己的内容。
+    本轮答案。本轮没有检索结果时回退到模型自己的内容。传入 ``verified_source`` 时，
+    只有该来源声明 ``answer_verified is True`` 的载荷才发布，否则返回固定的失败文案。
     """
 
     for message in reversed(_current_turn_tool_messages(messages, set(run_tool_call_ids or ()))):
@@ -635,7 +702,16 @@ def _resolve_tool_card_answer(
             payload = json.loads(content)
         except (TypeError, json.JSONDecodeError):
             return content if content in plain_messages else fallback_content
+        if isinstance(payload, dict) and payload.get("needs_clarification") is True:
+            # 澄清是工具给出的固定问句，不能回退成模型自由文本。
+            clarification = payload.get("clarification")
+            if isinstance(clarification, str) and clarification.strip():
+                return clarification
+            return failure_message or fallback_content
         if isinstance(payload, dict) and isinstance(payload.get("answer_markdown"), str):
+            if verified_source is not None:
+                if payload.get("answer_source") != verified_source or payload.get("answer_verified") is not True:
+                    return failure_message
             return payload["answer_markdown"]
         if isinstance(payload, str):
             return payload
@@ -673,6 +749,7 @@ async def save_partial_message(
     request_id: str | None = None,
     worker_id: str | None = None,
     interrupt_run: bool = False,
+    thinking_steps: list[dict[str, Any]] | None = None,
 ):
     cancelled_descendants: list[tuple[str, str]] = []
     try:
@@ -681,6 +758,8 @@ async def save_partial_message(
             "is_error": True,
             "error_message": error_message or f"发生错误: {error_type}",
         }
+        if thinking_steps:
+            extra_metadata["thinking_steps"] = thinking_steps
         if full_msg:
             msg_dict = full_msg.model_dump() if hasattr(full_msg, "model_dump") else {}
             content = full_msg.content if hasattr(full_msg, "content") else str(full_msg)
@@ -841,6 +920,7 @@ async def save_messages_from_langgraph_state(
     interrupt_error_message: str | None = None,
     token_usage: dict[str, Any] | None = None,
     agent_context: Any | None = None,
+    thinking_steps: list[dict[str, Any]] | None = None,
 ) -> bool:
     """在有效 lease 锁内原子写入消息与完成或中断终态。"""
 
@@ -863,6 +943,7 @@ async def save_messages_from_langgraph_state(
                 raise ValueError(f"AgentRun 不存在: {run_id}")
 
         messages = state.values.get("messages", [])
+        last_output_ai_position = _last_output_ai_position(messages)
         existing_ids = await conv_repo.get_message_source_ids_by_thread_id(thread_id)
         current_model_audits = await ModelMessageAuditRepository(conv_repo.db).list_for_run(run_id) if run_id else []
         current_audit_operation_ids = {message.operation_id for message in current_model_audits if message.operation_id}
@@ -876,7 +957,7 @@ async def save_messages_from_langgraph_state(
         state_tool_messages: dict[str, dict[str, Any]] = {}
         last_state_ai_id: str | None = None
         last_ai_message = None
-        for msg in messages or []:
+        for position, msg in enumerate(messages or []):
             if hasattr(msg, "model_dump"):
                 msg_dict = msg.model_dump()
             elif isinstance(msg, dict):
@@ -927,6 +1008,10 @@ async def save_messages_from_langgraph_state(
                     continue
                 if current_model_audits or msg_id in existing_ids:
                     continue
+                if thinking_steps and position == last_output_ai_position:
+                    # 非 Run 分支在写入最终输出时携带整轮思考；中间工具轮次的 AI 消息不重复挂载。
+                    msg_dict = dict(msg_dict)
+                    msg_dict["thinking_steps"] = thinking_steps
                 last_ai_message = await _save_ai_message(
                     conv_repo,
                     thread_id,
@@ -976,6 +1061,10 @@ async def save_messages_from_langgraph_state(
                     raise ValueError("最终 State AIMessage 无法与当前 Run 的 Model lifecycle 事实关联")
                 last_ai_message = terminal_ai_message
             if last_ai_message is not None:
+                if thinking_steps:
+                    metadata = dict(last_ai_message.extra_metadata or {})
+                    metadata["thinking_steps"] = thinking_steps
+                    last_ai_message.extra_metadata = metadata
                 has_tool_calls = bool((last_ai_message.extra_metadata or {}).get("tool_calls"))
                 should_publish = (
                     last_ai_message.message_type != MODEL_AUDIT_MESSAGE_TYPE
@@ -1204,6 +1293,8 @@ async def stream_agent_chat(
     image_content = input_message.image_content
     human_message = input_message.require_langchain_message()
     message_type = input_message.message_type
+    # 异常与中断分支都要把已直播的思考步骤落库，因此在进入 try 前初始化。
+    thinking_steps: list[dict[str, Any]] = []
 
     try:
         agent_item, agent, context, conversation = await _resolve_agent_runtime(
@@ -1317,6 +1408,11 @@ async def stream_agent_chat(
                     continue
 
                 if mode == "custom":
+                    thinking = _accept_thinking_payload(payload, context)
+                    if thinking is not None:
+                        upsert_thinking_step(thinking_steps, thinking)
+                        yield make_chunk(status="thinking", thinking=thinking, meta=meta)
+                        continue
                     compression = _context_compression_payload(payload)
                     if compression is not None:
                         yield make_chunk(status="context_compression", compression=compression, meta=meta)
@@ -1342,6 +1438,8 @@ async def stream_agent_chat(
                     continue
 
                 msg, metadata = payload
+                metadata = dict(metadata or {})
+                internal_model = _is_internal_model_metadata(metadata)
                 namespace = _metadata_namespace(metadata)
                 chunk_thread_id = _metadata_thread_id(metadata, thread_id if not namespace else None)
                 if namespace and not chunk_thread_id:
@@ -1359,6 +1457,8 @@ async def stream_agent_chat(
                 )
 
                 for stream_event in stream_events:
+                    if internal_model:
+                        continue
                     content = _stream_event_response(stream_event)
                     if not is_subagent_chunk and content:
                         trace_info = get_trace_info(langfuse_run)
@@ -1410,6 +1510,7 @@ async def stream_agent_chat(
                 interrupt_error_message=interrupt_error_message,
                 token_usage=_current_run_token_usage(agent_state, meta.get("run_id")),
                 agent_context=context,
+                thinking_steps=thinking_steps,
             )
         except Exception as e:
             logger.exception(f"Error saving messages from LangGraph state: {e}")
@@ -1451,6 +1552,7 @@ async def stream_agent_chat(
                 run_id=meta.get("run_id"),
                 request_id=meta.get("request_id"),
                 worker_id=meta.get("worker_id"),
+                thinking_steps=thinking_steps,
             )
 
         await _persist_model_request_timing(model_request_recorder, meta)
@@ -1525,6 +1627,7 @@ async def stream_agent_resume(
     if model_request_recorder is not None:
         callbacks.append(model_request_recorder)
     final_state = None
+    thinking_steps: list[dict[str, Any]] = []
     stream_source = agent.stream_resume_with_state(
         resume_command,
         context=context,
@@ -1575,6 +1678,11 @@ async def stream_agent_resume(
                     continue
 
                 if mode == "custom":
+                    thinking = _accept_thinking_payload(payload, context)
+                    if thinking is not None:
+                        upsert_thinking_step(thinking_steps, thinking)
+                        yield make_resume_chunk(status="thinking", thinking=thinking, meta=meta)
+                        continue
                     compression = _context_compression_payload(payload)
                     if compression is not None:
                         yield make_resume_chunk(status="context_compression", compression=compression, meta=meta)
@@ -1585,6 +1693,7 @@ async def stream_agent_resume(
 
                 msg, metadata = payload
                 metadata = dict(metadata or {})
+                internal_model = _is_internal_model_metadata(metadata)
                 namespace = _metadata_namespace(metadata)
                 chunk_thread_id = _metadata_thread_id(metadata, thread_id if not namespace else None)
                 if namespace and not chunk_thread_id:
@@ -1604,6 +1713,8 @@ async def stream_agent_resume(
                 )
 
                 for stream_event in stream_events:
+                    if internal_model:
+                        continue
                     content = _stream_event_response(stream_event)
                     yield make_resume_chunk(
                         content=content,
@@ -1649,6 +1760,7 @@ async def stream_agent_resume(
                 interrupt_error_message=interrupt_error_message,
                 token_usage=_current_run_token_usage(agent_state, meta.get("run_id")),
                 agent_context=context,
+                thinking_steps=thinking_steps,
             )
         except Exception as e:
             logger.exception(f"Error saving messages from LangGraph state: {e}")
@@ -1684,6 +1796,7 @@ async def stream_agent_resume(
                 run_id=meta.get("run_id"),
                 request_id=meta.get("request_id"),
                 worker_id=meta.get("worker_id"),
+                thinking_steps=thinking_steps,
             )
 
         await _persist_model_request_timing(model_request_recorder, meta)

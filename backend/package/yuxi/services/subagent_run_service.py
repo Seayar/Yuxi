@@ -69,6 +69,11 @@ def serialize_subagent_run_state(run: AgentRun) -> dict:
     任务描述不在此冗余存储：其唯一来源是父对话里 `subagent_start`（或历史 `task`）工具调用的入参，
     前端面板按 tool_call_id 回填展示。
     """
+    from yuxi.knowledge.power_spec.answer import ORGANIZER_SLUG, REVIEWER_SLUG
+
+    # 电力规范的整理/审查子智能体属于工具内部步骤，前端不展示；历史 run 没有
+    # runtime.internal 标记，按 slug 兜底识别，来源是 power_spec 自己的常量。
+    internal_subagent_slugs = {ORGANIZER_SLUG, REVIEWER_SLUG}
     payload = run.input_payload
     if not isinstance(payload, dict):
         raise ValueError("subagent run 缺少 input_payload")
@@ -84,6 +89,7 @@ def serialize_subagent_run_state(run: AgentRun) -> dict:
         "run_id": run.id,
         "subagent_slug": run.agent_slug,
         "subagent_name": runtime.get("subagent_name"),
+        "internal": bool(runtime.get("internal")) or run.agent_slug in internal_subagent_slugs,
         "child_thread_id": run.conversation_thread_id,
         "status": run.status,
         "created_at": format_utc_datetime(run.created_at),
@@ -111,6 +117,7 @@ class SubagentRunService:
         input_message: AgentRunInputMessage,
         tool_call_id: str,
         requested_thread_id: str | None = None,
+        internal: bool = False,
     ) -> SubagentStartResult:
         """启动或继续一个后台子智能体 run，并在新建时入队 worker。"""
 
@@ -151,6 +158,7 @@ class SubagentRunService:
                 creator_run=creator_run,
                 relation=relation,
                 tool_call_id=tool_call_id,
+                internal=internal,
             )
         except HTTPException as exc:
             detail = exc.detail
@@ -196,6 +204,7 @@ class SubagentRunService:
         creator_run: AgentRun,
         relation: SubagentThread,
         tool_call_id: str,
+        internal: bool = False,
     ) -> tuple[Any, bool]:
         """创建后台子智能体 run，并把规范化输入消息保存为该 run 的输入。"""
         if not input_message.content:
@@ -231,6 +240,8 @@ class SubagentRunService:
             "subagent_name": scope.agent_item.name,
             "parent_thread_id": creator_run.conversation_thread_id,
         }
+        if internal:
+            runtime_payload["internal"] = True
         input_payload = {
             "model_spec": resolved_model_spec,
             "tool_approval_mode": creator_run.input_payload.get("tool_approval_mode", DEFAULT_TOOL_APPROVAL_MODE),

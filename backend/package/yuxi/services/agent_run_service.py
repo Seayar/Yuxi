@@ -28,6 +28,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from yuxi.agents.buildin import AgentBackendNotFoundError, get_agent_backend
+from yuxi.agents.thinking import thinking_steps_payload
 from yuxi.agents.tool_approval import DEFAULT_TOOL_APPROVAL_MODE, normalize_tool_approval_mode
 from yuxi.config.options import system_options
 from yuxi.models.providers.cache import model_cache
@@ -89,6 +90,8 @@ def load_agent_run_context(agent_item, agent_backend):
     config_context = config_json.get("context") if isinstance(config_json, dict) else {}
     if isinstance(config_context, dict):
         context.update_config(config_context)
+    context.agent_slug = getattr(agent_item, "slug", None)
+    context.thinking_steps = thinking_steps_payload(context.agent_slug or "")
     return context
 
 
@@ -229,6 +232,7 @@ def _compact_stream_chunk(chunk: dict) -> dict:
             "source",
             "agent_state",
             "compression",
+            "thinking",
         )
         if chunk.get(key) is not None and chunk.get(key) != ""
     }

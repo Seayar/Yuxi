@@ -142,6 +142,24 @@ class _EmptyToolAuditRepo:
         return []
 
 
+class _OrmLikeMessage:
+    """模拟 ORM 消息对象：属性赋值会写回记录，便于断言 service 的写回结果。"""
+
+    def __init__(self, record: dict) -> None:
+        self.id = 1
+        self.conversation_id = 1
+        self.message_type = record["message_type"]
+        self._record = record
+
+    @property
+    def extra_metadata(self) -> dict:
+        return self._record["extra_metadata"]
+
+    @extra_metadata.setter
+    def extra_metadata(self, value: dict) -> None:
+        self._record["extra_metadata"] = value
+
+
 class _FakeConvRepo:
     def __init__(self, _db):
         self.db = _db
@@ -190,12 +208,7 @@ class _FakeConvRepo:
                 "commit": commit,
             }
         )
-        return SimpleNamespace(
-            id=1,
-            conversation_id=1,
-            message_type=message_type,
-            extra_metadata=extra_metadata or {},
-        )
+        return _OrmLikeMessage(self.saved_messages[-1])
 
     async def get_conversation_by_thread_id(self, thread_id: str):
         return self._conversation(thread_id)
@@ -296,6 +309,134 @@ async def test_save_messages_from_langgraph_state_handles_dict_tool_call_blocks(
             "commit": True,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_save_messages_persists_agent_thinking_steps() -> None:
+    class FakeGraph:
+        async def aget_state(self, _config):
+            return SimpleNamespace(values={"messages": [HumanMessage(content="question"), AIMessage(content="answer")]})
+
+    conv_repo = _FakeConvRepo(None)
+    steps = [
+        {
+            "agent": "power_spec",
+            "step_id": "parse_query",
+            "step_index": 1,
+            "title": "解析自然语言查询",
+            "state": "completed",
+            "content": "完成",
+            "data": {},
+        }
+    ]
+
+    await svc.save_messages_from_langgraph_state(
+        state=await FakeGraph().aget_state({}),
+        thread_id="thread-1",
+        conv_repo=conv_repo,
+        trace_info=None,
+        thinking_steps=steps,
+    )
+
+    assert conv_repo.saved_messages[-1]["extra_metadata"]["thinking_steps"] == steps
+
+
+@pytest.mark.asyncio
+async def test_save_messages_attaches_thinking_to_written_ai_messages() -> None:
+    """非 Run 分支只把整轮思考挂到最终输出消息，中间 AI 消息不重复挂载。"""
+
+    class FakeGraph:
+        async def aget_state(self, _config):
+            return SimpleNamespace(
+                values={
+                    "messages": [
+                        HumanMessage(content="question"),
+                        AIMessage(content="first"),
+                        AIMessage(content="second"),
+                    ]
+                }
+            )
+
+    conv_repo = _FakeConvRepo(None)
+    steps = [{"step_id": "parse_query", "step_index": 1, "state": "completed"}]
+
+    await svc.save_messages_from_langgraph_state(
+        state=await FakeGraph().aget_state({}),
+        thread_id="thread-1",
+        conv_repo=conv_repo,
+        trace_info=None,
+        thinking_steps=steps,
+    )
+
+    assert len(conv_repo.saved_messages) == 2
+    assert "thinking_steps" not in (conv_repo.saved_messages[0]["extra_metadata"] or {})
+    assert conv_repo.saved_messages[-1]["extra_metadata"]["thinking_steps"] == steps
+
+
+@pytest.mark.asyncio
+async def test_save_partial_message_persists_thinking_steps() -> None:
+    """异常分支也要把已直播的思考步骤随部分输出落库。"""
+
+    conv_repo = _FakeConvRepo(None)
+    steps = [{"step_id": "parse_query", "step_index": 1, "state": "failed"}]
+
+    await svc.save_partial_message(
+        conv_repo,
+        "thread-1",
+        full_msg=AIMessage(content="部分输出"),
+        error_message="boom",
+        error_type="unexpected_error",
+        thinking_steps=steps,
+    )
+
+    metadata = conv_repo.saved_messages[-1]["extra_metadata"]
+    assert metadata["thinking_steps"] == steps
+    assert metadata["is_error"] is True
+
+
+@pytest.mark.asyncio
+async def test_save_messages_binds_thinking_to_run_output_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run 路径把整轮思考绑定到本 Run 的输出消息元数据。"""
+
+    class FakeDB:
+        async def commit(self):
+            pass
+
+        async def rollback(self):
+            pass
+
+    class FakeGraph:
+        async def aget_state(self, _config):
+            return SimpleNamespace(values={"messages": [AIMessage(content="answer")]})
+
+    class FakeRunRepo:
+        def __init__(self, _db):
+            pass
+
+        async def lock_output_persistence(self, *_args, **_kwargs):
+            return object()
+
+        async def set_output_message(self, *_args, **_kwargs):
+            return object()
+
+    conv_repo = _FakeConvRepo(FakeDB())
+    steps = [{"step_id": "parse_query", "step_index": 1, "state": "completed"}]
+    monkeypatch.setattr(svc, "AgentRunRepository", FakeRunRepo)
+    monkeypatch.setattr(svc, "ModelMessageAuditRepository", _EmptyModelAuditRepo)
+    monkeypatch.setattr(svc, "ToolMessageAuditRepository", _EmptyToolAuditRepo)
+
+    await svc.save_messages_from_langgraph_state(
+        state=await FakeGraph().aget_state({}),
+        thread_id="thread-1",
+        conv_repo=conv_repo,
+        trace_info=None,
+        run_id="run-1",
+        request_id="req-1",
+        worker_id="worker-1",
+        thinking_steps=steps,
+    )
+
+    assert conv_repo.saved_messages[0]["extra_metadata"]["thinking_steps"] == steps
 
 
 @pytest.mark.asyncio

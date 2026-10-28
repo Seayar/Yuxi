@@ -42,6 +42,7 @@ export function useAgentThreadState({
         onGoingConv: createOnGoingConvState(),
         agentState: null,
         contextCompressing: false,
+        thinkingSteps: [],
         queuedRequests: [],
         queueSnapshot: { ...IDLE_QUEUE_SNAPSHOT },
         continueQueueInFlight: false,

@@ -232,6 +232,18 @@ class LangChainChatAdapter:
             logger.error(err)
             raise Exception(err)
 
+    async def ainvoke(self, message, config=None):
+        """带 RunnableConfig 的单次调用，供内部模型调用标记 metadata/tag。"""
+
+        messages = self._normalize_messages(message)
+        try:
+            response = await self.model.ainvoke(messages, config=config or {})
+            return GeneralResponse(response.text)
+        except Exception as e:
+            err = f"Error calling model: {e}, URL: {self.base_url}, Model: {self.model_name}"
+            logger.error(err)
+            raise Exception(err)
+
     async def _stream_response(self, messages):
         async for chunk in self.model.astream(messages):
             if chunk.text:

@@ -1,4 +1,4 @@
-"""kg 图检索：定位设备实例，并为选定设备收集生成处置方案所需的全部证据。
+"""kg3 图检索：定位设备实例，并为选定设备收集生成处置方案所需的全部证据。
 
 本模块只做“读图 + 打分 + 映射”，不做任何自然语言生成。``search_devices`` 按设备名称、
 位置线索、设备类型与电压等级在 ``设备实例`` 中召回并打分；``collect_plan_evidence`` 把
@@ -27,7 +27,7 @@ import re
 from collections.abc import Iterable
 from typing import Any
 
-from yuxi.knowledge.fault_trace.graph_kg import KgGraphClient, KgGraphError
+from yuxi.agents.toolkits.tugraph import TuGraphClient, TuGraphError
 from yuxi.knowledge.maintenance_plan.contracts import (
     DEVICE_NAME_PROPS,
     LABEL_CLAUSE,
@@ -146,7 +146,7 @@ LINE_PLACE_PATH_MARKERS = ("集电线路", "输电")
 # 设备定位
 # ---------------------------------------------------------------------------
 def search_devices(
-    client: KgGraphClient, query: PlanQuery, *, limit: int = MAX_DEVICE_CANDIDATES
+    client: TuGraphClient, query: PlanQuery, *, limit: int = MAX_DEVICE_CANDIDATES
 ) -> list[DeviceCandidate]:
     """按 设备名称 / 位置线索 / 设备类型 / 电压等级 在 设备实例 中检索并打分排序。
 
@@ -187,7 +187,7 @@ def search_devices(
 # ---------------------------------------------------------------------------
 # 证据收集
 # ---------------------------------------------------------------------------
-def collect_plan_evidence(client: KgGraphClient, query: PlanQuery, device: DeviceCandidate) -> PlanEvidence:
+def collect_plan_evidence(client: TuGraphClient, query: PlanQuery, device: DeviceCandidate) -> PlanEvidence:
     """收集生成方案所需的全部证据（层级、停电范围、模板、项目、安全距离、班组、备件）。
 
     每一步都往 ``retrieval_log`` 写一句人话，供需求说明的“思考过程”直接引用；
@@ -354,12 +354,12 @@ def derive_outage_scope(device: DeviceCandidate, ancestors: list[str], neighbors
     return scope
 
 
-def plan_graph_ready(client: KgGraphClient) -> bool:
-    """探测 kg 图是否可用：未配置或连接失败返回 False，由工具层投影为“处置方案知识库未配置”。"""
+def plan_graph_ready(client: TuGraphClient) -> bool:
+    """探测 kg3 图是否可用：未配置或连接失败返回 False，由工具层投影为“处置方案知识库未配置”。"""
 
     try:
         client.run("RETURN 1")
-    except KgGraphError:
+    except TuGraphError:
         return False
     return True
 
@@ -517,7 +517,7 @@ def _resolve_voltage_level(parents: list[dict[str, Any]], ancestors: list[str]) 
     return None
 
 
-def _collect_electrical_neighbors(client: KgGraphClient, *, device: DeviceCandidate) -> tuple[list[str], list[str]]:
+def _collect_electrical_neighbors(client: TuGraphClient, *, device: DeviceCandidate) -> tuple[list[str], list[str]]:
     """电连接邻居：a→b 表示 a 为电源侧，返回（上游邻居, 全部邻居）。"""
 
     records = client.run(
@@ -588,7 +588,7 @@ def _keyword_hits(props: dict[str, Any], work_object: str) -> bool:
     return any(work_object in keyword or keyword in work_object for keyword in keywords)
 
 
-def _collect_template_clauses(client: KgGraphClient, *, template_id: str) -> list[ClauseRef]:
+def _collect_template_clauses(client: TuGraphClient, *, template_id: str) -> list[ClauseRef]:
     """作业模板 -[依据条款]-> 标准条款，标准编号从 标准 节点取。"""
 
     if not template_id:
@@ -622,7 +622,7 @@ def _collect_template_clauses(client: KgGraphClient, *, template_id: str) -> lis
     return clauses
 
 
-def _query_item_names(client: KgGraphClient, *, device_type: str, relation: str, target_label: str) -> list[str]:
+def _query_item_names(client: TuGraphClient, *, device_type: str, relation: str, target_label: str) -> list[str]:
     """设备类型 -[需要试验/需要巡视]-> 项目名称。"""
 
     records = client.run(
@@ -650,7 +650,7 @@ def _safety_distance_place(device: DeviceCandidate) -> str:
 
 
 def _query_safety_distance(
-    client: KgGraphClient, *, voltage_level: str, place: str, log: list[str] | None = None
+    client: TuGraphClient, *, voltage_level: str, place: str, log: list[str] | None = None
 ) -> SafetyDistance | None:
     """按电压等级 + 适用场所取 安全距离 节点。
 
@@ -697,7 +697,7 @@ def _query_safety_distance(
 # ---------------------------------------------------------------------------
 # 班组与备品备件
 # ---------------------------------------------------------------------------
-def _find_team(client: KgGraphClient, *, ancestors: list[str], task_type: str | None) -> TeamInfo | None:
+def _find_team(client: TuGraphClient, *, ancestors: list[str], task_type: str | None) -> TeamInfo | None:
     """沿 ancestors 由近到远找第一个被班组管辖的区域节点，多个班组按作业类型偏好挑选。"""
 
     if not ancestors:
@@ -752,7 +752,7 @@ def _build_team(props: dict[str, Any], *, managed_area: str) -> TeamInfo:
     )
 
 
-def _find_spares(client: KgGraphClient, *, device_type: str, work_object: str) -> list[SpareInfo]:
+def _find_spares(client: TuGraphClient, *, device_type: str, work_object: str) -> list[SpareInfo]:
     """设备类型 -[配备备件]-> 备品备件；名称含作业对象的备件排前面。"""
 
     if not device_type:
@@ -798,7 +798,7 @@ def _in_condition(alias: str, prop: str, param: str) -> str:
     return f"coalesce({alias}.{prop}, '') IN ${param}"
 
 
-def _query_devices_by_keyword(client: KgGraphClient, *, keyword: str) -> list[dict[str, Any]]:
+def _query_devices_by_keyword(client: TuGraphClient, *, keyword: str) -> list[dict[str, Any]]:
     """按关键词在 名称/显示名/name 与 层级路径 上召回设备实例。"""
 
     props = (*DEVICE_NAME_PROPS, "层级路径")
@@ -811,7 +811,7 @@ def _query_devices_by_keyword(client: KgGraphClient, *, keyword: str) -> list[di
     )
 
 
-def _query_devices_by_device_type(client: KgGraphClient, *, device_type: str) -> list[dict[str, Any]]:
+def _query_devices_by_device_type(client: TuGraphClient, *, device_type: str) -> list[dict[str, Any]]:
     """按 属于 关系召回某设备类型下的设备实例（用户只说了设备类型时用）。"""
 
     return client.run(
@@ -826,7 +826,7 @@ def _query_devices_by_device_type(client: KgGraphClient, *, device_type: str) ->
     )
 
 
-def _query_parents(client: KgGraphClient, *, device: DeviceCandidate) -> list[dict[str, Any]]:
+def _query_parents(client: TuGraphClient, *, device: DeviceCandidate) -> list[dict[str, Any]]:
     """设备实例 -[位于]-> 父节点属性（校验/补全层级路径，并保留父节点的电压等级等图谱属性）。
 
     只查一次：父节点名称用于补全 ``ancestors``，电压等级属性用于解析设备电压
@@ -847,7 +847,7 @@ def _query_parents(client: KgGraphClient, *, device: DeviceCandidate) -> list[di
     return [record.get("b") or {} for record in records]
 
 
-def _query_templates(client: KgGraphClient, *, device_type: str) -> list[dict[str, Any]]:
+def _query_templates(client: TuGraphClient, *, device_type: str) -> list[dict[str, Any]]:
     """设备类型 -[适用模板]-> 作业模板（作业类型过滤在 Python 侧做）。"""
 
     return client.run(
@@ -862,7 +862,7 @@ def _query_templates(client: KgGraphClient, *, device_type: str) -> list[dict[st
     )
 
 
-def _query_standard_numbers(client: KgGraphClient, *, standard_ids: list[str | None]) -> dict[str, str]:
+def _query_standard_numbers(client: TuGraphClient, *, standard_ids: list[str | None]) -> dict[str, str]:
     """standard_id → 标准编号（如 DLT408 → DL/T 408—2023）。"""
 
     ids = _dedup(standard_ids)

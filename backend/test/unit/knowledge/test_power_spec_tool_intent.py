@@ -1,7 +1,11 @@
 import pytest
 
 from yuxi.knowledge.power_spec import tool as tool_module
-from yuxi.knowledge.power_spec.contracts import INTENT_ATTEMPTS_EXHAUSTED_MESSAGE
+from yuxi.knowledge.power_spec.contracts import (
+    INTENT_ATTEMPTS_EXHAUSTED_MESSAGE,
+    INTENT_PLAN_CHANGED_MESSAGE,
+    PowerSpecQuery,
+)
 from yuxi.knowledge.power_spec.intent import (
     extract_correction_text,
     parse_intent_confirmation,
@@ -177,6 +181,48 @@ async def test_confirmed_intent_skips_user_confirmation(monkeypatch):
 
     assert result == NO_EVIDENCE_MESSAGE
     assert queue.payloads == []
+
+
+def test_tool_schema_hides_confirmation_from_model():
+    """模型不能通过工具参数自行确认意图；确认结论只来自确认卡片。"""
+
+    assert "confirmed_intent" not in tool_module.PowerSpecSearchInput.model_fields
+
+
+@pytest.mark.asyncio
+async def test_replay_with_changed_plan_is_rejected(monkeypatch):
+    """重放的识别结果与用户确认过的计划不一致时，不按新计划检索。
+
+    真实链路里 ``interrupt`` 在 resume 时返回 checkpoint 保存的选项值；这里用记录首次
+    选项值的假 ``interrupt`` 复现：用户确认第一份计划，重放重算出第二份计划时应拒绝。
+    """
+
+    confirmed: list[str] = []
+    shown: list[dict] = []
+
+    def confirm_once(payload):
+        shown.append(payload)
+        if not confirmed:
+            confirmed.append(payload["questions"][0]["options"][0]["value"])
+        return {payload["questions"][0]["question_id"]: confirmed[0]}
+
+    _install(monkeypatch)
+    monkeypatch.setattr(tool_module, "interrupt", confirm_once)
+    await search_power_spec.coroutine(query_text=QUESTION, confirmed_intent=False, runtime=Runtime())
+
+    async def changed_intent(query_text, *, model_call=None, previous=None, feedback=None):
+        return PowerSpecQuery(query="110kV 开关柜触头温度限值", intent="设备参数查询", voltage_level="110kV")
+
+    monkeypatch.setattr(tool_module, "extract_power_spec_intent", changed_intent)
+
+    result = await search_power_spec.coroutine(
+        query_text="110kV 开关柜触头温度限值是多少",
+        confirmed_intent=False,
+        runtime=Runtime(),
+    )
+
+    assert result == INTENT_PLAN_CHANGED_MESSAGE
+    assert shown[0]["questions"][0]["options"][0]["value"].startswith("confirm#")
 
 
 def test_parse_intent_confirmation_accepts_frontend_answer_shapes():

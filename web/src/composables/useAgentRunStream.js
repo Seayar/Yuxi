@@ -232,9 +232,12 @@ export function useAgentRunStream({
     ts.activeRunSteerable = false
     if (settlesIdleThread) ts.runLastSeq = '0-0'
     if (isInterrupted) {
+      // 审批卡片恢复是异步的；先保留加载态，避免中断到卡片出现之间页面空白。
+      ts.replyLoadingVisible = true
       ts.activeRunId = runId
       saveActiveRunSnapshot(threadId, runId, ts.runLastSeq)
     } else {
+      ts.replyLoadingVisible = false
       ts.activeRunId = null
       clearActiveRunSnapshot(threadId)
       if (settlesIdleThread) {
@@ -247,7 +250,6 @@ export function useAgentRunStream({
       }
     }
     ts.lastRetryableJobTry = null
-    ts.replyLoadingVisible = false
     ts.pendingRequestId = null
     fetchThreadMessages({ agentId: unref(currentAgentId), threadId, delay }).finally(() => {
       const latest = getThreadState(threadId)

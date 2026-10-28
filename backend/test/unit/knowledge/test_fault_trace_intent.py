@@ -6,7 +6,7 @@ import json
 
 import pytest
 from yuxi.knowledge.fault_trace import intent as intent_module
-from yuxi.knowledge.fault_trace.contracts import FaultTraceQuery
+from yuxi.knowledge.fault_trace.contracts import DEVICE_NOT_FOUND_MESSAGE, FaultTraceQuery
 from yuxi.knowledge.fault_trace.intent import (
     apply_input_constraints,
     build_confirmation_payload,
@@ -82,7 +82,7 @@ def test_input_constraint_requires_specific_device():
     applied = apply_input_constraints(query)
 
     assert applied.clarification_required is True
-    assert applied.clarification_message == "未能识别故障设备，请明确设备名称后重新提交。"
+    assert applied.clarification_message == DEVICE_NOT_FOUND_MESSAGE
 
 
 def test_input_constraint_missing_phenomenon():
@@ -127,3 +127,87 @@ async def test_extract_prompt_includes_image_result(monkeypatch):
 
     assert fake.prompts
     assert "fault_name=冒烟/着火" in fake.prompts[0] or "冒烟/着火" in fake.prompts[0]
+
+
+def test_rule_parse_extracts_equipment_code_as_device():
+    query = parse_fault_trace_query("3B-7Y 10kV 线路通道内树木倒伏，枝干压覆导线，现场有放电痕迹")
+
+    assert query.device_name == "3B-7Y"
+    assert query.voltage_level == "10kV"
+    assert {"倒伏", "压覆", "放电"} <= set(query.phenomena)
+    assert query.clarification_required is False
+
+
+@pytest.mark.asyncio
+async def test_model_missing_device_is_backfilled_from_rules():
+    """模型漏识别设备时用规则补齐，保证确认卡与恢复重放后的意图一致。"""
+
+    raw = json.dumps(
+        {
+            "question": "3B-7Y 树木倒伏",
+            "device_name": None,
+            "device_type": None,
+            "voltage_level": None,
+            "phenomena": ["树木倒伏"],
+        },
+        ensure_ascii=False,
+    )
+    query = await extract_fault_trace_intent(
+        "3B-7Y 10kV 线路通道内树木倒伏，枝干压覆导线",
+        image_result=None,
+        model_call=_FakeModelCall(raw),
+    )
+
+    assert query.device_name == "3B-7Y"
+    assert query.voltage_level == "10kV"
+    assert query.clarification_required is False
+
+
+def test_rule_parse_keeps_full_device_name_for_numbered_transformer():
+    """带编号的主变压器名必须整体命中，避免截成“#1主变”后匹配到间隔/开关柜。"""
+
+    query = parse_fault_trace_query(
+        "35kV#1变电站#1主变压器运行中绕组区域冒烟，本体温度报警，请分析原因。"
+    )
+
+    assert query.device_name == "#1主变压器"
+    assert query.voltage_level == "35kV"
+    assert {"冒烟", "温度报警"} <= set(query.phenomena)
+
+
+@pytest.mark.asyncio
+async def test_extract_defers_phenomenon_check_to_image_step():
+    """第一步只要求设备具体；现象可以等设备图片识别后再判定。"""
+
+    fake = _FakeModelCall(
+        json.dumps(
+            {
+                "question": "1号主变异常",
+                "device_name": "1号主变",
+                "device_type": "变压器",
+                "voltage_level": None,
+                "phenomena": [],
+            },
+            ensure_ascii=False,
+        )
+    )
+    query = await extract_fault_trace_intent("1号主变异常", image_result=None, model_call=fake)
+
+    assert query.device_name == "1号主变"
+    assert query.phenomena == []
+    assert query.clarification_required is False
+
+
+@pytest.mark.asyncio
+async def test_rule_specific_query_skips_model_for_deterministic_confirmation():
+    """规则已能确定设备与现象时不调用模型，恢复重放得到同一份确认计划。"""
+
+    fake = _FakeModelCall(_intent_json(device_name="1号主变"))
+    query = await extract_fault_trace_intent(
+        "3B-7Y 10kV 线路通道内树木倒伏，枝干压覆导线",
+        image_result=None,
+        model_call=fake,
+    )
+
+    assert query.device_name == "3B-7Y"
+    assert fake.prompts == []

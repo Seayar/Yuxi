@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Awaitable, Callable
@@ -343,6 +344,45 @@ def build_intent_plan(query: PowerSpecQuery) -> dict[str, Any]:
     }
 
 
+# 确认卡片把计划指纹写进选项值，随用户选择持久化到 checkpoint；resume 重放时按同一指纹
+# 校验重算的计划，避免执行用户没有确认过的另一份计划。
+CONFIRM_VALUE_PREFIX = "confirm#"
+
+
+def intent_plan_signature(intent_plan: dict[str, Any]) -> tuple[str, ...]:
+    """确认计划的可比对字段；只保留用户实际确认的语义。"""
+
+    return tuple(f"{key}={intent_plan[key]!r}" for key in sorted(intent_plan) if key != "attempt")
+
+
+def plan_token(intent_plan: dict[str, Any]) -> str:
+    """计划指纹的短哈希；作为确认选项值的一部分往返。"""
+
+    payload = json.dumps(intent_plan_signature(intent_plan), ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+
+
+def parse_confirmation_token(value: Any) -> str | None:
+    """从确认结果里取出随卡片往返的计划指纹；没有指纹时返回 None。"""
+
+    if isinstance(value, dict):
+        for item in value.values():
+            token = parse_confirmation_token(item)
+            if token is not None:
+                return token
+        return None
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            token = parse_confirmation_token(item)
+            if token is not None:
+                return token
+        return None
+    text = str(value or "").strip()
+    if text.startswith(CONFIRM_VALUE_PREFIX):
+        return text[len(CONFIRM_VALUE_PREFIX) :] or None
+    return None
+
+
 def build_confirmation_payload(intent_plan: dict[str, Any]) -> dict[str, Any]:
     """构造意图确认卡片，展示模型对问题的重述与识别结果。"""
 
@@ -360,7 +400,7 @@ def build_confirmation_payload(intent_plan: dict[str, Any]) -> dict[str, Any]:
                     f"问题维度={', '.join(intent_plan['answer_dimensions']) or '未识别'}。是否正确？"
                 ),
                 "options": [
-                    {"label": "正确，继续检索", "value": "confirm"},
+                    {"label": "正确，继续检索", "value": f"{CONFIRM_VALUE_PREFIX}{plan_token(intent_plan)}"},
                     {"label": "不正确，我要补充/修改", "value": "correct"},
                 ],
                 "multi_select": False,
@@ -415,6 +455,8 @@ def parse_intent_confirmation(value: Any) -> tuple[str, str | None]:
         return "invalid", None
     if isinstance(value, str):
         text = value.strip()
+        if text.startswith(CONFIRM_VALUE_PREFIX):
+            return "confirm", None
         if text.lower() in {"confirm", "confirmed"} or text in {"正确，继续检索", "正确"}:
             return "confirm", None
         if text.lower() in {"correct", "reject"} or text in {"不正确，我要补充/修改", "不正确"}:

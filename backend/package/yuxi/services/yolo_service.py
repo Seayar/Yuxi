@@ -17,7 +17,6 @@ from yuxi.config.options import fault_image_opts
 from yuxi.utils import get_docker_safe_url, logger
 
 DETECT_PATH = "/api/fault/detect"
-HEALTH_PATH = "/api/fault/health"
 # 直连 YOLO 服务时的图片上限；反向代理另有 client_max_body_size，两者按各自边界独立生效。
 MAX_FAULT_IMAGE_BYTES = 10 * 1024 * 1024
 # 识别耗时体现在 read；连接与写入保持短超时，避免上游僵死连接长期占用请求。
@@ -99,28 +98,6 @@ def _parse_detect_payload(payload: dict[str, Any]) -> YoloDetectResult:
     if not isinstance(fault_type, str) or not fault_type or not isinstance(fault_name, str) or not fault_name:
         raise YoloServiceError("故障识别服务返回缺少故障类别")
     return YoloDetectResult(fault=True, fault_type=fault_type, fault_name=fault_name)
-
-
-async def yolo_service_health() -> dict[str, Any]:
-    """读取 YOLO 服务健康状态，供 `/api/fault/health` 透传。"""
-
-    base_url = await _resolve_base_url()
-    if base_url is None:
-        raise YoloServiceError("故障识别服务未配置，请联系管理员")
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=10.0, write=10.0, pool=10.0)) as client:
-            response = await client.get(f"{base_url}{HEALTH_PATH}")
-    except httpx.HTTPError as exc:
-        raise YoloServiceError("无法连接故障识别服务，请检查服务地址与服务运行状态") from exc
-    if response.status_code != 200:
-        raise YoloServiceError(f"故障识别服务返回 {response.status_code}，请检查服务运行状态")
-    try:
-        payload = response.json()
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        raise YoloServiceError("故障识别服务返回格式异常") from exc
-    if not isinstance(payload, dict):
-        raise YoloServiceError("故障识别服务返回格式异常")
-    return payload
 
 
 async def _resolve_base_url() -> str | None:

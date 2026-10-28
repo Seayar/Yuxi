@@ -132,9 +132,11 @@ async def _fake_save_messages_from_langgraph_state(
     interrupt_error_message=None,
     token_usage=None,
     agent_context=None,
+    thinking_steps=None,
 ):
     del state, thread_id, conv_repo, trace_info
     del run_id, request_id, worker_id, interrupt_error_type, interrupt_error_message, token_usage
+    del thinking_steps
     return complete_run or interrupt_run
 
 
@@ -602,6 +604,7 @@ async def test_stream_agent_chat_commits_before_stream_and_persists_langfuse_con
         interrupt_error_message=None,
         token_usage=None,
         agent_context=None,
+        thinking_steps=None,
     ):
         calls["saved_state"] = {
             "thread_id": thread_id,
@@ -1147,3 +1150,78 @@ def test_execution_requires_worker_snapshot(mode):
             svc.stream_agent_chat(**kwargs, agent_slug="test-agent", input_message=build_chat_input_message("hello"))
         else:
             svc.stream_agent_resume(**kwargs, resume_input={"answer": "ok"})
+
+
+@pytest.mark.asyncio
+async def test_thinking_custom_event_streams_and_persists_with_output(monkeypatch: pytest.MonkeyPatch):
+    """工具 custom 思考事件经服务层转为 thinking 帧，并随最终输出消息持久化。"""
+    from unittest.mock import AsyncMock
+
+    from yuxi.knowledge.power_spec import contracts as _power_spec_contracts  # noqa: F401 - 导入即注册四步
+
+    class FakeGraph:
+        async def aget_state(self, _config):
+            return SimpleNamespace(values={"messages": []})
+
+    class FakeAgent:
+        context_schema = _FakeContext
+
+        async def stream_messages_with_state(self, messages, input_context=None, **kwargs):
+            yield (
+                "custom",
+                {
+                    "type": "yuxi.thinking_step",
+                    "thinking": {
+                        "agent": "power-spec-agent",
+                        "step_id": "parse_query",
+                        "step_index": 1,
+                        "state": "completed",
+                        "content": "解析完成",
+                    },
+                },
+            )
+            yield "messages", (AIMessageChunk(content="回答"), {"node": "llm"})
+
+        async def stream_messages(self, messages, input_context=None, **kwargs):
+            raise AssertionError("stream_messages fallback should not be used")
+
+        async def get_graph(self, *, context=None):
+            return FakeGraph()
+
+    saved = AsyncMock(return_value=True)
+    _patch_stream_scaffolding(
+        monkeypatch,
+        agent=FakeAgent(),
+        runtime_context={"agent_slug": "power-spec-agent"},
+        save_messages=saved,
+    )
+    monkeypatch.setattr(svc, "save_partial_message", AsyncMock())
+
+    @asynccontextmanager
+    async def fake_session():
+        yield _FakeSession()
+
+    monkeypatch.setattr(svc.pg_manager, "get_async_session_context", fake_session)
+
+    async def run() -> list[dict]:
+        chunks = []
+        async for chunk in svc.stream_agent_chat(
+            prepared_execution=prepared_execution(),
+            agent_slug="power-spec-agent",
+            thread_id="thread-1",
+            meta={"request_id": "req-1"},
+            input_message=build_chat_input_message("hello"),
+            current_user=SimpleNamespace(id=1, uid="user-1", role="user", department_id="dept-1"),
+            db=_FakeSession(),
+        ):
+            chunks.append(json.loads(chunk.decode("utf-8")))
+        return chunks
+
+    chunks = await run()
+
+    thinking_chunks = [chunk for chunk in chunks if chunk.get("status") == "thinking"]
+    assert len(thinking_chunks) == 1
+    assert thinking_chunks[0]["thinking"]["step_id"] == "parse_query"
+    assert thinking_chunks[0]["thinking"]["title"] == "解析自然语言查询"
+    assert chunks[-1]["status"] == "finished"
+    assert saved.await_args.kwargs["thinking_steps"][0]["step_id"] == "parse_query"

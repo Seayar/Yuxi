@@ -2,6 +2,7 @@ import { message } from 'ant-design-vue'
 import { handleChatError } from '@/utils/errorHandler'
 import { unref } from 'vue'
 import { extractPendingInterrupt } from '@/composables/useApproval'
+import { finalizeThinkingSteps } from '@/utils/thinkingSteps'
 
 const serializeToolArgs = (args) => {
   if (typeof args === 'string') return args
@@ -72,6 +73,12 @@ const toolFinishedMessage = (chunk) => {
   }
 }
 
+// 终态收尾：流结束时仍未完成的步骤标记为跳过，避免面板一直显示“进行中”。
+const finalizeThreadThinkingSteps = (threadState) => {
+  if (!threadState) return
+  threadState.thinkingSteps = finalizeThinkingSteps(threadState.thinkingSteps)
+}
+
 export function useAgentStreamHandler({
   getThreadState,
   processApprovalInStream,
@@ -99,6 +106,7 @@ export function useAgentStreamHandler({
           if (resolvedRequestId) {
             threadState.pendingRequestId = resolvedRequestId
           }
+          threadState.thinkingSteps = []
           if (resolvedRequestId && msg && msg.type !== 'system') {
             const localHumanMessage = threadState.onGoingConv.msgChunks[resolvedRequestId]?.find(
               (item) => item?.type === 'human' || item?.role === 'user'
@@ -156,6 +164,19 @@ export function useAgentStreamHandler({
         }
         return false
 
+      case 'thinking':
+        {
+          const thinking = chunk.thinking
+          if (thinking?.step_id) {
+            const current = Array.isArray(threadState.thinkingSteps) ? threadState.thinkingSteps : []
+            const next = current.filter((item) => item?.step_id !== thinking.step_id)
+            next.push(thinking)
+            next.sort((left, right) => Number(left.step_index || 0) - Number(right.step_index || 0))
+            threadState.thinkingSteps = next
+          }
+        }
+        return false
+
       case 'stream_event':
         {
           // 工具结果需立即落地（不经平滑层），写入 msgChunks 后由 convertToolResultToMessages
@@ -175,6 +196,7 @@ export function useAgentStreamHandler({
         handleChatError({ message: chunkMessage }, 'stream')
         // Stop the loading indicator
         if (threadState) {
+          finalizeThreadThinkingSteps(threadState)
           threadState.isStreaming = false
           threadState.replyLoadingVisible = false
           threadState.pendingRequestId = null
@@ -186,7 +208,8 @@ export function useAgentStreamHandler({
       case 'ask_user_question_required':
       case 'human_approval_required':
         streamSmoother?.flushThread(threadId)
-        threadState.replyLoadingVisible = false
+        // 审批卡片由异步状态恢复渲染；保持加载态直到卡片出现，避免中间空白。
+        threadState.replyLoadingVisible = true
         console.log(`${debugPrefix}[approval_required]`, {
           threadId,
           currentAgentId: unref(currentAgentId)
@@ -230,6 +253,7 @@ export function useAgentStreamHandler({
         streamSmoother?.flushThread(threadId)
         // 先标记流式结束，但保持消息显示直到历史记录加载完成
         if (threadState) {
+          finalizeThreadThinkingSteps(threadState)
           threadState.isStreaming = false
           threadState.replyLoadingVisible = false
           threadState.pendingRequestId = null
@@ -262,6 +286,7 @@ export function useAgentStreamHandler({
           currentAgentId: unref(currentAgentId)
         })
         if (threadState) {
+          finalizeThreadThinkingSteps(threadState)
           threadState.isStreaming = false
           threadState.replyLoadingVisible = false
           threadState.pendingRequestId = null

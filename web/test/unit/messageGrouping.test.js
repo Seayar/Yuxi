@@ -7,6 +7,7 @@ import {
   isConversationSettled,
   formatEmptyRunStatus
 } from '../../src/utils/conversationProcessGrouping.js'
+import { getConversationDisplayItems } from '../../src/utils/messageGrouping.js'
 
 test('关联续跑组成连续回答，消息归属不变且只累计执行耗时', () => {
   const groups = [
@@ -138,6 +139,125 @@ test('运行中或最终消息后仍有工具调用时不聚合过程', () => {
     collapseConversationProcess(items, true).some((item) => item.type === 'process-group'),
     false
   )
+})
+
+test('思考步骤归入最后一条 AI 消息前的思考/工具面板', () => {
+  const steps = [
+    { step_id: 'parse_query', step_index: 1, title: '解析自然语言查询', state: 'completed' },
+    { step_id: 'retrieve_kb', step_index: 2, title: '检索规程标准知识库', state: 'started' }
+  ]
+  const conv = {
+    messages: [
+      { id: 'human-1', type: 'human', content: '查询 10kV 开关柜规范' },
+      { id: 'ai-1', type: 'ai', content: '回答' }
+    ]
+  }
+
+  const items = getConversationDisplayItems(conv, {
+    enrichToolCalls: () => [],
+    thinkingSteps: steps
+  })
+
+  assert.deepEqual(items.map((item) => item.type), ['message', 'tool-group', 'message'])
+  assert.deepEqual(items[1].entries[0], {
+    type: 'thinking',
+    key: 'thinking-ai-1',
+    steps
+  })
+})
+
+test('历史轮次不重复展示当前思考步骤', () => {
+  const steps = [{ step_id: 'parse_query', step_index: 1, title: '解析', state: 'completed' }]
+  const conv = {
+    messages: [
+      { id: 'human-1', type: 'human', content: '第一问' },
+      { id: 'ai-1', type: 'ai', content: '第一答' },
+      { id: 'human-2', type: 'human', content: '第二问' },
+      { id: 'ai-2', type: 'ai', content: '第二答' }
+    ]
+  }
+
+  const items = getConversationDisplayItems(conv, {
+    enrichToolCalls: () => [],
+    thinkingSteps: steps
+  })
+
+  assert.equal(items.filter((item) => item.type === 'tool-group').length, 1)
+  assert.equal(items.find((item) => item.type === 'tool-group').entries[0].key, 'thinking-ai-2')
+})
+
+test('四步思考存在时隐藏重复的检索工具卡片，普通工具保留', () => {
+  const steps = [{ step_id: 'parse_query', step_index: 1, title: '解析', state: 'completed' }]
+  const conv = {
+    messages: [
+      { id: 'human-1', type: 'human', content: '查询' },
+      { id: 'ai-1', type: 'ai', content: '回答' }
+    ]
+  }
+  const enrichToolCalls = () => [
+    { id: 'tool-1', name: 'search_power_spec', args: { query_text: '查询' } },
+    { id: 'tool-2', name: 'read_file', args: { path: '/a.md' } }
+  ]
+
+  const hidden = getConversationDisplayItems(conv, {
+    enrichToolCalls,
+    thinkingSteps: steps,
+    hideThinkingTools: true
+  })
+  const shown = getConversationDisplayItems(conv, { enrichToolCalls, thinkingSteps: steps })
+
+  const toolNames = (items) =>
+    items
+      .filter((item) => item.type === 'tool-group')
+      .flatMap((item) => item.entries.filter((entry) => entry.type === 'tool'))
+      .map((entry) => entry.toolCall.name)
+
+  assert.deepEqual(toolNames(hidden), ['read_file'])
+  assert.ok(
+    hidden.some((item) => item.entries?.some((entry) => entry.type === 'thinking')),
+    '思考面板必须保留'
+  )
+  // 开关关闭时（历史轮次）两张工具卡片都要保留，证明去重只由独立开关驱动。
+  assert.deepEqual(toolNames(shown), ['search_power_spec', 'read_file'])
+})
+
+test('空白思考步骤数组不会隐式隐藏工具卡片', () => {
+  const conv = {
+    messages: [
+      { id: 'human-1', type: 'human', content: '查询' },
+      { id: 'ai-1', type: 'ai', content: '' }
+    ]
+  }
+
+  const items = getConversationDisplayItems(conv, {
+    enrichToolCalls: () => [{ id: 'tool-1', name: 'search_power_spec', args: {} }],
+    thinkingSteps: []
+  })
+
+  assert.deepEqual(
+    items
+      .filter((item) => item.type === 'tool-group')
+      .flatMap((item) => item.entries.filter((entry) => entry.type === 'tool'))
+      .map((entry) => entry.toolCall.name),
+    ['search_power_spec']
+  )
+})
+
+test('流式会话可用独立开关隐藏思考工具卡片，不依赖思考步骤已到达', () => {
+  const conv = {
+    messages: [
+      { id: 'human-1', type: 'human', content: '查询' },
+      { id: 'ai-1', type: 'ai', content: '' }
+    ]
+  }
+
+  const items = getConversationDisplayItems(conv, {
+    enrichToolCalls: () => [{ id: 'tool-1', name: 'trace_fault', args: {} }],
+    thinkingSteps: [],
+    hideThinkingTools: true
+  })
+
+  assert.equal(items.some((item) => item.type === 'tool-group'), false)
 })
 
 test('formatProcessDuration: 复用 Run 时延格式', () => {

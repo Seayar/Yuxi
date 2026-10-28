@@ -31,7 +31,7 @@ from yuxi.workspace.workdir import Workdir
 MESSAGE_AUDIT_LIMIT = 500
 AGENT_RUN_TRACE_LIMIT = 500
 MODEL_HISTORY_METADATA_KEYS = frozenset(
-    {"attachments", "source", "error_type", "error_message", "langfuse_trace_id", "model"}
+    {"attachments", "source", "error_type", "error_message", "langfuse_trace_id", "model", "thinking_steps"}
 )
 
 

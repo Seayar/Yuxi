@@ -239,6 +239,8 @@ def adapt_vector_results(
                 match_score=_as_float(result.get("score")),
                 metadata={
                     "chunk_id": metadata.get("chunk_id"),
+                    # Milvus 的 chunk_index 决定同条款分块的原文顺序，丢弃后聚合只能按分数排列。
+                    "chunk_index": metadata.get("chunk_index"),
                     "graph_score": _as_float(result.get("graph_score")),
                     "raw_clause_body": str(result.get("content") or ""),
                     "parsed_clause_body": str(clause_metadata.get("clause_body") or ""),

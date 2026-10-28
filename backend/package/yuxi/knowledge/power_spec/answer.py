@@ -508,6 +508,7 @@ def build_subagent_caller(context: Any) -> SubagentCaller:
                 agent_item=agent_item,
                 input_message=build_chat_input_message(message),
                 tool_call_id=tool_call_id,
+                internal=True,
             )
         run_id = started.run.id
         thread_id = started.run.conversation_thread_id

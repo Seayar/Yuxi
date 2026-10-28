@@ -1,0 +1,237 @@
+{
+  "schema_version": "thinking-fixture/v2",
+  "agent": "fault-trace-agent",
+  "events": [
+    {
+      "version": "v1",
+      "agent": "fault-trace-agent",
+      "step_id": "parse_fault",
+      "step_index": 1,
+      "title": "解析故障描述",
+      "state": "completed",
+      "content": "识别到 3B-7Y：树木倒伏枝干压覆导线。",
+      "data": {
+        "device": {
+          "device_id": "b64172ecbc094fc88c9a5ab4a1d0aa5a",
+          "graph_id": "LGR#b64172ecbc094fc88c9a5ab4a1d0aa5a",
+          "name": "3B-7Y",
+          "device_type": "架空线路",
+          "device_category": "中压线路",
+          "voltage_level": "10kV"
+        },
+        "candidates": [],
+        "image": {
+          "source": "user_upload",
+          "yolo": {
+            "fault": true,
+            "fault_type": "foreign_object",
+            "fault_name": "异物"
+          },
+          "skipped_reason": null
+        },
+        "phenomena": ["树木倒伏枝干压覆导线"],
+        "summary": "识别到 3B-7Y：树木倒伏枝干压覆导线，图片识别到异物。",
+        "needs_clarification": false,
+        "clarification": ""
+      },
+      "started_at": "2026-10-26T08:00:00.000+00:00",
+      "finished_at": "2026-10-26T08:00:02.400+00:00",
+      "elapsed_ms": 2400,
+      "error": null
+    },
+    {
+      "version": "v1",
+      "agent": "fault-trace-agent",
+      "step_id": "match_causal_chain",
+      "step_index": 2,
+      "title": "匹配因果链",
+      "state": "completed",
+      "content": "匹配到 1 个故障模式、5 个故障现象、5 个可能原因；2 个成立、3 个待确认。",
+      "data": {
+        "device_type": "架空线路",
+        "fault_modes": [{"mode_id": "FM-WR-01", "name": "异物搭挂"}],
+        "phenomena": [
+          {"phenomenon_id": "PH-04", "name": "树木倒伏枝干压覆导线", "matched": true}
+        ],
+        "causes": [
+          {
+            "cause_id": "CA-04",
+            "name": "通道内树木未及时砍伐或修剪，遇大风倒伏压线",
+            "status": "established",
+            "true_count": 2,
+            "trigger_summary": "2 项实时判据命中；1 项缺少数据"
+          }
+        ],
+        "triggers": [
+          {"trigger_id": "TC-R03", "name": "泄漏电流超1mA注意值", "expression": "leakage_current > 1", "result": "true", "reason": "ok"},
+          {"trigger_id": "TC-R05", "name": "紫外光子数超1000", "expression": "uv_photon_rate > 1000", "result": "true", "reason": "ok"},
+          {"trigger_id": "TC-R09", "name": "线路保护动作", "expression": "line_protection_trip == true", "result": "false", "reason": "ok"},
+          {"trigger_id": "TC-R11", "name": "接触点红外温升超10K", "expression": "contact_point_temp_rise > 10", "result": "false", "reason": "ok"},
+          {"trigger_id": "TC-R12", "name": "树木倒伏/放电痕迹", "expression": "image_tree_fall_detected == true", "result": "unknown", "reason": "image_required"}
+        ],
+        "missing_data": ["image_tree_fall_detected"],
+        "warnings": ["故障原因挂在故障模式上（缺少现象→原因边），按模式汇总可能原因"]
+      },
+      "started_at": "2026-10-26T08:00:02.400+00:00",
+      "finished_at": "2026-10-26T08:00:02.700+00:00",
+      "elapsed_ms": 300,
+      "error": null
+    },
+    {
+      "version": "v1",
+      "agent": "fault-trace-agent",
+      "step_id": "trace_topology",
+      "step_index": 3,
+      "title": "拓扑关系追溯",
+      "state": "completed",
+      "content": "上游：35kV#3变电站、110kV变电站；下游：无。",
+      "data": {
+        "upstream": [
+          {
+            "device_id": "LGR#5091219c26c74fe5989e324d5cb9b59a",
+            "name": "35kV#3变电站",
+            "device_type": "站",
+            "voltage_level": "35kV"
+          },
+          {
+            "device_id": "LGR#SUP110ST1",
+            "name": "110kV变电站",
+            "device_type": "变电站",
+            "voltage_level": "110kV"
+          }
+        ],
+        "downstream": [],
+        "paths": [
+          "35kV#3变电站 → 3B-7Y",
+          "110kV变电站 → 35kV#3变电站 → 3B-7Y"
+        ],
+        "consequences": [
+          {"consequence_id": "FC-01", "name": "相间短路"},
+          {"consequence_id": "FC-02", "name": "线路接地"},
+          {"consequence_id": "FC-03", "name": "线路跳闸（保护动作）"},
+          {"consequence_id": "FC-04", "name": "导线损伤（断股/截面损失）"}
+        ],
+        "warnings": ["未发现 3B-7Y 的下游电气连接设备"]
+      },
+      "started_at": "2026-10-26T08:00:02.700+00:00",
+      "finished_at": "2026-10-26T08:00:02.900+00:00",
+      "elapsed_ms": 200,
+      "error": null
+    },
+    {
+      "version": "v1",
+      "agent": "fault-trace-agent",
+      "step_id": "generate_report",
+      "step_index": 4,
+      "title": "生成溯源报告",
+      "state": "completed",
+      "content": "已生成故障溯源报告。",
+      "data": {
+        "located_cause": {
+          "cause_id": "CA-04",
+          "name": "通道内树木未及时砍伐或修剪，遇大风倒伏压线"
+        },
+        "verdict": "established",
+        "reasoning": "依据图谱因果链与实时判据，定位原因「通道内树木未及时砍伐或修剪，遇大风倒伏压线」；命中判据：泄漏电流超1mA注意值、紫外光子数超1000。仍缺少实时数据：image_tree_fall_detected。",
+        "report": {
+          "schema_version": "fault-trace-report/v1",
+          "summary": {
+            "text": "10kV 3B-7Y出现「树木倒伏枝干压覆导线」。",
+            "device_names": ["3B-7Y"],
+            "phenomenon": "树木倒伏枝干压覆导线",
+            "image_used": true
+          },
+          "reasoning": [
+            {
+              "phenomenon_id": "PH-04",
+              "phenomenon": "树木倒伏枝干压覆导线",
+              "causes": [
+                {
+                  "cause_id": "CA-04",
+                  "name": "通道内树木未及时砍伐或修剪，遇大风倒伏压线",
+                  "verdict": "established",
+                  "trigger_summary": "2 项实时判据命中；1 项缺少数据",
+                  "measures": ["1. 修剪树木\n2. 清理现场"]
+                }
+              ]
+            }
+          ],
+          "location": {
+            "cause_id": "CA-04",
+            "cause_name": "通道内树木未及时砍伐或修剪，遇大风倒伏压线",
+            "verdict": "established",
+            "causes": [
+              {
+                "cause_id": "CA-04",
+                "name": "通道内树木未及时砍伐或修剪，遇大风倒伏压线",
+                "true_count": 2,
+                "rule": "leakage_current > 1 且 uv_photon_rate > 1000 → 通道内树木未及时砍伐或修剪，遇大风倒伏压线"
+              }
+            ],
+            "phenomena": ["树木倒伏枝干压覆导线"],
+            "rule": "leakage_current > 1 且 uv_photon_rate > 1000 → 通道内树木未及时砍伐或修剪，遇大风倒伏压线",
+            "reasoning": "依据图谱因果链与实时判据，定位原因「通道内树木未及时砍伐或修剪，遇大风倒伏压线」；命中判据：泄漏电流超1mA注意值、紫外光子数超1000。仍缺少实时数据：image_tree_fall_detected。",
+            "evidence": [
+              {
+                "type": "trigger",
+                "cause_id": "CA-04",
+                "trigger_id": "TC-R03",
+                "name": "泄漏电流超1mA注意值",
+                "expression": "leakage_current > 1",
+                "values": {"leakage_current": 1.2},
+                "result": "true",
+                "reason": "ok"
+              }
+            ],
+            "missing_data": ["image_tree_fall_detected"]
+          },
+          "impact": {
+            "upstream": [
+              {
+                "device_id": "LGR#5091219c26c74fe5989e324d5cb9b59a",
+                "name": "35kV#3变电站",
+                "device_type": "站",
+                "voltage_level": "35kV"
+              },
+              {
+                "device_id": "LGR#SUP110ST1",
+                "name": "110kV变电站",
+                "device_type": "变电站",
+                "voltage_level": "110kV"
+              }
+            ],
+            "downstream": [],
+            "paths": ["35kV#3变电站 → 3B-7Y", "110kV变电站 → 35kV#3变电站 → 3B-7Y"],
+            "consequences": [
+              {"consequence_id": "FC-01", "name": "相间短路"},
+              {"consequence_id": "FC-04", "name": "导线损伤（断股/截面损失）"}
+            ],
+            "warnings": ["未发现 3B-7Y 的下游电气连接设备"]
+          },
+          "suggestions": [
+            {
+              "cause_id": "CA-04",
+              "cause_name": "通道内树木未及时砍伐或修剪，遇大风倒伏压线",
+              "measures": ["1. 修剪树木\n2. 清理现场"]
+            }
+          ],
+          "meta": {
+            "graph": "kg3",
+            "schema_version": "kg3/v1",
+            "generated_at": "2026-10-26T08:00:03.100+00:00",
+            "elapsed_ms": 4300,
+            "data_missing": ["image_tree_fall_detected"],
+            "device_type": "架空线路",
+            "cause_link_level": "fault_mode",
+            "warnings": ["故障原因挂在故障模式上（缺少现象→原因边），按模式汇总可能原因"]
+          }
+        },
+        "answer_markdown": "**① 故障摘要**\n- 故障现象简述：10kV 3B-7Y出现「树木倒伏枝干压覆导线」。\n- 涉及设备：3B-7Y\n\n**② 推理过程**\n<table>\n<thead><tr><th>故障现象</th><th>可能原因</th></tr></thead>\n<tbody>\n<tr><td rowspan=\"1\">树木倒伏枝干压覆导线</td><td>通道内树木未及时砍伐或修剪，遇大风倒伏压线</td></tr>\n</tbody>\n</table>\n\n**③ 原因定位**\n- 定位原因：通道内树木未及时砍伐或修剪，遇大风倒伏压线\n- 判定成立的故障现象：树木倒伏枝干压覆导线\n- 命中规则：leakage_current > 1 且 uv_photon_rate > 1000 → 通道内树木未及时砍伐或修剪，遇大风倒伏压线\n- 推理依据：依据图谱因果链与实时判据，定位原因「通道内树木未及时砍伐或修剪，遇大风倒伏压线」；命中判据：泄漏电流超1mA注意值、紫外光子数超1000。仍缺少实时数据：image_tree_fall_detected。\n\n**④ 影响范围**\n- 上游根源设备：35kV#3变电站、110kV变电站\n- 下游受影响设备：无\n- 拓扑关系：35kV#3变电站 → 3B-7Y\n- 故障后果：相间短路、线路接地、线路跳闸（保护动作）、导线损伤（断股/截面损失）\n\n**⑤ 处置建议**\n<table>\n<thead><tr><th>故障原因</th><th>建议措施</th></tr></thead>\n<tbody>\n<tr><td>通道内树木未及时砍伐或修剪，遇大风倒伏压线</td><td>1. 修剪树木<br>2. 清理现场</td></tr>\n</tbody>\n</table>"
+      },
+      "started_at": "2026-10-26T08:00:02.900+00:00",
+      "finished_at": "2026-10-26T08:00:03.400+00:00",
+      "elapsed_ms": 500,
+      "error": null
+    }
+  ]
+}

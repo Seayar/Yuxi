@@ -2144,6 +2144,20 @@ def test_validate_resume_input_accepts_only_approve_and_reject_decisions():
                 },
             },
         ),
+        (
+            "thinking",
+            {
+                "status": "thinking",
+                "run_id": "run-1",
+                "thinking": {
+                    "agent": "power_spec",
+                    "step_id": "parse_query",
+                    "step_index": 1,
+                    "title": "解析自然语言查询",
+                    "state": "started",
+                },
+            },
+        ),
     ],
 )
 def test_compact_stream_chunk_retains_status_and_field(field: str, chunk: dict):

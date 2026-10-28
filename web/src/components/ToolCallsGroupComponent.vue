@@ -9,7 +9,7 @@
       @click="toggleToolCallsExpanded"
     >
       <span class="summary-leading">
-        <Atom size="14" />
+        <Atom size="14" :class="{ 'is-thinking-active': isThinkingLive }" />
       </span>
       <span class="summary-content">
         <span class="summary-title">{{ toolCallsSummaryTitle }}</span>
@@ -37,8 +37,13 @@
       <div class="tool-calls-collapse-inner">
         <div class="tool-calls-panel">
           <div v-for="entry in displayEntries" :key="entry.key" class="tool-call-container">
+            <ThinkingTimeline
+              v-if="entry.type === 'thinking'"
+              :steps="entry.steps"
+              embedded
+            />
             <ReasoningBlockComponent
-              v-if="entry.type === 'reasoning'"
+              v-else-if="entry.type === 'reasoning'"
               :content="entry.content"
               :is-active="isActive && entry === displayEntries[displayEntries.length - 1]"
             />
@@ -61,6 +66,7 @@ import { ChevronDown, Atom } from '@lucide/vue'
 import { storeToRefs } from 'pinia'
 import { useAgentStore } from '@/stores/agent'
 import ReasoningBlockComponent from '@/components/ReasoningBlockComponent.vue'
+import ThinkingTimeline from '@/components/ThinkingTimeline.vue'
 import { ToolCallRenderer } from '@/components/ToolCallingResult'
 import {
   getToolCallId,
@@ -104,12 +110,30 @@ const displayEntries = computed(() =>
 const hasReasoning = computed(() =>
   displayEntries.value.some((entry) => entry.type === 'reasoning')
 )
+const thinkingEntries = computed(() => displayEntries.value.filter((entry) => entry.type === 'thinking'))
+const thinkingSteps = computed(() =>
+  thinkingEntries.value
+    .flatMap((entry) => entry.steps || [])
+    .sort((left, right) => Number(left.step_index || 0) - Number(right.step_index || 0))
+)
+const thinkingCompletedCount = computed(
+  () =>
+    thinkingSteps.value.filter((step) => ['completed', 'failed', 'skipped'].includes(step.state))
+      .length
+)
+const activeThinkingStep = computed(() => {
+  const live = thinkingSteps.value.find((step) => ['started', 'waiting'].includes(step.state))
+  return live || thinkingSteps.value.at(-1) || null
+})
+const isThinkingLive = computed(() =>
+  ['started', 'waiting'].includes(activeThinkingStep.value?.state)
+)
 const shouldCollapseToolCalls = computed(() => displayEntries.value.length > 0)
 const areToolCallsExpanded = ref(false)
 
 watch(
-  [() => normalizedToolCalls.value.length, () => props.isActive],
-  ([, isActive], [, previousActive]) => {
+  [() => normalizedToolCalls.value.length, () => thinkingEntries.value.length, () => props.isActive],
+  ([, , isActive], [, , previousActive]) => {
     // 如果是活跃状态，强制展开
     if (isActive) {
       areToolCallsExpanded.value = true
@@ -146,6 +170,13 @@ const getToolCallLabel = (toolCall) => {
 }
 
 const toolCallsSummaryTitle = computed(() => {
+  if (thinkingEntries.value.length) {
+    const step = activeThinkingStep.value
+    if (step?.state === 'waiting') return `等待确认：${step.title}`
+    if (step?.state === 'started') return `正在${step.title}`
+    const suffix = normalizedToolCalls.value.length ? ` · ${normalizedToolCalls.value.length} 个工具` : ''
+    return `思考过程 · ${thinkingCompletedCount.value}/${thinkingSteps.value.length} 步${suffix}`
+  }
   if (normalizedToolCalls.value.length === 0) return props.isActive ? 'Thinking...' : '推理过程'
   if (hasReasoning.value) return `推理与工具调用 · ${normalizedToolCalls.value.length} 个工具`
   if (normalizedToolCalls.value.length === 1) {
@@ -165,13 +196,20 @@ const toolCallsNamesMeta = computed(() => {
 })
 
 const statusSummary = computed(() => {
+  const parts = []
+  if (thinkingEntries.value.length) {
+    const state = activeThinkingStep.value?.state
+    if (state === 'waiting') parts.push('等待确认')
+    else if (state === 'started') parts.push('进行中')
+    else if (thinkingSteps.value.some((step) => step.state === 'failed')) parts.push('失败')
+    else if (thinkingCompletedCount.value === thinkingSteps.value.length) parts.push('已完成')
+  }
   const states = normalizedToolCalls.value.map((toolCall) =>
     getToolCallDisplayStatus(toolCall, activeSubagentToolCallIds?.value)
   )
   const runningCount = states.filter((state) => state === 'running').length
   const errorCount = states.filter((state) => state === 'error').length
 
-  const parts = []
   if (errorCount > 0) parts.push(`${errorCount} 失败`)
   if (runningCount > 0) parts.push(`${runningCount} 进行中`)
 
@@ -230,6 +268,11 @@ const toggleToolCallsExpanded = () => {
       align-items: center;
       color: var(--gray-700);
       flex-shrink: 0;
+
+      .is-thinking-active {
+        color: var(--primary-color, #006f58);
+        animation: thinking-summary-spin 1.4s linear infinite;
+      }
     }
 
     .summary-content {
@@ -333,12 +376,20 @@ const toggleToolCallsExpanded = () => {
   }
 }
 
+@keyframes thinking-summary-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .tool-calls-container {
     .tool-calls-summary .summary-chevron,
+    .tool-calls-summary .is-thinking-active,
     .tool-calls-collapse-panel,
     .tool-calls-collapse-inner {
       transition: none;
+      animation: none;
     }
   }
 }

@@ -537,6 +537,7 @@ async def test_subagent_status_returns_terminal_result(monkeypatch) -> None:
             "run_id": "child-run",
             "subagent_slug": "worker",
             "subagent_name": "Worker",
+            "internal": False,
             "child_thread_id": "child-thread",
             "status": "completed",
             "events_url": "/api/agent/runs/child-run/events",

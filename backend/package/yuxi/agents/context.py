@@ -166,6 +166,16 @@ class BaseContext:
         metadata={"name": "运行 ID", "configurable": False, "hide": True},
     )
 
+    agent_slug: str | None = field(
+        default=None,
+        metadata={"name": "智能体标识", "configurable": False, "hide": True},
+    )
+
+    thinking_steps: list[dict[str, str]] = field(
+        default_factory=list,
+        metadata={"name": "思考过程步骤", "configurable": False, "hide": True},
+    )
+
     request_id: str | None = field(
         default=None,
         metadata={"name": "请求 ID", "configurable": False, "hide": True},

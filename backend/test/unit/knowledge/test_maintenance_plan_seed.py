@@ -117,7 +117,7 @@ def install(monkeypatch, driver: FakeDriver) -> FakeDriver:
 def run_seed(seed=None) -> dict:
     return seed_plan_graph_kg(
         uri="bolt://fake:7688",
-        graph="kg",
+        graph="kg3",
         username="admin",
         password="not-used-in-test",
         seed=seed or sample_seed(),
@@ -420,11 +420,12 @@ def test_dry_run_does_not_create_driver(monkeypatch):
 
     result = seed_plan_graph_kg(
         uri="bolt://fake:7688",
-        graph="kg",
+        graph="kg3",
         username="admin",
         password="",
         seed=sample_seed(),
         dry_run=True,
+        kg_ref={"areas": [{"name": "#1开闭所"}]},
     )
     assert result["status"] == "dry_run"
     assert result["templates"] == 1
@@ -452,15 +453,66 @@ def test_main_requires_password_env(monkeypatch, capsys):
     assert "KG_PASSWORD" in capsys.readouterr().err
 
 
-def test_main_dry_run_offline(monkeypatch, capsys):
+def test_main_dry_run_offline(monkeypatch, capsys, tmp_path):
     monkeypatch.setattr(
         seed_module, "_open_driver", lambda **kwargs: pytest.fail("dry-run 不得创建 driver")
     )
-    monkeypatch.setattr("sys.argv", ["seed.py", "--uri", "bolt://fake:7688", "--dry-run"])
+    monkeypatch.setattr(seed_module, "load_plan_seed", lambda data_dir: sample_seed())
+    kg_ref = tmp_path / "kg_ref.json"
+    kg_ref.write_text(json.dumps({"areas": [{"name": "#1开闭所"}]}, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(
+        "sys.argv",
+        ["seed.py", "--uri", "bolt://fake:7688", "--dry-run", "--kg-ref", str(kg_ref)],
+    )
     assert seed_module.main() == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["status"] == "dry_run"
     assert payload["statements"]["total"] > 0
+
+
+def test_main_requires_kg_ref(monkeypatch, capsys):
+    """缺少 kg_ref 时导入必须被拒绝，不能静默跳过管辖区域检查。"""
+
+    monkeypatch.setattr(seed_module, "load_plan_seed", lambda data_dir: sample_seed())
+    monkeypatch.setenv("KG_PASSWORD", "unused")
+    monkeypatch.setattr(
+        seed_module, "_open_driver", lambda **kwargs: pytest.fail("缺 kg_ref 时不得创建 driver")
+    )
+    monkeypatch.setattr("sys.argv", ["seed.py", "--uri", "bolt://fake:7688", "--dry-run"])
+
+    assert seed_module.main() == 1
+    assert "kg-ref" in capsys.readouterr().err
+
+
+def test_edge_readback_reports_edges_that_were_not_written(monkeypatch):
+    """设备类型节点由主知识库维护；缺失时边没写成，回读必须把它记成未写入。"""
+
+    install(monkeypatch, fake_graph())
+
+    result = run_seed()
+
+    assert result["edges"][seed_module.REL_HAS_TEMPLATE] == 1
+    assert result["edges_verified"][seed_module.REL_HAS_TEMPLATE] == 0
+    assert result["edges_verified"][seed_module.REL_TEMPLATE_CLAUSE] == 2
+    assert result["edges_verified"][seed_module.REL_MANAGES] == 1
+    assert {
+        (item["relation"], item["source"], item["target"]) for item in result["unmatched_edges"]
+    } == {
+        (seed_module.REL_HAS_TEMPLATE, "开关柜", "TPL#开关柜#更换#断路器"),
+        (seed_module.REL_SPARE, "开关柜", "SPARE#开关柜#断路器手车"),
+        (seed_module.REL_SPARE, "断路器", "SPARE#开关柜#断路器手车"),
+    }
+
+
+def test_edge_readback_confirms_edges_when_endpoints_exist(monkeypatch):
+    """设备类型节点存在时，回读确认的边数应与发出的边数一致。"""
+
+    install(monkeypatch, fake_graph(device_types=("开关柜", "断路器")))
+
+    result = run_seed()
+
+    assert result["edges_verified"] == result["edges"]
+    assert result["unmatched_edges"] == []
 
 
 def test_load_plan_seed_reads_real_data():

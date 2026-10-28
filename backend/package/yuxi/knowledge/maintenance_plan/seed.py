@@ -1,4 +1,4 @@
-"""把处置方案知识（作业模板 / 安全距离 / 班组 / 备品备件）幂等写入独立 TuGraph ``kg`` 图。
+"""把处置方案知识（作业模板 / 安全距离 / 班组 / 备品备件）幂等写入 TuGraph ``kg3`` 图。
 
 照搬 ``ref/fault_trace_参考实现/seed.py`` 的结构：``_ensure_kg_schema`` 先注册中文点/边标签、
 再用 Cypher ``MERGE`` 按单属性主键 ``id`` 幂等写入、``argparse`` CLI、返回计数。
@@ -283,8 +283,12 @@ def _merge_edge(
     dst_param: str,
     dst_value: Any,
     set_props: tuple[tuple[str, str, Any], ...] = (),
-) -> None:
-    """两端各按单属性匹配后 ``MERGE`` 关系（写入语句允许两个 MATCH）；可选写入边属性。"""
+) -> bool:
+    """两端各按单属性匹配后 ``MERGE`` 关系，并回读 ``count(r)`` 确认边确实存在。
+
+    端点缺失时 ``MERGE`` 不写边也不报错，只靠调用方计数会把“没写”当成“写了”。
+    返回 ``True`` 表示回读确认到这条边。
+    """
 
     set_clause = "".join(f" SET r.{name} = ${param}" for name, param, _value in set_props)
     cypher = (
@@ -297,6 +301,15 @@ def _merge_edge(
         params[param] = value
     with driver.session() as session:
         session.run(cypher, **params)
+        # 回读只带端点参数：不把边属性参数传给一条用不到它们的查询。
+        readback = (
+            f"MATCH (a:{src_label} {{{src_prop}: ${src_param}}})"
+            f"-[r:{rel}]->"
+            f"(b:{dst_label} {{{dst_prop}: ${dst_param}}}) "
+            "RETURN count(r) AS total"
+        )
+        matched = session.run(readback, **{src_param: src_value, dst_param: dst_value}).single()
+    return bool(matched and matched["total"])
 
 
 def _template_props(template: dict[str, Any]) -> dict[str, Any]:
@@ -515,15 +528,17 @@ def seed_plan_graph_kg(
     password: str,
     seed: dict[str, list[dict]],
     dry_run: bool = False,
+    kg_ref: dict | None = None,
 ) -> dict[str, Any]:
-    """把 seed 幂等写入外部 kg 图，返回节点/关系计数与未匹配清单。
+    """把 seed 幂等写入外部 kg3 图，返回节点/关系计数与未匹配清单。
 
     ``dry_run=True`` 时不创建 driver、不连接图，只输出将执行的语句数与离线预检结果。
+    预检由 CLI 在连图前执行；直接调用本函数不会重跑预检，调用方必须自行保证前置条件。
     """
 
     if dry_run:
         planned = _planned_statements(seed)
-        report = preflight_seed(seed)
+        report = preflight_seed(seed, kg_ref=kg_ref)
         return {
             "status": "dry_run",
             "templates": len(seed["templates"]),
@@ -531,8 +546,10 @@ def seed_plan_graph_kg(
             "teams": len(seed["teams"]),
             "spares": len(seed["spares"]),
             "edges": dict(planned["edges_by_relation"]),
+            "edges_verified": {rel: 0 for rel in planned["edges_by_relation"]},
             "unmatched_clauses": [],
             "unmatched_areas": [],
+            "unmatched_edges": [],
             "statements": planned,
             "preflight": report,
         }
@@ -540,10 +557,21 @@ def seed_plan_graph_kg(
     templates = seed["templates"]
     teams = seed["teams"]
     spares = seed["spares"]
+    # ``edges`` 是发出的 MERGE 意图数；``edges_verified`` 是写完后回读 ``count(r)`` 确认的条数。
+    # 两者不一致说明端点不存在（例如“设备类型”节点由主知识库维护、本模块不创建）。
     edges = {REL_HAS_TEMPLATE: 0, REL_TEMPLATE_CLAUSE: 0, REL_MANAGES: 0, REL_SPARE: 0}
+    edges_verified = {REL_HAS_TEMPLATE: 0, REL_TEMPLATE_CLAUSE: 0, REL_MANAGES: 0, REL_SPARE: 0}
+    unmatched_edges: list[dict[str, Any]] = []
     unmatched_clauses: list[dict[str, Any]] = []
     unmatched_areas: list[dict[str, Any]] = []
     clause_cache: dict[str, list[dict]] = {}
+
+    def record_edge(rel: str, *, written: bool, source: Any, target: Any) -> None:
+        edges[rel] += 1
+        if written:
+            edges_verified[rel] += 1
+            return
+        unmatched_edges.append({"relation": rel, "source": str(source), "target": str(target)})
 
     driver = _open_driver(uri=uri, graph=graph, username=username, password=password)
     try:
@@ -565,7 +593,7 @@ def seed_plan_graph_kg(
             device_type = str(template.get("设备类型") or "").strip()
             if not device_type:
                 continue
-            _merge_edge(
+            written = _merge_edge(
                 driver,
                 rel=REL_HAS_TEMPLATE,
                 src_label=LABEL_DEVICE_TYPE,
@@ -577,7 +605,7 @@ def seed_plan_graph_kg(
                 dst_param="pid",
                 dst_value=template_id,
             )
-            edges[REL_HAS_TEMPLATE] += 1
+            record_edge(REL_HAS_TEMPLATE, written=written, source=device_type, target=template_id)
 
         # 3) 依据条款：作业模板 → 标准条款（按 standard_id + 条款号 匹配，未匹配记入清单）
         for template in templates:
@@ -589,7 +617,7 @@ def seed_plan_graph_kg(
                 if not clause_id:
                     unmatched_clauses.append({"template": template_id, "standard_id": standard_id, "条款号": clause_no})
                     continue
-                _merge_edge(
+                written = _merge_edge(
                     driver,
                     rel=REL_TEMPLATE_CLAUSE,
                     src_label=LABEL_TEMPLATE,
@@ -602,7 +630,7 @@ def seed_plan_graph_kg(
                     dst_value=clause_id,
                     set_props=(("用途", "usage", str(clause.get("用途") or "").strip()),),
                 )
-                edges[REL_TEMPLATE_CLAUSE] += 1
+                record_edge(REL_TEMPLATE_CLAUSE, written=written, source=template_id, target=clause_id)
 
         # 4) 管辖：班组 → 设备实例（重名且无法区分时不静默任选）
         for team in teams:
@@ -615,7 +643,7 @@ def seed_plan_graph_kg(
                 if not device_id:
                     unmatched_areas.append({"team": team_id, "area": name, "reason": reason or "未匹配"})
                     continue
-                _merge_edge(
+                written = _merge_edge(
                     driver,
                     rel=REL_MANAGES,
                     src_label=LABEL_TEAM,
@@ -627,7 +655,7 @@ def seed_plan_graph_kg(
                     dst_param="did",
                     dst_value=device_id,
                 )
-                edges[REL_MANAGES] += 1
+                record_edge(REL_MANAGES, written=written, source=team_id, target=device_id)
 
         # 5) 配备备件：设备类型 → 备品备件（适用设备类型每项一条边）
         for spare in spares:
@@ -636,7 +664,7 @@ def seed_plan_graph_kg(
                 name = str(device_type or "").strip()
                 if not name:
                     continue
-                _merge_edge(
+                written = _merge_edge(
                     driver,
                     rel=REL_SPARE,
                     src_label=LABEL_DEVICE_TYPE,
@@ -648,7 +676,7 @@ def seed_plan_graph_kg(
                     dst_param="pid",
                     dst_value=spare_id,
                 )
-                edges[REL_SPARE] += 1
+                record_edge(REL_SPARE, written=written, source=name, target=spare_id)
     finally:
         driver.close()
 
@@ -663,18 +691,25 @@ def seed_plan_graph_kg(
         "teams": len(teams),
         "spares": len(spares),
         "edges": edges,
+        "edges_verified": edges_verified,
         "unmatched_clauses": unmatched_clauses,
         "unmatched_areas": unmatched_areas,
+        "unmatched_edges": unmatched_edges,
         "schema": schema,
     }
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="导入处置方案知识数据到独立 TuGraph kg 图")
+    parser = argparse.ArgumentParser(description="导入处置方案知识数据到 TuGraph kg3 图")
     parser.add_argument("--uri", required=True, help="TuGraph Bolt 地址，如 bolt://192.168.138.10:7688")
-    parser.add_argument("--graph", default="kg", help="图名称，默认 kg")
+    parser.add_argument("--graph", default="kg3", help="图名称，默认 kg3")
     parser.add_argument("--username", default="admin", help="用户名，默认 admin")
     parser.add_argument("--data-dir", default=str(DEFAULT_DATA_DIR), help="seed 数据目录，默认包内 data/")
+    parser.add_argument(
+        "--kg-ref",
+        default="",
+        help="ref/kg_ref.json 路径；缺少时班组管辖区域检查按未通过处理，预检会拦截导入",
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -688,17 +723,29 @@ def main() -> int:
         print(f"导入失败：{exc}", file=sys.stderr)
         return 1
 
-    # 连图前先离线预检；预检不过直接拦截，避免写入坏数据
-    report = preflight_seed(seed)
-    if not report["ok"]:
-        print(json.dumps(report, ensure_ascii=False, indent=2))
-        print("离线预检未通过，已终止导入。", file=sys.stderr)
-        return 2
-
+    # 写入前的前置条件先校验：密码决定能否真实连接，kg_ref 决定管辖区域能否被证明。
     password = os.environ.get(PASSWORD_ENV, "")
     if not args.dry_run and not password:
         print(f"导入失败：未设置环境变量 {PASSWORD_ENV}（不提供默认密码）", file=sys.stderr)
         return 1
+
+    kg_ref: dict | None = None
+    if not args.kg_ref:
+        print("导入失败：缺少 --kg-ref（ref/kg_ref.json），无法校验班组管辖区域", file=sys.stderr)
+        return 1
+    ref_path = Path(args.kg_ref)
+    if not ref_path.is_file():
+        print(f"导入失败：kg_ref 文件不存在: {ref_path}", file=sys.stderr)
+        return 1
+    with ref_path.open(encoding="utf-8") as handle:
+        kg_ref = json.load(handle)
+
+    # 连图前先离线预检；预检不过直接拦截，避免写入坏数据
+    report = preflight_seed(seed, kg_ref=kg_ref)
+    if not report["ok"]:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        print("离线预检未通过，已终止导入。", file=sys.stderr)
+        return 2
 
     try:
         result = seed_plan_graph_kg(
@@ -708,6 +755,7 @@ def main() -> int:
             password=password,
             seed=seed,
             dry_run=args.dry_run,
+            kg_ref=kg_ref,
         )
     except (KgSeedError, PreflightError) as exc:
         print(f"导入失败：{exc}", file=sys.stderr)

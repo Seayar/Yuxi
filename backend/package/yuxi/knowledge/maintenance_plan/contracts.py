@@ -1,7 +1,7 @@
 """处置方案生成的数据契约。
 
 ``contracts`` 拥有处置方案在意图解析、图谱检索、方案装配与发布链路上流动的统一数据结构：
-六段式方案、图谱证据、用户可见文案与 kg 图中文标签/关系常量。其他模块只消费这里的形状，
+六段式方案、图谱证据、用户可见文案与 kg3 图的中文标签/关系常量。其他模块只消费这里的形状，
 不要在别处重复定义标签名、关系名或报告字段。
 """
 
@@ -63,7 +63,7 @@ TASK_TEST = "试验"
 TASK_PATROL = "巡视"
 TASK_TYPES = (TASK_REPLACE, TASK_REPAIR, TASK_TEST, TASK_PATROL)
 
-# kg 图 设备类型 节点的全部名称（ref/kg_schema.md，19 个）
+# kg3 图的设备类型节点全部名称（ref/kg_schema.md，19 个）
 DEVICE_TYPES = (
     "变压器",
     "开关柜",
@@ -92,7 +92,7 @@ MAX_DEVICE_CANDIDATES = 8
 MAX_CHOICE_ROUNDS = 3
 
 # ---------------------------------------------------------------------------
-# 独立 TuGraph `kg` 图的中文标签 / 关系
+# TuGraph `kg3` 图的中文标签 / 关系
 #
 # 已有（同事录入的台账与规程，见 ref/kg_schema.md）：
 #   设备实例 -[属于]-> 设备类型；设备实例 -[位于]-> 设备实例（子→父）；
@@ -156,7 +156,7 @@ class PlanQuery:
     raw_text: str = ""  # 用户原文；多轮补充时为“上一轮原文；本次补充”的拼接全文
     task_type: str | None = None  # 更换/检修/试验/巡视
     device_name: str | None = None  # 用户提到的设备名称（原文，如“3k18”“1号主变”）
-    device_type: str | None = None  # 设备类型（归一到 kg 设备类型名称，如“开关柜”）
+    device_type: str | None = None  # 设备类型（归一到 kg3 设备类型名称，如“开关柜”）
     voltage_level: str | None = None  # 如“10kV”
     work_object: str | None = None  # 作业对象/部件，如“断路器”“冷却系统”“有载分接开关”
     location_hint: str | None = None  # 站/开闭所/线路等位置线索，如“#3开闭所”“35kV#1变电站”
@@ -173,7 +173,7 @@ class DeviceCandidate:
 
     device_id: str  # 设备实例 id，如 LGR#xxxx
     name: str
-    device_type: str | None  # 归一后的设备类型（kg 设备类型名称）
+    device_type: str | None  # 归一后的设备类型（kg3 设备类型名称）
     voltage_level: str | None
     path: str  # 层级路径，如“#3开闭所 > 3k18”
     ledger_class: str | None = None  # 台账分类，如“中压断路器柜”

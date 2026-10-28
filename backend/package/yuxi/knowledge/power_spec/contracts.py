@@ -4,6 +4,18 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from yuxi.thinking import ThinkingStepSpec, register_thinking_steps
+
+
+POWER_SPEC_THINKING_STEPS = (
+    ThinkingStepSpec("parse_query", "解析自然语言查询", "识别查询类型、设备、电压等级、关注维度与检索关键词。"),
+    ThinkingStepSpec("retrieve_kb", "检索规程标准知识库", "在可见知识库中执行向量与关键词召回并重排。"),
+    ThinkingStepSpec("locate_clauses", "定位相关条款", "融合、过滤并校验可回溯的条款证据。"),
+    ThinkingStepSpec("generate_result", "生成检索结果", "整理、审查并生成规范条款卡片。"),
+)
+POWER_SPEC_AGENT_SLUG = "power-spec-agent"
+register_thinking_steps(POWER_SPEC_AGENT_SLUG, POWER_SPEC_THINKING_STEPS)
+
 
 PowerSpecIntent = Literal["设备参数查询", "检修标准查询", "安全规范查询", "其他类型"]
 
@@ -12,11 +24,13 @@ PowerSpecIntent = Literal["设备参数查询", "检修标准查询", "安全规
 NO_EVIDENCE_MESSAGE = "未检索到资料"
 KNOWLEDGE_BASE_NOT_READY_MESSAGE = "电力规范知识库尚未完成条款级重建"
 INTENT_ATTEMPTS_EXHAUSTED_MESSAGE = "多次未确认问题意图，请重新描述您的电力规范问题"
+INTENT_PLAN_CHANGED_MESSAGE = "意图识别结果与已确认内容不一致，请重新确认检索问题"
 PLAIN_TOOL_MESSAGES = frozenset(
     {
         NO_EVIDENCE_MESSAGE,
         KNOWLEDGE_BASE_NOT_READY_MESSAGE,
         INTENT_ATTEMPTS_EXHAUSTED_MESSAGE,
+        INTENT_PLAN_CHANGED_MESSAGE,
     }
 )
 

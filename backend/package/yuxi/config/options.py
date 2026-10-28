@@ -209,7 +209,7 @@ paddleocr_api_opts = Option(
 fault_image_opts = Option(
     key="fault_image_opts",
     name="故障图片识别服务",
-    description="配置 YOLO 设备图片故障类型识别服务，供 /api/fault/images 使用。",
+    description="配置 YOLO 设备图片故障类型识别服务，供故障溯源工具识别设备图片。",
     params={
         "fields": [
             {
@@ -226,8 +226,8 @@ fault_image_opts = Option(
 
 fault_trace_opts = Option(
     key="fault_trace_opts",
-    name="故障溯源知识图谱",
-    description="配置故障溯源智能体使用的独立 TuGraph 图（kg 图，人工录入故障数据）。",
+    name="知识图谱",
+    description="配置故障溯源与处置方案共用的 TuGraph kg3 图（设备类型、故障模式、现象、原因、触发条件、作业模板等）。",
     params={
         "fields": [
             {
@@ -243,8 +243,9 @@ fault_trace_opts = Option(
                 "label": "图名称",
                 "type": "string",
                 "environment": "FAULT_TRACE_GRAPH",
-                "placeholder": "kg",
-                "help": "人工录入故障数据的图名称，留空时读取 FAULT_TRACE_GRAPH。",
+                "default": "kg3",
+                "placeholder": "kg3",
+                "help": "图谱名称，留空时读取 FAULT_TRACE_GRAPH，再回退 kg3。",
             },
             {
                 "key": "username",

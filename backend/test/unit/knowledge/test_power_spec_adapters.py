@@ -37,6 +37,23 @@ def test_adapt_vector_results_preserves_rerank_and_source_metadata():
     assert evidence[0].metadata["chunk_id"] == "chunk-1"
 
 
+def test_adapt_vector_results_preserves_chunk_index_for_source_order():
+    """丢弃 chunk_index 会让同条款分块按召回分数排列，正文顺序与原文不符。"""
+
+    evidence = adapt_vector_results(
+        [
+            {
+                "content": "有人值班变电站每日巡视。",
+                "rerank_score": 0.91,
+                "metadata": {"file_id": "file-1", "chunk_id": "chunk-1", "chunk_index": 7},
+            }
+        ],
+        {"file-1": DOCUMENT_METADATA},
+    )
+
+    assert evidence[0].metadata["chunk_index"] == 7
+
+
 def test_adapt_vector_results_ignores_unmapped_files_and_clauses():
     evidence = adapt_vector_results(
         [
@@ -215,3 +232,31 @@ def test_adapt_vector_results_keeps_table_with_its_block_when_row_matches():
         "1 | 红外测温 | 1年",
         "本节内容与查询无关。",
     ]
+
+
+def test_adapter_chunk_index_restores_source_order_when_merging():
+    """真实 adapter 输出的 chunk_index 必须能还原原文顺序，不能按召回分排列。"""
+
+    from yuxi.knowledge.power_spec.retrieval import _merge_clause_group
+
+    rows = [
+        {
+            "content": "第二段：温升限值按表14执行。",
+            "rerank_score": 0.99,
+            "metadata": {"file_id": "file-1", "chunk_id": "chunk-2", "chunk_index": 2, "clause_no": "6.2.1"},
+        },
+        {
+            "content": "第一段：巡视周期为每月一次。",
+            "rerank_score": 0.10,
+            "metadata": {"file_id": "file-1", "chunk_id": "chunk-1", "chunk_index": 1, "clause_no": "6.2.1"},
+        },
+    ]
+    evidence = adapt_vector_results(rows, {"file-1": DOCUMENT_METADATA})
+
+    merged = _merge_clause_group(
+        [(item.rerank_score or 0.0, item, []) for item in evidence],
+        graph_matched=False,
+    )
+
+    assert merged.clause_body == "第一段：巡视周期为每月一次。\n\n第二段：温升限值按表14执行。"
+    assert merged.rerank_score == 0.99

@@ -9,12 +9,16 @@ from langgraph.types import interrupt
 from pydantic import BaseModel, Field
 
 from yuxi.agents.backends.knowledge_base_backend import resolve_visible_knowledge_bases_for_context
+from yuxi.agents.thinking import ThinkingEmitter
 from yuxi.agents.toolkits.registry import tool
 from yuxi.knowledge.power_spec.answer import build_subagent_caller, produce_power_spec_answer
 from yuxi.knowledge.power_spec.contracts import (
     INTENT_ATTEMPTS_EXHAUSTED_MESSAGE,
+    INTENT_PLAN_CHANGED_MESSAGE,
     KNOWLEDGE_BASE_NOT_READY_MESSAGE,
     NO_EVIDENCE_MESSAGE,
+    POWER_SPEC_AGENT_SLUG,
+    POWER_SPEC_THINKING_STEPS,
     PowerSpecQuery,
 )
 from yuxi.knowledge.power_spec.ingestion import is_power_spec_metadata_ready
@@ -26,7 +30,9 @@ from yuxi.knowledge.power_spec.intent import (
     build_intent_plan,
     extract_correction_text,
     extract_power_spec_intent,
+    parse_confirmation_token,
     parse_intent_confirmation,
+    plan_token,
 )
 from yuxi.knowledge.power_spec.retrieval import (
     PowerSpecSearchService,
@@ -64,7 +70,6 @@ class PowerSpecSearchInput(BaseModel):
 
     kb_id: str | None = Field(default=None, description="可选；未提供时仅在当前 Agent 恰好可见一个知识库时自动选择")
     query_text: str = Field(description="自然语言规范检索问题")
-    confirmed_intent: bool = Field(default=False, description="用户是否确认了工具返回的意图识别结果")
 
 
 @tool(
@@ -79,7 +84,11 @@ async def search_power_spec(
     confirmed_intent: bool = False,
     runtime: ToolRuntime = None,
 ) -> dict[str, Any] | str:
-    """检索现行电力规范并返回可验证的条款证据。"""
+    """检索现行电力规范并返回可验证的条款证据。
+
+    ``confirmed_intent`` 不在 ``PowerSpecSearchInput`` 里：模型无法通过工具参数跳过确认卡片，
+    确认结论只来自 ``interrupt`` 返回的用户选择；该形参仅供测试模拟已确认的用户动作。
+    """
 
     if not query_text.strip():
         return "请提供查询内容"
@@ -90,27 +99,68 @@ async def search_power_spec(
     cached_result = getattr(context, "_power_spec_search_result", None)
     if cached_result is not None:
         return cached_result
-    visible_kbs = await resolve_visible_knowledge_bases_for_context(context)
-    if not kb_id:
-        if len(visible_kbs) != 1:
-            return NO_EVIDENCE_MESSAGE
-        kb_id = str(visible_kbs[0].get("kb_id") or "")
-    if not kb_id.strip():
-        return NO_EVIDENCE_MESSAGE
-    if not any(str(item.get("kb_id")) == kb_id for item in visible_kbs):
-        return NO_EVIDENCE_MESSAGE
+
+    emitter = ThinkingEmitter(agent_slug=POWER_SPEC_AGENT_SLUG, steps=POWER_SPEC_THINKING_STEPS)
+    emitter.emit("parse_query", "started", content="正在解析查询意图。")
 
     if confirmed_intent:
         query = await extract_power_spec_intent(query_text, model_call=_build_intent_model_call(context))
     else:
+        emitter.emit(
+            "parse_query",
+            "waiting",
+            content="等待用户确认查询意图。",
+            data={"needs_confirmation": True},
+        )
         query = await _confirm_intent_with_user(query_text, context=context)
         if isinstance(query, str):
+            emitter.emit(
+                "parse_query",
+                "failed",
+                content=query,
+                error={"code": "intent_attempts_exhausted", "message": query},
+            )
             return query
     if query.clarification_required:
+        emitter.emit(
+            "parse_query",
+            "waiting",
+            content=query.clarification_message or "请补充查询信息。",
+            data={"clarification": query.clarification_message, "needs_confirmation": True},
+        )
         return {
             "query": query.model_dump(mode="json"),
             "clarification": query.clarification_message,
+            "needs_clarification": True,
+            "thinking_steps": emitter.snapshot(),
         }
+    emitter.emit(
+        "parse_query",
+        "completed",
+        content=_intent_summary(query),
+        data=_intent_data(query),
+    )
+
+    emitter.emit("retrieve_kb", "started", content="正在检索规程标准知识库。")
+    visible_kbs = await resolve_visible_knowledge_bases_for_context(context)
+    if not kb_id:
+        if len(visible_kbs) != 1:
+            emitter.emit(
+                "retrieve_kb",
+                "failed",
+                content=NO_EVIDENCE_MESSAGE,
+                error={"code": "kb_unavailable", "message": "未找到唯一可见知识库"},
+            )
+            return NO_EVIDENCE_MESSAGE
+        kb_id = str(visible_kbs[0].get("kb_id") or "")
+    if not kb_id.strip() or not any(str(item.get("kb_id")) == kb_id for item in visible_kbs):
+        emitter.emit(
+            "retrieve_kb",
+            "failed",
+            content=NO_EVIDENCE_MESSAGE,
+            error={"code": "kb_unavailable", "message": "知识库不可见"},
+        )
+        return NO_EVIDENCE_MESSAGE
 
     config = await knowledge_base.get_kb_config(kb_id)
     reranker_model = config.query_options.get("reranker_model") or None
@@ -124,6 +174,7 @@ async def search_power_spec(
     async with pg_manager.get_async_session_context() as db:
         power_spec_repository = PowerSpecRepository()
         metadata_by_file_id = await power_spec_repository.list_power_spec_extractions(db, kb_id=kb_id)
+    files_ready = sum(1 for metadata in metadata_by_file_id.values() if is_power_spec_metadata_ready(metadata))
 
     raw_results: list[dict[str, Any]] | None = None
     evidence_cache = None
@@ -133,7 +184,14 @@ async def search_power_spec(
         nonlocal raw_results, evidence_cache, knowledge_base_not_ready
         if evidence_cache is not None:
             return evidence_cache
-        raw_results = await _retrieve_for_query(executor, config, kb_id, query, reranker_model)
+        raw_results = await _retrieve_for_query(
+            executor,
+            config,
+            kb_id,
+            query,
+            reranker_model,
+            degradation_warnings,
+        )
         ready_file_ids = {
             file_id for file_id, metadata in metadata_by_file_id.items() if is_power_spec_metadata_ready(metadata)
         }
@@ -152,26 +210,84 @@ async def search_power_spec(
         return await load_evidence()
 
     result = await PowerSpecSearchService(graph_search, vector_search).search(query)
+    keyword_query = _keyword_query_text(query)
+    retrieval_data = {
+        "kb_id": kb_id,
+        "files_ready": files_ready,
+        "vector_count": len(raw_results or []),
+        "keyword_count": len(keyword_query.split()) if keyword_query else 0,
+        "candidate_count": len(result.evidence),
+        "reranker": reranker_model or "none",
+        "degraded": not reranker_model,
+    }
+    emitter.emit(
+        "retrieve_kb",
+        "completed",
+        content=f"已召回 {retrieval_data['vector_count']} 条候选，进入条款定位。",
+        data=retrieval_data,
+    )
+
     if knowledge_base_not_ready:
-        result_payload = KNOWLEDGE_BASE_NOT_READY_MESSAGE
-        setattr(context, "_power_spec_search_result", result_payload)
-        return result_payload
+        emitter.emit(
+            "locate_clauses",
+            "failed",
+            content=KNOWLEDGE_BASE_NOT_READY_MESSAGE,
+            error={"code": "kb_not_ready", "message": KNOWLEDGE_BASE_NOT_READY_MESSAGE},
+        )
+        setattr(context, "_power_spec_search_result", KNOWLEDGE_BASE_NOT_READY_MESSAGE)
+        return KNOWLEDGE_BASE_NOT_READY_MESSAGE
     if result.no_result:
-        setattr(context, "_power_spec_search_result", NO_EVIDENCE_MESSAGE)
-        return NO_EVIDENCE_MESSAGE
-    verification = verify_evidence_projection(result.evidence)
-    if not verification.valid:
+        emitter.emit(
+            "locate_clauses",
+            "failed",
+            content=NO_EVIDENCE_MESSAGE,
+            error={"code": "no_evidence", "message": NO_EVIDENCE_MESSAGE},
+        )
         setattr(context, "_power_spec_search_result", NO_EVIDENCE_MESSAGE)
         return NO_EVIDENCE_MESSAGE
 
-    reviewed = await _review_clause_metadata(context, result.evidence)
-    organized = await produce_power_spec_answer(
-        query=query,
-        evidences=reviewed,
-        call_subagent=build_subagent_caller(context),
-        call_compose=_context_model_call(context),
-        tool_call_id=getattr(runtime, "tool_call_id", None),
+    emitter.emit("locate_clauses", "started", content="正在校验条款证据。")
+    verification = verify_evidence_projection(result.evidence)
+    if not verification.valid:
+        emitter.emit(
+            "locate_clauses",
+            "failed",
+            content=NO_EVIDENCE_MESSAGE,
+            error={"code": "evidence_unverified", "message": "证据投影校验失败"},
+        )
+        setattr(context, "_power_spec_search_result", NO_EVIDENCE_MESSAGE)
+        return NO_EVIDENCE_MESSAGE
+
+    reviewed, review_fixes = await _review_clause_metadata(context, result.evidence)
+    emitter.emit(
+        "locate_clauses",
+        "completed",
+        content=f"已定位 {len(reviewed)} 条可回溯条款。",
+        data={
+            "evidence_count": len(reviewed),
+            "verified": True,
+            "review_fixes": review_fixes,
+            "warnings": list(degradation_warnings),
+        },
     )
+
+    emitter.emit("generate_result", "started", content="正在生成规范条款卡片。")
+    try:
+        organized = await produce_power_spec_answer(
+            query=query,
+            evidences=reviewed,
+            call_subagent=build_subagent_caller(context),
+            call_compose=_context_model_call(context),
+            tool_call_id=getattr(runtime, "tool_call_id", None),
+        )
+    except Exception as exc:  # noqa: BLE001
+        emitter.emit(
+            "generate_result",
+            "failed",
+            content="生成检索结果失败。",
+            error={"code": "generate_result_failed", "message": str(exc)},
+        )
+        raise
     retrieval_mode = ("graph+" if any(item.metadata.get("graph_score") is not None for item in reviewed) else "") + (
         "vector+rerank" if reranker_model else "vector"
     )
@@ -185,20 +301,54 @@ async def search_power_spec(
         "answer_source": organized["answer_source"],
         "answer_verified": organized["answer_verified"],
         "warnings": degradation_warnings,
+        "thinking_steps": emitter.snapshot(),
     }
+    emitter.emit(
+        "generate_result",
+        "completed",
+        content=f"已生成 {len(organized['items'])} 张规范条款卡片。",
+        data={
+            "card_count": len(organized["items"]),
+            "answer_source": organized["answer_source"],
+            "answer_verified": organized["answer_verified"],
+        },
+    )
+    result_payload["thinking_steps"] = emitter.snapshot()
     setattr(context, "_power_spec_search_result", result_payload)
     return result_payload
 
 
-async def _review_clause_metadata(context: Any, evidence: list[Any]) -> list[Any]:
-    """由模型校对条款编号与标题，只应用通过代码校验的字符级修复。"""
+def _intent_summary(query: PowerSpecQuery) -> str:
+    parts = [query.intent]
+    if query.device_name or query.device_type:
+        parts.append(query.device_name or query.device_type or "")
+    if query.voltage_level:
+        parts.append(query.voltage_level)
+    return "识别为" + "，".join(part for part in parts if part) + "问题。"
+
+
+def _intent_data(query: PowerSpecQuery) -> dict[str, Any]:
+    return {
+        "query_type": query.intent,
+        "device": query.device_name,
+        "device_type": query.device_type,
+        "voltage": query.voltage_level,
+        "dimensions": list(query.answer_dimensions),
+        "keywords": list(query.normalized_terms),
+        "needs_confirmation": False,
+        "clarification": query.clarification_message,
+    }
+
+
+async def _review_clause_metadata(context: Any, evidence: list[Any]) -> tuple[list[Any], int]:
+    """由模型校对条款编号与标题，只应用通过代码校验的字符级修复；返回修复条数。"""
 
     model_call = _context_model_call(context)
     if not POWER_SPEC_CLAUSE_REVIEW_ENABLED or model_call is None:
-        return evidence
+        return evidence, 0
 
     outcome = await review_clause_metadata(evidence, model_call=model_call)
-    return outcome.evidence
+    return outcome.evidence, len(outcome.applied)
 
 
 async def _retrieve_for_query(
@@ -207,6 +357,7 @@ async def _retrieve_for_query(
     kb_id: str,
     query: PowerSpecQuery,
     reranker_model: str | None,
+    degradation_warnings: list[str],
 ) -> list[dict[str, Any]]:
     """按模型给出的问题与关键词召回，多路结果按 chunk 合并。
 
@@ -241,6 +392,8 @@ async def _retrieve_for_query(
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(f"关键词召回失败，仅使用问题召回: {exc}")
+        # 可选召回路径降级必须可观察：结果里带上降级原因，不能只留日志。
+        degradation_warnings.append(f"关键词召回失败，已仅使用问题召回: {exc}")
         return base
     logger.info(f"电力规范多路召回：问题 {len(base)} 条，关键词「{keyword_query}」{len(keyword_results)} 条")
     return _merge_results(base, keyword_results)
@@ -318,8 +471,14 @@ async def _confirm_intent_with_user(query_text: str, *, context: Any) -> PowerSp
         intent_plan = build_intent_plan(query)
         intent_plan["attempt"] = attempt
         setattr(context, "_power_spec_intent_plan", intent_plan)
-        decision, correction = parse_intent_confirmation(interrupt(build_confirmation_payload(intent_plan)))
+        answer = interrupt(build_confirmation_payload(intent_plan))
+        decision, correction = parse_intent_confirmation(answer)
         if decision == "confirm":
+            # resume 会重新识别意图；用户确认的计划指纹随选项值持久化在 checkpoint 里，
+            # 重算结果与它不一致时不能静默按另一份计划检索。
+            confirmed_token = parse_confirmation_token(answer)
+            if confirmed_token is not None and confirmed_token != plan_token(intent_plan):
+                return INTENT_PLAN_CHANGED_MESSAGE
             return query
         if decision == "invalid" or not correction:
             correction = extract_correction_text(interrupt(build_correction_payload(intent_plan)))
@@ -341,7 +500,13 @@ def _context_model_call(context: Any) -> Callable[[str], Awaitable[str]] | None:
 
     async def model_call(prompt: str) -> str:
         model = _select_context_model(context, max_tokens=POWER_SPEC_INTENT_MAX_TOKENS)
-        response = await model.call(prompt, stream=False)
+        response = await model.ainvoke(
+            prompt,
+            config={
+                "metadata": {"yuxi_internal_model": True, "purpose": "power_spec_internal"},
+                "tags": ["yuxi_internal_model"],
+            },
+        )
         return getattr(response, "content", "") or ""
 
     return model_call

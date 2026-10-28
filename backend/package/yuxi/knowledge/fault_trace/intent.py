@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Awaitable, Callable
@@ -10,7 +11,12 @@ from typing import Any
 import json_repair
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from yuxi.knowledge.fault_trace.contracts import FaultTraceQuery
+from yuxi.knowledge.fault_trace.contracts import (
+    CLARIFY_INFO_MISSING_MESSAGE,
+    CLARIFY_PHENOMENON_MISSING_MESSAGE,
+    DEVICE_NOT_FOUND_MESSAGE,
+    FaultTraceQuery,
+)
 from yuxi.utils import logger
 
 # ---------------------------------------------------------------------------
@@ -20,26 +26,33 @@ from yuxi.utils import logger
 _DEVICE_TYPES = ("变压器", "开关柜", "断路器", "隔离开关", "电缆", "配电柜", "互感器", "避雷器", "母线", "线路")
 _VOLTAGE_PATTERN = re.compile(r"(?P<value>\d+(?:\.\d+)?)\s*[kKＫｋ][vVＶｖ]")
 # SRS：设备名称应指向具体设备；只出现类型词（如“变压器”）不算具体设备。
-_DEVICE_SUFFIXES = (
-    "主变",
-    "主变压器",
-    "变压器",
-    "开关柜",
-    "开闭所",
-    "断路器",
-    "隔离开关",
-    "互感器",
-    "避雷器",
-    "电抗器",
-    "母线",
-    "电缆",
-    "线路",
-    "进线",
-    "出线",
-    "冷却器",
-    "接头",
-    "泵",
-    "风扇",
+# 后缀按长度降序排列，保证“#1主变压器”整体命中而不是只截到“#1主变”。
+_DEVICE_SUFFIXES = tuple(
+    sorted(
+        (
+            "主变",
+            "主变压器",
+            "变压器",
+            "开关柜",
+            "开闭所",
+            "断路器",
+            "隔离开关",
+            "互感器",
+            "避雷器",
+            "电抗器",
+            "母线",
+            "电缆",
+            "线路",
+            "进线",
+            "出线",
+            "冷却器",
+            "接头",
+            "泵",
+            "风扇",
+        ),
+        key=len,
+        reverse=True,
+    )
 )
 _DEVICE_NAME_PATTERN = re.compile(
     r"(?P<name>"
@@ -48,6 +61,12 @@ _DEVICE_NAME_PATTERN = re.compile(
     r"\d*\s*[kK][vV]\s*(?:" + "|".join(_DEVICE_SUFFIXES) + r")(?:\s*#\s*[A-Za-z0-9一二三四五六七八九十]+)?"
     r"|"
     r"(?:电缆|线路|母线)[^，。；;\s]{0,8}(?:\s*#\s*[A-Za-z0-9一二三四五六七八九十]+)?"
+    r"|"
+    # 带编号的设备名：#1主变压器、2号主变、3B-7Y 等
+    r"#?\s*\d{1,3}\s*(?:" + "|".join(_DEVICE_SUFFIXES) + r")"
+    r"|"
+    # 设备编号：3B-7Y、1B-1K-1 等字母数字组合（含 -/# 分段）
+    r"\d{1,2}[A-Za-z](?:[-#][A-Za-z0-9]{1,8})+"
     r")"
 )
 _PHENOMENON_TERMS = (
@@ -71,6 +90,12 @@ _PHENOMENON_TERMS = (
     "破损",
     "裂纹",
     "异物",
+    "倒伏",
+    "压覆",
+    "搭挂",
+    "缠绕",
+    "跳闸",
+    "温度报警",
 )
 
 
@@ -133,14 +158,19 @@ async def extract_fault_trace_intent(
     previous: FaultTraceQuery | None = None,
     feedback: str | None = None,
 ) -> FaultTraceQuery:
-    """优先由模型识别意图，模型不可用或输出非法时回退规则解析。
+    """优先由模型识别意图，规则能确定设备与现象时直接使用规则结果。
 
-    ``image_result`` 来自 `/api/fault/images` 的 YOLO 识别结果，与用户文字/语音
-    一起进入语义融合（SRS：统一语义表示层）。
+    中断确认会在恢复时重放工具调用，规则解析保证同一条输入得到同一份确认计划；
+    只有规则无法确定具体设备/现象时才调用模型，避免重放后确认卡内容漂移。
+
+    ``image_result`` 是调用方显式传入的 YOLO 识别结果，与用户文字/语音一起进入
+    语义融合（SRS：统一语义表示层）；未传入时由工具读取会话中的上传图片。
     """
 
-    if model_call is None:
-        query = parse_fault_trace_query(query_text)
+    rule_query = parse_fault_trace_query(query_text)
+    rule_is_specific = rule_query.has_specific_device() and rule_query.has_phenomenon()
+    if model_call is None or rule_is_specific:
+        query = rule_query
     else:
         try:
             raw = await model_call(
@@ -154,7 +184,23 @@ async def extract_fault_trace_intent(
 
     query.image_fault_type = _clean_optional(image_result.get("fault_type")) if image_result else None
     query.image_fault_name = _clean_optional(image_result.get("fault_name")) if image_result else None
-    return apply_input_constraints(query)
+    _merge_rule_fallback(query, query_text)
+    # 现象可以由图片识别补齐，第一步只要求设备具体；现象校验留到图片步骤之后。
+    return apply_input_constraints(query, require_phenomenon=False)
+
+
+def _merge_rule_fallback(query: FaultTraceQuery, query_text: str) -> None:
+    """模型漏识别设备/现象时用规则结果补齐，避免确认卡片与恢复重放结果漂移。"""
+
+    if query.has_specific_device() and query.phenomena:
+        return
+    fallback = parse_fault_trace_query(query_text)
+    if not (query.device_name and query.device_name.strip()):
+        query.device_name = fallback.device_name or query.device_name
+    query.device_type = query.device_type or fallback.device_type
+    query.voltage_level = query.voltage_level or fallback.voltage_level
+    if not query.phenomena:
+        query.phenomena = fallback.phenomena
 
 
 def build_intent_prompt(
@@ -242,27 +288,27 @@ def _clean_optional(value: Any) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-def apply_input_constraints(query: FaultTraceQuery) -> FaultTraceQuery:
+def apply_input_constraints(query: FaultTraceQuery, *, require_phenomenon: bool = True) -> FaultTraceQuery:
     """按 SRS 输入约束设置澄清：
 
     - 设备名称应指向具体设备，仅输入设备类型视为不明确；
     - 图像本身不可单独诊断，须配合文字或语音描述；
     - 信息不完整时走方案三（反问澄清）话术。
+
+    ``require_phenomenon=False`` 用于图片步骤之前：此时现象还可以由设备图片识别补齐。
     """
 
     if not query.has_specific_device():
         if query.has_phenomenon():
             query.clarification_required = True
-            query.clarification_message = "未能识别故障设备，请明确设备名称后重新提交。"
+            query.clarification_message = DEVICE_NOT_FOUND_MESSAGE
         else:
             query.clarification_required = True
-            query.clarification_message = "未能识别完整的故障信息，请明确故障设备和故障现象"
+            query.clarification_message = CLARIFY_INFO_MISSING_MESSAGE
         return query
-    if not query.has_phenomenon():
+    if require_phenomenon and not query.has_phenomenon():
         query.clarification_required = True
-        query.clarification_message = (
-            "已收到您的描述，但缺少故障现象，请补充具体故障现象（例如：冷却器风扇停转、触头烧蚀）。"
-        )
+        query.clarification_message = CLARIFY_PHENOMENON_MISSING_MESSAGE
         return query
     return query
 
@@ -310,6 +356,51 @@ def build_intent_plan(query: FaultTraceQuery) -> dict[str, Any]:
     }
 
 
+# 确认卡片把计划指纹放进选项值，随用户选择持久化到 checkpoint；resume 重放时按同一指纹
+# 校验重算的计划，避免执行用户没有确认过的另一份计划。
+CONFIRM_VALUE_PREFIX = "confirm#"
+
+
+def intent_plan_signature(intent_plan: dict[str, Any]) -> tuple[str, ...]:
+    """确认计划的可比对字段；只保留用户实际确认的语义（含图片识别结果）。"""
+
+    return (
+        str(intent_plan.get("device_name") or ""),
+        str(intent_plan.get("device_type") or ""),
+        str(intent_plan.get("voltage_level") or ""),
+        str(intent_plan.get("image_fault_name") or ""),
+        *(str(item) for item in (intent_plan.get("phenomena") or ())),
+    )
+
+
+def plan_token(intent_plan: dict[str, Any]) -> str:
+    """计划指纹的短哈希；作为确认选项值的一部分往返。"""
+
+    payload = json.dumps(intent_plan_signature(intent_plan), ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+
+
+def parse_confirmation_token(value: Any) -> str | None:
+    """从确认结果里取出随卡片往返的计划指纹；没有指纹时返回 None。"""
+
+    if isinstance(value, dict):
+        for item in value.values():
+            token = parse_confirmation_token(item)
+            if token is not None:
+                return token
+        return None
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            token = parse_confirmation_token(item)
+            if token is not None:
+                return token
+        return None
+    text = str(value or "").strip()
+    if text.startswith(CONFIRM_VALUE_PREFIX):
+        return text[len(CONFIRM_VALUE_PREFIX) :] or None
+    return None
+
+
 def build_confirmation_payload(intent_plan: dict[str, Any]) -> dict[str, Any]:
     """构造意图确认卡片，展示模型对设备与故障现象的理解。"""
 
@@ -332,7 +423,7 @@ def build_confirmation_payload(intent_plan: dict[str, Any]) -> dict[str, Any]:
                 "question_id": INTENT_QUESTION_ID,
                 "question": question,
                 "options": [
-                    {"label": "正确，继续溯源", "value": "confirm"},
+                    {"label": "正确，继续溯源", "value": f"{CONFIRM_VALUE_PREFIX}{plan_token(intent_plan)}"},
                     {"label": "不正确，我要补充/修改", "value": "correct"},
                 ],
                 "multi_select": False,
@@ -386,6 +477,8 @@ def parse_intent_confirmation(value: Any) -> tuple[str, str | None]:
         return "invalid", None
     if isinstance(value, str):
         text = value.strip()
+        if text.startswith(CONFIRM_VALUE_PREFIX):
+            return "confirm", None
         if text.lower() in {"confirm", "confirmed"} or text in {"正确，继续溯源", "正确"}:
             return "confirm", None
         if text.lower() in {"correct", "reject"} or text in {"不正确，我要补充/修改", "不正确"}:

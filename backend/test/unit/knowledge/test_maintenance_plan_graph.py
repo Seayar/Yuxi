@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 
 import pytest
-from yuxi.knowledge.fault_trace.graph_kg import KgGraphError
+from yuxi.agents.toolkits.tugraph import TuGraphError
 from yuxi.knowledge.maintenance_plan.contracts import (
     LABEL_DEVICE,
     LABEL_SAFETY_DISTANCE,
@@ -962,7 +962,7 @@ def test_plan_graph_ready_returns_true_when_query_succeeds(client: FakeKgClient)
 def test_plan_graph_ready_returns_false_when_graph_unavailable():
     class BrokenClient:
         def run(self, cypher: str, **params) -> list[dict]:
-            raise KgGraphError("无法连接故障溯源知识图谱")
+            raise TuGraphError("无法连接故障溯源知识图谱")
 
     assert plan_graph_ready(BrokenClient()) is False
 

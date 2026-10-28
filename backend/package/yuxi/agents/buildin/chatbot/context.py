@@ -15,3 +15,12 @@ class ChatBotContext(BaseContext):
             "kind": "subagents",
         },
     )
+
+    image_input_mode: str = field(
+        default="model",
+        metadata={
+            "name": "图片输入方式",
+            "description": "model：图片随消息交给模型；server：由智能体工具自行处理上传图片，模型只接收文字。",
+            "hide": True,
+        },
+    )

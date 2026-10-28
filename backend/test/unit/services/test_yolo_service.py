@@ -15,7 +15,6 @@ from yuxi.services.yolo_service import (
 pytestmark = pytest.mark.unit
 
 DETECT_URL = "http://yolo.local/api/fault/detect"
-HEALTH_URL = "http://yolo.local/api/fault/health"
 IMAGE_BYTES = b"\x89PNG\r\n\x1a\nfake-image-payload"
 
 
@@ -152,28 +151,3 @@ async def test_detect_fails_explicitly_when_service_not_configured(monkeypatch: 
 
     with pytest.raises(YoloServiceError, match="未配置"):
         await _detect()
-
-
-async def test_health_passthrough(monkeypatch: pytest.MonkeyPatch, httpx_mock):
-    _use_config(monkeypatch)
-    healthy = {
-        "code": 200,
-        "message": "success",
-        "model": "YOLO",
-        "model_path": "/app/models/best.pt",
-        "status": "running",
-    }
-    httpx_mock.add_response(url=HEALTH_URL, content=json.dumps(healthy).encode())
-
-    result = await yolo_service.yolo_service_health()
-
-    assert result["model"] == "YOLO"
-    assert result["status"] == "running"
-
-
-async def test_health_maps_upstream_error(monkeypatch: pytest.MonkeyPatch, httpx_mock):
-    _use_config(monkeypatch)
-    httpx_mock.add_response(url=HEALTH_URL, status_code=500, content=b"boom")
-
-    with pytest.raises(YoloServiceError):
-        await yolo_service.yolo_service_health()

@@ -29,7 +29,7 @@ from pydantic import BaseModel, Field
 
 from yuxi.agents.toolkits.registry import tool
 from yuxi.config.options import fault_trace_opts
-from yuxi.knowledge.fault_trace.graph_kg import KgGraphClient, KgGraphConfig, KgGraphError
+from yuxi.agents.toolkits.tugraph import TuGraphClient, TuGraphConfig, TuGraphError
 from yuxi.knowledge.maintenance_plan.answer import produce_maintenance_plan_answer
 from yuxi.knowledge.maintenance_plan.contracts import (
     CHOICE_ABORTED_MESSAGE,
@@ -87,9 +87,9 @@ class MaintenancePlanInput(BaseModel):
     args_schema=MaintenancePlanInput,
 )
 async def generate_maintenance_plan(query_text: str, runtime: ToolRuntime = None) -> dict[str, Any] | str:
-    """根据运维任务从 kg 图检索台账设备、作业模板与规程条款，确定性装配六段式处置方案。
+    """根据运维任务从 kg3 图检索台账设备、作业模板与规程条款，确定性装配六段式处置方案。
 
-    图谱数据来自人工录入的独立 TuGraph ``kg`` 图（管理员配置 ``fault_trace_opts``），
+    图谱数据来自人工录入的 TuGraph ``kg3`` 图（管理员配置 ``fault_trace_opts``），
     由 ``graph_plan`` 适配器按中文标签读取台账、模板、安全距离、班组与备件。
     """
 
@@ -125,14 +125,14 @@ async def generate_maintenance_plan(query_text: str, runtime: ToolRuntime = None
             return resolved
         query = resolved
 
-    client = KgGraphClient(config)
+    client = TuGraphClient(config)
     try:
         located = await _locate_device(client, query, model_call=model_call, rounds=rounds)
         if isinstance(located, str):
             return located
         query, device = located
         evidence = await asyncio.to_thread(collect_plan_evidence, client, query, device)
-    except KgGraphError as exc:
+    except TuGraphError as exc:
         logger.warning(f"处置方案图谱查询失败: {exc}")
         return _remember(context, PLAN_GRAPH_NOT_CONFIGURED_MESSAGE)
     finally:
@@ -205,7 +205,7 @@ def _task_type_from(selected: str | None, free_text: str | None) -> str | None:
 
 
 async def _locate_device(
-    client: KgGraphClient,
+    client: TuGraphClient,
     query: PlanQuery,
     *,
     model_call: Callable[[str], Awaitable[str]] | None,
@@ -337,8 +337,8 @@ def _normalize_name(value: str | None) -> str:
 # ---------------------------------------------------------------------------
 # 配置、模型调用与缓存
 # ---------------------------------------------------------------------------
-async def _resolve_kg_config() -> KgGraphConfig | None:
-    """读取管理员配置的 kg 图连接（复用 fault_trace_opts）；关键字段缺失时返回 None。"""
+async def _resolve_kg_config() -> TuGraphConfig | None:
+    """读取管理员配置的 kg3 图连接（复用 fault_trace_opts）；关键字段缺失时返回 None。"""
 
     try:
         resolved = await fault_trace_opts.get()
@@ -353,7 +353,7 @@ async def _resolve_kg_config() -> KgGraphConfig | None:
         return None
     if not username or not password:
         return None
-    return KgGraphConfig(uri=uri, graph=graph, username=username, password=password)
+    return TuGraphConfig(uri=uri, graph=graph, username=username, password=password)
 
 
 def _context_model_call(context: Any) -> Callable[[str], Awaitable[str]] | None:

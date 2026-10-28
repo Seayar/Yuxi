@@ -97,7 +97,7 @@ def test_node_id_is_deterministic():
 
 
 def test_label_constants_match_adapter_schema():
-    """seed 写入标签必须与 graph_kg 适配器读取标签一致。"""
+    """历史 kg 迁移写入的标签必须与迁移目标一致（运行时读取 kg3，见 graph_kg3.py）。"""
 
     from yuxi.knowledge.fault_trace.contracts import KG_ENTITY_LABELS, KG_RELATION_TYPES
 
@@ -188,7 +188,7 @@ def test_seed_writes_schema_then_nodes_and_edges(monkeypatch):
 
     result = seed_module.seed_fault_graph_kg(
         uri="bolt://stub:7688",
-        graph="kg",
+        graph="kg3",
         username="admin",
         password="secret",
         seed=load_fault_seed_from_dict(_valid_seed()),
@@ -224,7 +224,7 @@ def test_seed_reuses_existing_ledger_device(monkeypatch):
 
     seed_module.seed_fault_graph_kg(
         uri="bolt://stub:7688",
-        graph="kg",
+        graph="kg3",
         username="admin",
         password="secret",
         seed=load_fault_seed_from_dict(_valid_seed()),

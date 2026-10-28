@@ -7,7 +7,40 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
+
+_NODE_MERGE = re.compile(r"MERGE \(n:([^\s{]+) \{id: \$([A-Za-z_]+)\}\)")
+_EDGE_MERGE = re.compile(
+    r"MATCH \(a:([^\s{]+) \{([^:}]+): \$([A-Za-z_]+)\}\) "
+    r"MATCH \(b:([^\s{]+) \{([^:}]+): \$([A-Za-z_]+)\}\) "
+    r"MERGE \(a\)-\[r:([^\]]+)\]->\(b\)"
+)
+_EDGE_COUNT = re.compile(
+    r"MATCH \(a:([^\s{]+) \{([^:}]+): \$([A-Za-z_]+)\}\)-\[r:([^\]]+)\]->"
+    r"\(b:([^\s{]+) \{([^:}]+): \$([A-Za-z_]+)\}\) RETURN count\(r\) AS total"
+)
+
+
+def _edge_key(
+    *,
+    a_label: str,
+    a_prop: str,
+    a_value: Any,
+    rel: str,
+    b_label: str,
+    b_prop: str,
+    b_value: Any,
+) -> tuple[str, str, str, str, str]:
+    """边的身份：端点标签 + 端点属性 + 方向 + 关系类型。"""
+
+    return (
+        a_label,
+        f"{a_prop}={a_value}",
+        rel,
+        b_label,
+        f"{b_prop}={b_value}",
+    )
 
 
 class FakeResult:
@@ -22,15 +55,15 @@ class FakeResult:
     def single(self):
         return self._rows[0] if self._rows else None
 
-    def consume(self) -> "FakeResult":
+    def consume(self) -> FakeResult:
         return self
 
 
 class FakeSession:
-    def __init__(self, driver: "FakeDriver") -> None:
+    def __init__(self, driver: FakeDriver) -> None:
         self._driver = driver
 
-    def __enter__(self) -> "FakeSession":
+    def __enter__(self) -> FakeSession:
         return self
 
     def __exit__(self, *exc: Any) -> bool:
@@ -46,7 +79,11 @@ class FakeDriver:
 
     - ``registered_vertex`` / ``registered_edge``：图上已注册的标签（用于验证“已注册跳过”）；
     - ``clauses``：``{standard_id: {条款号: clause_id}}``；
-    - ``devices``：``{名称: [{"id":..., "path":...}]}``。
+    - ``devices``：``{名称: [{"id":..., "path":...}]}``；
+    - ``device_types``：图上已存在的“设备类型”节点名称，用于回读确认边是否真的写入。
+
+    假图谱按 ``MERGE`` 语义维护已知节点集合：节点 ``MERGE`` 会登记，边写入后按“两端都存在”
+    回答 ``RETURN count(r)``，因此边回读不是硬编码成功。
     """
 
     def __init__(
@@ -56,6 +93,7 @@ class FakeDriver:
         registered_edge: tuple[str, ...] = (),
         clauses: dict[str, dict[str, str]] | None = None,
         devices: dict[str, list[dict[str, str]]] | None = None,
+        device_types: tuple[str, ...] = (),
     ) -> None:
         self.registered_vertex = set(registered_vertex)
         self.registered_edge = set(registered_edge)
@@ -63,6 +101,12 @@ class FakeDriver:
         self.devices = dict(devices or {})
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.closed = False
+        self.graph_nodes: set[tuple[str, str]] = {
+            ("标准条款", clause_id) for clauses in self.clauses.values() for clause_id in clauses.values()
+        }
+        self.graph_nodes |= {("设备实例", row["id"]) for rows in self.devices.values() for row in rows}
+        self.graph_nodes |= {("设备类型", name) for name in device_types}
+        self.graph_edges: set[tuple[str, str, str, str, str]] = set()
 
     def session(self) -> FakeSession:
         return FakeSession(self)
@@ -71,6 +115,43 @@ class FakeDriver:
         self.closed = True
 
     def respond(self, cypher: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+        edge_count = _EDGE_COUNT.search(cypher)
+        if edge_count:
+            a_label, a_prop, a_param, rel, b_label, b_prop, b_param = edge_count.groups()
+            key = _edge_key(
+                a_label=a_label,
+                a_prop=a_prop,
+                a_value=params.get(a_param),
+                rel=rel,
+                b_label=b_label,
+                b_prop=b_prop,
+                b_value=params.get(b_param),
+            )
+            return [{"total": 1 if key in self.graph_edges else 0}]
+        edge_merge = _EDGE_MERGE.search(cypher)
+        if edge_merge:
+            a_label, a_prop, a_param, b_label, b_prop, b_param, rel = edge_merge.groups()
+            a_exists = (a_label, str(params.get(a_param))) in self.graph_nodes
+            b_exists = (b_label, str(params.get(b_param))) in self.graph_nodes
+            # MERGE 语义：两端都存在才写边；方向由模式固定，写反的边不会进集合。
+            if a_exists and b_exists:
+                self.graph_edges.add(
+                    _edge_key(
+                        a_label=a_label,
+                        a_prop=a_prop,
+                        a_value=params.get(a_param),
+                        rel=rel,
+                        b_label=b_label,
+                        b_prop=b_prop,
+                        b_value=params.get(b_param),
+                    )
+                )
+            return []
+        node_merge = _NODE_MERGE.search(cypher)
+        if node_merge:
+            label, id_param = node_merge.groups()
+            self.graph_nodes.add((label, str(params.get(id_param))))
+            return []
         if "db.vertexLabels()" in cypher:
             return [{"label": label} for label in sorted(self.registered_vertex)]
         if "db.edgeLabels()" in cypher:

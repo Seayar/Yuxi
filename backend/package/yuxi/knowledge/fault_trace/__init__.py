@@ -1,44 +1,7 @@
 """故障溯源模块。
 
-仅重导出被生产消费的符号；公开面保持最小。
+各能力按子模块提供：``contracts``（契约与固定文案）、``graph_kg3``（kg3 图谱读取）、
+``workflow``（四步编排）、``tool``（工具入口）、``realtime``/``rules``（实时值与三值求值）、
+``answer``/``report_text``（报告装配与文案）、``seed``（历史 kg 迁移）。
+包根不再重导出具体符号，避免出现没有生产消费者的第二层公开面。
 """
-
-from yuxi.knowledge.fault_trace.answer import build_fault_answer_markdown, produce_fault_trace_answer
-from yuxi.knowledge.fault_trace.contracts import (
-    FAULT_GRAPH_NOT_CONFIGURED_MESSAGE,
-    NO_FAULT_GRAPH_MESSAGE,
-    FaultTraceQuery,
-    FaultTraceReport,
-    report_payload,
-)
-from yuxi.knowledge.fault_trace.graph import FaultGraphEvidence
-from yuxi.knowledge.fault_trace.graph_kg import (
-    KgGraphClient,
-    KgGraphConfig,
-    collect_kg_fault_evidence,
-)
-from yuxi.knowledge.fault_trace.intent import (
-    apply_input_constraints,
-    extract_fault_trace_intent,
-    parse_fault_trace_query,
-)
-from yuxi.knowledge.fault_trace.seed import load_fault_seed, seed_fault_graph_kg
-
-__all__ = [
-    "FAULT_GRAPH_NOT_CONFIGURED_MESSAGE",
-    "NO_FAULT_GRAPH_MESSAGE",
-    "FaultTraceQuery",
-    "FaultTraceReport",
-    "report_payload",
-    "FaultGraphEvidence",
-    "KgGraphClient",
-    "KgGraphConfig",
-    "collect_kg_fault_evidence",
-    "apply_input_constraints",
-    "extract_fault_trace_intent",
-    "parse_fault_trace_query",
-    "produce_fault_trace_answer",
-    "build_fault_answer_markdown",
-    "load_fault_seed",
-    "seed_fault_graph_kg",
-]

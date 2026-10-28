@@ -277,6 +277,18 @@ async def test_confirmed_intent_path_returns_organized_answer(monkeypatch):
     assert result["answer_source"] == ANSWER_SOURCE_MODEL
     assert result["answer_verified"] is True
     assert result["evidence_found"] is True
+    assert [step["step_id"] for step in result["thinking_steps"]] == [
+        "parse_query",
+        "retrieve_kb",
+        "locate_clauses",
+        "generate_result",
+    ]
+    assert [step["title"] for step in result["thinking_steps"]] == [
+        "解析自然语言查询",
+        "检索规程标准知识库",
+        "定位相关条款",
+        "生成检索结果",
+    ]
     assert set(result["spec_results"][0]) == {"standard_name", "standard_no", "clause_no", "clause_body"}
 
 
@@ -352,6 +364,61 @@ async def test_missing_reranker_keeps_results_and_reports_warning(monkeypatch):
     assert result["warnings"] == ["未配置重排模型，已按召回分数排序"]
     assert result["spec_results"][0]["clause_no"] == "6.1"
     assert result["evidence_found"] is True
+
+
+@pytest.mark.asyncio
+async def test_keyword_recall_failure_is_visible_in_warnings():
+    """关键词召回是可选的第二路：失败时保留问题召回，并把降级原因写进 warnings。"""
+
+    class Executor:
+        def __init__(self):
+            self.calls: list[str] = []
+
+        async def aquery(self, query_text, *_args, **_kwargs):
+            self.calls.append(query_text)
+            if len(self.calls) > 1:
+                raise RuntimeError("keyword backend down")
+            return [{"content": RAW_BODY, "score": 0.82, "metadata": {"file_id": "file-1", "chunk_id": "chunk-1"}}]
+
+    query = parse_power_spec_query(QUESTION).model_copy(update={"normalized_terms": ["油中溶解气体", "周期"]})
+    executor = Executor()
+    warnings: list[str] = []
+
+    results = await tool_module._retrieve_for_query(
+        executor,
+        type("Config", (), {"query_options": {}})(),
+        "kb1",
+        query,
+        "local:reranker",
+        warnings,
+    )
+
+    assert len(executor.calls) == 2
+    assert [item["metadata"]["chunk_id"] for item in results] == ["chunk-1"]
+    assert warnings and "关键词召回失败" in warnings[0]
+
+
+@pytest.mark.asyncio
+async def test_review_fixes_counts_only_applied_corrections(monkeypatch):
+    """``review_fixes`` 必须是真实应用的修复条数，不能拿意见条数充数。"""
+
+    class Outcome:
+        def __init__(self):
+            self.evidence = [_evidence()]
+            self.applied = [{"clause_no": "6.1"}]
+
+    async def fake_review(evidence, *, model_call):
+        del evidence, model_call
+        return Outcome()
+
+    monkeypatch.setattr(tool_module, "POWER_SPEC_CLAUSE_REVIEW_ENABLED", True)
+    monkeypatch.setattr(tool_module, "review_clause_metadata", fake_review)
+    monkeypatch.setattr(tool_module, "_context_model_call", lambda _context: object())
+
+    reviewed, fixes = await tool_module._review_clause_metadata(Context(), [_evidence()])
+
+    assert fixes == 1
+    assert len(reviewed) == 1
 
 
 @pytest.mark.asyncio

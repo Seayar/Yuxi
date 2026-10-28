@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from yuxi.agents.context import AGENT_RUNTIME_RESOURCE_FIELDS
 from yuxi.agents.presets import AgentPreset
 from yuxi.agents.presets.default_chatbot import PRESET as DEFAULT_AGENT
+from yuxi.agents.thinking import thinking_steps_payload
 from yuxi.permissions import ResourcePermission, normalize_permission_config, resolve_agent_permission
 from yuxi.storage.postgres.models_business import Agent, User
 from yuxi.utils.datetime_utils import utc_now_naive
@@ -151,6 +152,24 @@ class AgentRepository:
         await self.db.commit()
         await self.db.refresh(agent)
         return agent
+
+    async def fill_preset_context_defaults(self, preset: AgentPreset) -> None:
+        """为已存在的预置智能体补齐新增的 context 默认字段，不覆盖已有配置。"""
+
+        agent = await self.get_by_slug(preset.slug)
+        if agent is None:
+            return
+        config = dict(agent.config_json or {})
+        context = dict(config.get("context") or {})
+        missing = {key: copy.deepcopy(value) for key, value in preset.context.items() if key not in context}
+        if not missing:
+            return
+        context.update(missing)
+        config["context"] = context
+        agent.config_json = config
+        agent.updated_at = utc_now_naive()
+        await self.db.commit()
+        await self.db.refresh(agent)
 
     async def list_visible(self, *, user: User, include_subagent_definitions: bool = False) -> list[Agent]:
         """列出用户可见的主智能体，只有显式请求时才包含子智能体定义。"""
@@ -389,6 +408,7 @@ class AgentRepository:
                 backend_info_cache[cache_key] = backend_info
         data["capabilities"] = backend_info.get("capabilities", [])
         data["metadata"] = backend_info.get("metadata", {})
+        data["thinking_steps"] = thinking_steps_payload(getattr(agent, "slug", "") or "")
         if include_configurable_items:
             data["configurable_items"] = backend_info.get("configurable_items", {})
         return data

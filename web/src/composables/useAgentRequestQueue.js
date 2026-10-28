@@ -148,6 +148,9 @@ export function useAgentRequestQueue({
               tsInner.onGoingConv.msgChunks[requestId] = requestMessages
             }
             tsInner.pendingRequestId = requestId
+            // run_created 到 Run init/首事件之间仍要显示生成中，避免 resetOnGoingConv 后空白。
+            tsInner.isStreaming = true
+            tsInner.replyLoadingVisible = true
             void startRunStream(threadId, data.run_id, '0-0', { requestId })
           }
         } else if (event === 'cancelled' || event === 'rejected' || event === 'failed') {

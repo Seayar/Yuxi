@@ -14,7 +14,10 @@ NEW_REPORT = "### 本轮溯源报告"
 
 
 def _report_payload(markdown: str) -> str:
-    return f'{{"status": "ok", "answer_markdown": "{markdown}"}}'
+    return (
+        '{"status": "ok", "answer_source": "fault_trace", "answer_verified": true, '
+        f'"answer_markdown": "{markdown}"}}'
+    )
 
 
 def _history(*, with_second_turn_tool: bool, second_turn_tool_content: str = _report_payload(NEW_REPORT)):

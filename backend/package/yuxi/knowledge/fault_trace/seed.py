@@ -1,8 +1,8 @@
-"""故障图谱数据导入独立 TuGraph ``kg`` 图（中文 schema）。
+"""故障图谱数据导入历史 TuGraph ``kg`` 图（已废弃，仅用于迁移对照）。
 
-把维护好的 JSON 故障图谱数据以中文标签幂等写入外部 ``kg`` 图，供 ``graph_kg``
-适配器读取。写入使用 Cypher MERGE（按 名称+标签 归并节点、按类型+两端名称归并
-关系），重复导入不会产生重复记录。语义正确性由人工维护与真实图谱回读校验。
+把维护好的 JSON 故障图谱数据以中文标签幂等写入历史 ``kg`` 图，仅用于旧数据迁移对照。
+写入使用 Cypher MERGE（按 名称+标签 归并节点、按类型+两端名称归并关系），重复导入不会
+产生重复记录。语义正确性由人工维护与真实图谱回读校验。
 
 JSON 文件结构：:
 
@@ -38,7 +38,7 @@ from neo4j import GraphDatabase
 
 from yuxi.utils import logger
 
-# 与 graph_kg 适配器保持一致的中文标签/关系
+# 历史 kg 图的中文标签/关系（迁移用）。运行时只读 kg3，读取逻辑在 graph_kg3.py，两者标签体系不同。
 LABEL_DEVICE = "设备实例"
 LABEL_FAULT_MODE = "故障模式"
 LABEL_PHENOMENON = "故障现象"
@@ -249,7 +249,7 @@ def seed_fault_graph_kg(
     password: str,
     seed: dict[str, Any],
 ) -> dict[str, Any]:
-    """把 seed 幂等写入外部 kg 图，返回累计实体/关系计数。"""
+    """把 seed 幂等写入历史 kg 图，返回累计实体/关系计数。"""
 
     counters = {"devices": 0, "fault_modes": 0, "phenomena": 0, "causes": 0, "measures": 0, "triggers": 0}
     edge_count = 0
@@ -358,9 +358,15 @@ def seed_fault_graph_kg(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="导入故障图谱数据到独立 TuGraph kg 图")
+    parser = argparse.ArgumentParser(
+        description="把故障图谱导入历史 TuGraph kg 图（运行时只读 kg3，本命令仅用于历史数据迁移）"
+    )
     parser.add_argument("--uri", required=True, help="TuGraph Bolt 地址，如 bolt://<host>:7688")
-    parser.add_argument("--graph", default="kg", help="图名称，默认 kg")
+    parser.add_argument(
+        "--graph",
+        required=True,
+        help="目标图名称；必须显式指定，避免误把历史数据写进运行时使用的 kg3 图",
+    )
     parser.add_argument("--username", required=True, help="TuGraph 用户名")
     parser.add_argument("--password", required=True, help="TuGraph 密码")
     parser.add_argument("--file", required=True, help="故障图谱 seed JSON 文件路径")

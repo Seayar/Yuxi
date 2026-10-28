@@ -920,8 +920,13 @@ import ProjectSelectionSection from '@/components/ProjectSelectionSection.vue'
 import FallbackAvatar from '@/components/common/FallbackAvatar.vue'
 import { enrichTaskToolCalls, parseToolCallArgs } from '@/components/ToolCallingResult/toolRegistry'
 import { getConversationDisplayItems } from '@/utils/messageGrouping'
+import { hasResidualThinkingSteps, liveThinkingFallbackIndex } from '@/utils/thinkingSteps'
 import { makeChildThreadId } from '@/utils/subagentThread'
-import { isSubagentLaunchToolName, mergeSubagentRunsForDisplay } from '@/utils/subagentRuns'
+import {
+  isInternalSubagentRun,
+  isSubagentLaunchToolName,
+  mergeSubagentRunsForDisplay
+} from '@/utils/subagentRuns'
 import {
   getDockedStatePanelMaxHeight,
   getFloatingStatePanelMaxHeight
@@ -1028,6 +1033,7 @@ const attachmentInitialFiles = ref([])
 const attachmentInitialFilesKey = ref(0)
 const selectedProjectId = ref(AUTO_PROJECT_ID)
 const threadCreationRequestId = ref('')
+const skipRouteSelectThreadId = ref('')
 const isRefreshingState = ref(false)
 const collapsedStateSections = reactive({
   tokenUsageDetails: true,
@@ -2111,7 +2117,7 @@ const subagentDescriptionByToolCallId = computed(() => {
 // 先按真实 run / 工具调用合并流式占位，最后按 child_thread_id 收敛为每个子线程一项。
 const displaySubagentRuns = computed(() => {
   const descByToolCall = subagentDescriptionByToolCallId.value
-  const merged = [...currentSubagentRuns.value]
+  const merged = [...currentSubagentRuns.value].filter((run) => !isInternalSubagentRun(run))
   const runIdIndex = new Map()
   const transientIdIndex = new Map()
   merged.forEach((run, index) => {
@@ -2301,6 +2307,45 @@ const conversations = computed(() => {
   return groupConversationContinuations(activeRunHistoryConvs)
 })
 
+const getPersistedThinkingSteps = (conv) => {
+  const messages = Array.isArray(conv?.messages) ? conv.messages : []
+  const lastMessage = messages.findLast((message) => message.type === 'ai') || null
+  const persisted = lastMessage?.extra_metadata?.thinking_steps
+  return Array.isArray(persisted) ? persisted : []
+}
+
+const currentThinkingSteps = computed(() => {
+  const liveSteps = currentThreadState.value?.thinkingSteps
+  if (Array.isArray(liveSteps) && liveSteps.length) return liveSteps
+  if (currentThreadState.value?.replyLoadingVisible) {
+    return (currentAgent.value?.thinking_steps || []).map((step) => ({
+      ...step,
+      state: 'pending'
+    }))
+  }
+  return getPersistedThinkingSteps(conversations.value.at(-1))
+})
+
+const liveThinkingConversationIndex = computed(() => {
+  // 优先按当前 activeRunId 精确匹配；不能用“最后一条 AI 消息”兜底，否则新一轮开始时
+  // 会挂到上一轮答案上。run_id 尚未回填时只允许落在“流式中且还没有 run”的那一轮。
+  const thread = currentThreadState.value
+  const activeRunId = thread?.activeRunId
+  if (activeRunId) {
+    return conversations.value.findLastIndex(
+      (conv) =>
+        conv.run?.run_id === activeRunId ||
+        (conv.messages || []).some(
+          (message) => message.type === 'ai' && getMessageRunId(message) === activeRunId
+        )
+    )
+  }
+  return liveThinkingFallbackIndex(conversations.value, {
+    activeRunId,
+    streaming: thread?.isStreaming === true || thread?.replyLoadingVisible === true
+  })
+})
+
 /** 间隔超过一小时时，在新用户消息上方显示发送时间。 */
 const getConversationTimeLabel = (conv, previousConv) => {
   const sentAt = conv.messages.find((message) => message.type === 'human')?.created_at
@@ -2325,17 +2370,56 @@ const getConversationTimeLabel = (conv, previousConv) => {
 }
 
 const conversationRows = computed(() => {
-  const rows = conversations.value.map((conv, index) => ({
-    type: 'conversation',
-    key:
-      conv.displayKey ||
-      conv.run?.run_id ||
-      (conv.status === 'streaming' ? 'ongoing-conversation' : `history-${index}`),
-    conv,
-    timeLabel: getConversationTimeLabel(conv, conversations.value[index - 1]),
-    displayItems: getDisplayItems(conv),
-    artifacts: MessageProcessor.extractArtifactsFromConversation(conv)
-  }))
+  const liveThinkingIndex = liveThinkingConversationIndex.value
+  const liveThinkingSteps = currentThinkingSteps.value
+  const hasActiveThinking = hasResidualThinkingSteps(liveThinkingSteps)
+  const showLiveThinking =
+    liveThinkingSteps.length > 0 &&
+    (currentThreadState.value?.isStreaming === true ||
+      currentThreadState.value?.replyLoadingVisible === true ||
+      hasActiveThinking)
+  const rows = conversations.value.map((conv, index) => {
+    const isLiveThinking = showLiveThinking && index === liveThinkingIndex
+    // 流式期间工具卡片由思考面板表达，隐藏同样的工具卡片，避免重复与结束后跳变。
+    const displayItems = getDisplayItems(conv, {
+      thinkingSteps: isLiveThinking ? [] : getPersistedThinkingSteps(conv),
+      hideThinkingTools: isLiveThinking
+    })
+    if (isLiveThinking) {
+      const liveThinkingItem = {
+        type: 'tool-group',
+        key: `live-thinking-${conv.run?.run_id || index}`,
+        toolCalls: [],
+        liveThinking: true,
+        entries: [
+          {
+            type: 'thinking',
+            key: `live-thinking-${conv.run?.run_id || index}`,
+            steps: liveThinkingSteps
+          }
+        ]
+      }
+      const finalMessageIndex = displayItems.findLastIndex(
+        (item) => item.type === 'message' && item.message?.type === 'ai'
+      )
+      if (finalMessageIndex === -1) {
+        displayItems.push(liveThinkingItem)
+      } else {
+        displayItems.splice(finalMessageIndex, 0, liveThinkingItem)
+      }
+    }
+    return {
+      type: 'conversation',
+      key:
+        conv.displayKey ||
+        conv.run?.run_id ||
+        (conv.status === 'streaming' ? 'ongoing-conversation' : `history-${index}`),
+      conv,
+      timeLabel: getConversationTimeLabel(conv, conversations.value[index - 1]),
+      displayItems,
+      artifacts: MessageProcessor.extractArtifactsFromConversation(conv)
+    }
+  })
 
   if (currentThreadConfigNotice.value) {
     const insertAfterCount = Math.max(
@@ -2432,11 +2516,13 @@ const isProcessing = computed(
     isStreaming.value || (hasQueuedRequests.value && currentQueueSnapshot.value.status !== 'paused')
 )
 const isReplyLoading = computed(() => {
-  const threadState = currentThreadState.value
-  return Boolean(threadState?.replyLoadingVisible) && currentQueueSnapshot.value.status !== 'paused'
+  // 队列 paused 时不能再显示“正在生成回复”：用户此时要看到的是“继续队列”入口。
+  if (currentQueueSnapshot.value.status === 'paused') return false
+  return Boolean(currentThreadState.value?.replyLoadingVisible)
 })
 const replyLoadingText = computed(() => {
   const threadState = currentThreadState.value
+  if (threadState?.pendingInterrupt) return '等待确认...'
   if (threadState?.contextCompressing) return '正在压缩上下文...'
   if (hasQueuedRequests.value) return `排队中（${queuedRequestCount.value} 条）...`
   return '正在生成回复...'
@@ -2989,6 +3075,7 @@ const createActiveThread = async (title = '新的对话') => {
     if (!accepted) throw new Error('新对话上下文已变化，请重新发送或添加附件')
 
     threadCreationRequestId.value = ''
+    skipRouteSelectThreadId.value = thread.id
     setCurrentThreadId(thread.id, { force: true })
     return thread.id
   } finally {
@@ -3271,6 +3358,22 @@ const selectThreadFromRoute = async (threadId) => {
     await initAll()
   }
 
+  // 发送新对话时 createActiveThread 会先切换 currentThreadId，随后路由同步到
+  // /agent/:thread_id；这次同步不能重新 selectChat，否则会清掉乐观消息和加载态。
+  if (threadId && threadId === skipRouteSelectThreadId.value) {
+    skipRouteSelectThreadId.value = ''
+    return true
+  }
+  if (skipRouteSelectThreadId.value && threadId !== skipRouteSelectThreadId.value) {
+    skipRouteSelectThreadId.value = ''
+  }
+  if (threadId && threadId === currentChatId.value) {
+    const state = getThreadState(threadId)
+    if (state?.isStreaming || state?.pendingRequestId || state?.replyLoadingVisible) {
+      return true
+    }
+  }
+
   if (!threadId) {
     const previousThreadId = currentThreadId.value
     if (previousThreadId) {
@@ -3383,6 +3486,10 @@ const handleSendMessage = async ({ image, queuePolicy = 'enqueue' } = {}) => {
       }))
     })
     threadState.isStreaming = true
+    // 创建 Run / 首事件到达前就展示反馈，避免优化消息后出现空白等待。
+    threadState.replyLoadingVisible = true
+    threadState.pendingRequestId = requestId
+    threadState.thinkingSteps = []
   } else {
     threadState.queuedRequests.push({
       request_id: requestId,
@@ -3436,7 +3543,8 @@ const handleSendMessage = async ({ image, queuePolicy = 'enqueue' } = {}) => {
       })
       if (!hadActiveRun) {
         threadState.isStreaming = false
-        threadState.replyLoadingVisible = false
+        // 请求已派发但 Run 可能仍在启动；保持加载态直到 init/终态，避免空白。
+        threadState.replyLoadingVisible = true
       }
       await resumeQueuedRequests(threadId, resolveAgentSlugForThread(threadId))
     } else if (runId) {
@@ -3578,6 +3686,8 @@ const handleApprovalWithStream = async (answer) => {
     threadState.pendingInterrupt = null
     threadState.isStreaming = true
     resetOnGoingConv(threadId, { preserveRequestStreams: true })
+    threadState.replyLoadingVisible = true
+    threadState.thinkingSteps = []
     const requestId = createClientRequestId()
     const runResp = await agentApi.createAgentRun({
       query: null,
@@ -3591,6 +3701,7 @@ const handleApprovalWithStream = async (answer) => {
     if (!runId) {
       throw new Error('创建 resume run 失败：缺少 run_id')
     }
+    threadState.pendingRequestId = requestId
     // 首个流事件前读取已持久化的续跑关系；读取失败不能把已创建的 Run 当成创建失败。
     try {
       await fetchThreadMessages({ agentId: currentAgentId.value, threadId })
@@ -3750,11 +3861,13 @@ const getMessageToolCalls = (message) => {
   })
 }
 
-const getDisplayItems = (conv) =>
+const getDisplayItems = (conv, { thinkingSteps = [], hideThinkingTools = false } = {}) =>
   getConversationDisplayItems(conv, {
     enrichToolCalls: getMessageToolCalls,
     runTiming: conv.processTiming || getMessageRun(getLastMessage(conv))?.timing,
-    collapseIntermediate: conv?.status !== 'streaming' && isConversationSettled(conv)
+    collapseIntermediate: conv?.status !== 'streaming' && isConversationSettled(conv),
+    thinkingSteps,
+    hideThinkingTools
   })
 
 const isDisplayMessageProcessing = (conv, displayItem) => {
@@ -3767,8 +3880,13 @@ const isDisplayMessageProcessing = (conv, displayItem) => {
 }
 
 const isToolGroupActive = (conv, itemIndex, displayItems) => {
+  const item = displayItems?.[itemIndex]
+  if (item?.liveThinking) return true
+  const hasThinking = Boolean(item?.entries?.some((entry) => entry.type === 'thinking'))
   return (
-    isReplyLoading.value && conv?.status === 'streaming' && itemIndex === displayItems.length - 1
+    isReplyLoading.value &&
+    conv?.status === 'streaming' &&
+    (itemIndex === displayItems.length - 1 || hasThinking)
   )
 }
 

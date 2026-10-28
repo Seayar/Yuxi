@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 PlanIntentModelCall = Callable[[str], Awaitable[str]]
 
-# kg 图中的设备类型名称清单由 contracts 统一拥有（归一结果必须落在其中）
+# kg3 图中的设备类型名称清单由 contracts 统一拥有（归一结果必须落在其中）
 KG_DEVICE_TYPES = DEVICE_TYPES
 
 # ---------------------------------------------------------------------------
@@ -86,7 +86,7 @@ _DEVICE_NAME_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?<![0-9])\d+\s*[kKＫｋ]\s*\d+"),
 )
 
-# 设备类型关键词 → kg 设备类型名称；顺序即优先级（“开关柜”优先于“断路器”，“杆塔”优先于“绝缘子”）
+# 设备类型关键词 → kg3 设备类型名称；顺序即优先级（“开关柜”优先于“断路器”，“杆塔”优先于“绝缘子”）
 _DEVICE_TYPE_KEYWORDS: tuple[tuple[str, str], ...] = (
     ("开关柜", "开关柜"),
     ("断路器柜", "开关柜"),
@@ -232,7 +232,7 @@ def _match_device_name(text: str) -> str | None:
 
 
 def _match_device_type(text: str) -> str | None:
-    """按关键词把口语设备类型归一到 kg 设备类型名称。"""
+    """按关键词把口语设备类型归一到 kg3 设备类型名称。"""
 
     if not text:
         return None
@@ -264,7 +264,7 @@ def _squeeze(text: str) -> str:
 
 
 def normalize_device_type(raw: str | None) -> str | None:
-    """把口语设备类型归一到 kg 的设备类型名称。
+    """把口语设备类型归一到 kg3 的设备类型名称。
 
     例：主变/站用变/接地变→变压器；箱变→箱式变电站；开关/断路器→断路器（但“开关柜”→开关柜）；
     刀闸→隔离开关；PT→电压互感器；CT→电流互感器；集电线路/配电线路/输电线路/线路→架空线路。

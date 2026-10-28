@@ -53,3 +53,4 @@ async def initialize_agent_presets(db: AsyncSession) -> None:
     repository = AgentRepository(db)
     for preset in presets:
         await repository.ensure_preset(preset)
+        await repository.fill_preset_context_defaults(preset)

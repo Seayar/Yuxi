@@ -2,6 +2,7 @@ import { computed, onScopeDispose, ref, watch } from 'vue'
 import { agentApi } from '@/apis'
 import { processRunSseResponse } from './useAgentRunStream'
 import { normalizeRunSeq } from '@/utils/runStreamResume'
+import { isInternalSubagentRun } from '@/utils/subagentRuns'
 
 const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'interrupted'])
 // HTTP/1.1 下给父流、状态查询和取消请求保留同源连接；额外子 Run 每 2 秒回读。
@@ -83,7 +84,7 @@ export function useSubagentRuns({ scope, runs, enabled = ref(true) }) {
     ([currentScope, active, discovered]) => {
       if (!currentScope || !active) return
       for (const run of discovered || []) {
-        if (!run.run_id || subscriptions.has(run.run_id)) continue
+        if (!run.run_id || subscriptions.has(run.run_id) || isInternalSubagentRun(run)) continue
         const entry = { id: run.run_id, controller: new AbortController(), cursor: '0-0' }
         subscriptions.set(entry.id, entry)
         records.value[entry.id] = { ...run }

@@ -87,3 +87,7 @@ web/src/utils/__tests__/
 
 # 部署与运行期秘密/产物（不入版本控制）
 new-web/certs/
+.scratch
+.testtmp
+# 业务台账导出数据（含真实设备台账，不入版本控制）
+三区台账接口数据_调整版.json

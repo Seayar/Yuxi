@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from yuxi.agents.backends.paths import runtime_workdir_path
 from yuxi.agents.buildin import get_agent_backend
 from yuxi.agents.context import BaseContext, prepare_agent_runtime_context
+from yuxi.agents.thinking import thinking_steps_payload
 from yuxi.agents.skills.service import PERSONAL_SKILL_SOURCE_TYPE
 from yuxi.repositories.agent_repository import AgentRepository
 from yuxi.services.workdir_service import AuthorizedWorkdir
@@ -150,6 +151,8 @@ async def prepare_run_execution(
     configured = (agent_item.config_json or {}).get("context") or {}
     configurable_fields = {item.name for item in fields(context) if item.metadata.get("configurable", True)}
     context.update_config(configured)
+    context.agent_slug = getattr(agent_item, "slug", None)
+    context.thinking_steps = thinking_steps_payload(context.agent_slug or "")
     payload = run.input_payload
     context.update(
         {

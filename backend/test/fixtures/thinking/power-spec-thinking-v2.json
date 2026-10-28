@@ -1,0 +1,92 @@
+{
+  "schema_version": "thinking-fixture/v2",
+  "agent": "power-spec-agent",
+  "events": [
+    {
+      "version": "v1",
+      "agent": "power-spec-agent",
+      "step_id": "parse_query",
+      "step_index": 1,
+      "title": "解析自然语言查询",
+      "state": "completed",
+      "content": "识别为设备参数类问题：110kV 变压器顶层油温限值。",
+      "data": {
+        "query_type": "设备参数查询",
+        "device": "变压器",
+        "voltage": "110kV",
+        "dimensions": ["油温", "限值"],
+        "keywords": ["110kV", "变压器", "顶层油温", "限值"],
+        "needs_confirmation": false,
+        "clarification": null
+      },
+      "started_at": "2026-10-23T13:10:00.000+08:00",
+      "finished_at": "2026-10-23T13:10:00.600+08:00",
+      "elapsed_ms": 600,
+      "error": null
+    },
+    {
+      "version": "v1",
+      "agent": "power-spec-agent",
+      "step_id": "retrieve_kb",
+      "step_index": 2,
+      "title": "检索规程标准知识库",
+      "state": "completed",
+      "content": "问题路召回 30 条、关键词路召回 18 条，合并 36 条候选。",
+      "data": {
+        "kb_id": "kb_xjpfx49cv7",
+        "files_ready": 9,
+        "vector_count": 30,
+        "keyword_count": 18,
+        "candidate_count": 36,
+        "reranker": "bge-reranker",
+        "degraded": false
+      },
+      "started_at": "2026-10-23T13:10:00.600+08:00",
+      "finished_at": "2026-10-23T13:10:02.200+08:00",
+      "elapsed_ms": 1600,
+      "error": null
+    },
+    {
+      "version": "v1",
+      "agent": "power-spec-agent",
+      "step_id": "locate_clauses",
+      "step_index": 3,
+      "title": "定位相关条款",
+      "state": "completed",
+      "content": "定位 2 条相关条款，投影校验通过。",
+      "data": {
+        "evidence_count": 2,
+        "verified": true,
+        "review_fixes": 0,
+        "warnings": []
+      },
+      "started_at": "2026-10-23T13:10:02.200+08:00",
+      "finished_at": "2026-10-23T13:10:03.000+08:00",
+      "elapsed_ms": 800,
+      "error": null
+    },
+    {
+      "version": "v1",
+      "agent": "power-spec-agent",
+      "step_id": "generate_result",
+      "step_index": 4,
+      "title": "生成检索结果",
+      "state": "completed",
+      "content": "已生成 2 张规范条款卡片。",
+      "data": {
+        "card_count": 2,
+        "answer_source": "power_spec",
+        "answer_verified": true,
+        "internal_steps": {
+          "organizer": "completed",
+          "reviewer": "completed",
+          "issue_count": 0
+        }
+      },
+      "started_at": "2026-10-23T13:10:03.000+08:00",
+      "finished_at": "2026-10-23T13:10:05.500+08:00",
+      "elapsed_ms": 2500,
+      "error": null
+    }
+  ]
+}

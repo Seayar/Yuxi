@@ -46,7 +46,7 @@ pytestmark = pytest.mark.unit
 # 生产环境 ``@tool`` 返回 StructuredTool（可调用体在 .coroutine）；本地桩保持普通异步函数
 GENERATE = getattr(tool_module.generate_maintenance_plan, "coroutine", None) or tool_module.generate_maintenance_plan
 
-KG_OPTION = {"server_url": "bolt://fake:7688", "graph": "kg", "username": "u", "password": "p"}
+KG_OPTION = {"server_url": "bolt://fake:7688", "graph": "kg3", "username": "u", "password": "p"}
 
 
 # ---------------------------------------------------------------------------
@@ -184,7 +184,7 @@ def env(monkeypatch):
 
     _FakeClient.instances = []
     monkeypatch.setattr(tool_module, "fault_trace_opts", _FakeOption(KG_OPTION))
-    monkeypatch.setattr(tool_module, "KgGraphClient", _FakeClient)
+    monkeypatch.setattr(tool_module, "TuGraphClient", _FakeClient)
     recorder = _InterruptRecorder()
     monkeypatch.setattr(tool_module, "interrupt", recorder)
     return SimpleNamespace(monkeypatch=monkeypatch, interrupt=recorder)
@@ -289,7 +289,7 @@ async def test_kg_error_projects_to_not_configured_and_caches(env):
     env.monkeypatch.setattr(tool_module, "extract_plan_intent", fake_intent)
 
     def boom(_n, _q):
-        raise tool_module.KgGraphError("boom")
+        raise tool_module.TuGraphError("boom")
 
     _patch_search(env.monkeypatch, boom)
     context = _context()

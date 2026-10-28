@@ -86,12 +86,14 @@ def valid_seed() -> dict[str, list[dict]]:
 
 
 def test_real_data_preflight_ok():
-    """包内六份真实数据的结构检查通过；区域匹配由独立夹具验证。"""
+    """包内六份真实数据的结构检查通过；缺失台账时管辖区域检查按未通过处理。"""
 
     report = run_preflight(DATA_DIR)
-    assert report["ok"] is True, report["issues"]
     for name, check in report["checks"].items():
+        if name == "班组管辖区域在台账中":
+            continue
         assert check["ok"], (name, check["problems"])
+    assert report["checks"]["班组管辖区域在台账中"]["ok"] is False
     # 七项检查都在
     assert set(report["checks"]) == {
         "键名齐全",
@@ -105,9 +107,24 @@ def test_real_data_preflight_ok():
 
 
 def test_valid_synthetic_seed_ok():
-    report = preflight_seed(valid_seed())
+    report = preflight_seed(valid_seed(), kg_ref=KG_REF)
     assert report["ok"] is True
-    assert report["checks"]["班组管辖区域在台账中"]["note"] == "未提供 kg_ref.json，跳过"
+    assert report["checks"]["班组管辖区域在台账中"]["ok"] is True
+
+
+def test_missing_kg_ref_fails_closed():
+    """缺少台账时无法证明管辖区域在台账中，必须判为未通过而不是跳过。"""
+
+    report = preflight_seed(valid_seed())
+
+    assert report["ok"] is False
+    assert report["checks"]["班组管辖区域在台账中"]["ok"] is False
+    assert any("kg_ref" in issue for issue in report["issues"])
+
+
+def test_run_preflight_rejects_missing_kg_ref_file(tmp_path: Path):
+    with pytest.raises(preflight_module.PreflightError, match="kg_ref"):
+        run_preflight(DATA_DIR, kg_ref_path=tmp_path / "missing.json")
 
 
 def test_missing_key_detected():
