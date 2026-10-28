@@ -20,6 +20,6 @@
 | [上下文压缩](./context-compression.md) | 单一阈值怎样控制工具结果压缩、摘要和主动压缩？ | [中间件](../agents/middleware.md)、[智能体配置](../agents/agents-config.md) |
 | [知识库](./knowledge-base.md) | 文件状态、存储、权限和 Agent 检索怎样连接？ | [知识库教程](../intro/knowledge-base.md)、[文档处理](../advanced/document-processing.md) |
 | [电力规范检索](./power-spec-retrieval.md) | 条款证据怎样从 PDF 变成规范卡片？ | [文档处理](../advanced/document-processing.md)、[配置和开发智能体](../agents/agents-config.md) |
-| [故障溯源](./fault-trace.md) | 故障图片怎样被识别、kg 图数据怎样变成五段式溯源报告？ | [配置系统详解](../advanced/configuration.md)、[配置和开发智能体](../agents/agents-config.md) |
+| [故障溯源](./fault-trace.md) | 故障图片怎样被识别，故障图谱与实时值怎样变成五段式溯源报告？ | [配置系统详解](../advanced/configuration.md)、[配置和开发智能体](../agents/agents-config.md) |
 
 只有当主题有稳定的 Owner、真实 consumer 和可验证链路时，才新增机制页。未来设计放入 roadmap 或 proposed decision，不画进当前运行图。

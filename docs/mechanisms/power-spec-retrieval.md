@@ -75,7 +75,7 @@ sequenceDiagram
   participant V as 校验与渲染
 
   U->>A: 电力规范问题
-  A->>T: query_text, confirmed_intent=false
+  A->>T: query_text
   T-->>U: interrupt 意图确认卡片
   U->>T: 确认继续
   T->>M: hybrid 召回 + rerank
@@ -88,7 +88,7 @@ sequenceDiagram
 
 ### 意图确认
 
-工具第一次调用时使用 `confirmed_intent=false`。此时它先调用模型识别意图，把用户问题重述为完整可检索的规范问题，并给出查询类型、设备、电压等级、问题维度和检索关键词，然后调用 LangGraph 的 `interrupt` 展示确认卡片。
+工具第一次调用时只接收 `query_text`；`confirmed_intent` 不在工具输入契约里，模型无法通过参数跳过确认。工具先调用模型识别意图，把用户问题重述为完整可检索的规范问题，并给出查询类型、设备、电压等级、问题维度和检索关键词，然后调用 LangGraph 的 `interrupt` 展示确认卡片。
 
 用户在确认卡片上选择继续后，恢复的是同一次工具调用，因此业务提示词要求模型不要重新调用工具，也不要把确认结果当作新的查询参数。
 
@@ -403,7 +403,7 @@ async def main():
     runtime = type("Runtime", (), {"context": Context()})()
     result = await search_power_spec.coroutine(
         query_text="110kV变压器的温升限值是多少",
-        confirmed_intent=True,
+        confirmed_intent=True,  # 仅本地调试：跳过确认卡片；模型无法通过工具参数传入
         runtime=runtime,
     )
     if isinstance(result, str):

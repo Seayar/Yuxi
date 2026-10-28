@@ -44,6 +44,21 @@ Compose 默认按单 worker、100 个同时运行的 AgentRun 配置。执行槽
 
 推荐值、1/10/20/50/100 并发的延迟和资源实测、取消 key 轮询的负载模型及完整验证命令见 [Agent 并发容量](./agent-concurrency-capacity.md)。所有可覆盖变量仍集中列在仓库根 `.env.template`，不另外维护重复配置清单。
 
+## 故障溯源
+
+故障溯源的运行参数分属两类：图连接与图片识别服务走管理员系统配置（`fault_trace_opts`、`fault_image_opts`），环境变量只在系统配置留空时兜底；实时值 Redis 只读环境变量。所有可覆盖变量的默认值集中列在仓库根 `.env.template` 的 `fault trace` 分区。
+
+| 变量 | 读取者 | 缺省与条件 |
+|---|---|---|
+| `FAULT_TRACE_GRAPH_URI`、`FAULT_TRACE_GRAPH`、`FAULT_TRACE_GRAPH_USERNAME`、`FAULT_TRACE_GRAPH_PASSWORD` | `fault_trace_opts` → `TuGraphClient` | 系统配置优先；`FAULT_TRACE_GRAPH` 缺省回退 `kg3`；地址、图名、用户名、密码任一为空时工具返回“故障溯源知识库未配置” |
+| `FAULT_TRACE_REDIS_URL` | `fault_trace/realtime.py` | 为空时回退应用 `REDIS_URL`；两者都为空时属性状态为 `not_configured` |
+| `FAULT_TRACE_REDIS_DB` | `fault_trace/realtime.py` | 缺省 `0`；非整数按 `0` 处理 |
+| `FAULT_TRACE_REDIS_PREFIX` | `fault_trace/realtime.py` | 缺省空串；key 形如 `{prefix}{台账ID}:{属性}` |
+| `YOLO_FAULT_BASE_URL` | `fault_image_opts` → `yolo_service` | 系统配置优先；两者都为空时识别返回“故障识别服务未配置” |
+| `TUGRAPH_CONNECT_TIMEOUT`、`TUGRAPH_QUERY_TIMEOUT` | `agents/toolkits/tugraph.py` | 连接缺省 5 秒、查询事务超时缺省 10 秒；查询超时以 bolt 事务配置下发，是否执行取决于 TuGraph 对 bolt 事务配置的支持 |
+
+`FAULT_TRACE_REDIS_URL` 与 `YOLO_FAULT_BASE_URL` 在 API 与 worker 的容器环境里都必须存在，否则容器读不到宿主机的同名变量。
+
 ## 修改后的确认方式
 
 修改系统配置后，重新打开配置页面确认保存值，并用一次真实请求确认行为。只看到 HTTP 200 或提示“保存成功”不能证明模型、OCR 或检索链路已经可用。

@@ -4,6 +4,8 @@
 类型：feature
 Owner：backend/package/yuxi/knowledge/maintenance_plan/tool.py
 
+> 现状：2026-10-28 起处置方案与故障溯源共用 TuGraph `kg3`，seed 默认写入 kg3 且要求提供 `kg_ref.json`；图谱迁移与公开路由移除见[故障图谱迁移到 kg3 并移除公开故障路由](./2026-10-28-fault-trace-kg3-and-route-removal.md)。本文中的 `kg` 指首次交付时的旧图。
+
 ## 问题
 
 `需求_处置方案生成.md` 与 `ref/原型_V0.1.0.0.html` 定义了「处置方案生成」需求：用户以文字/语音输入运维任务
@@ -27,7 +29,7 @@ Owner：backend/package/yuxi/knowledge/maintenance_plan/tool.py
 2. **图谱链路**：`graph_plan.search_devices` 在 `设备实例` 台账中召回打分（名称/层级路径/设备类型/电压综合），
    候选不唯一时 `interrupt` 让用户选；`graph_plan.collect_plan_evidence` 收集层级祖先、停电范围、作业模板与
    依据条款、试验/巡视项目、安全距离、管辖班组、备品备件，每步写 `retrieval_log`。设备定位与证据收集是
-   确定性只读查询，中断重放不产生副作用。kg 连接复用管理员已配置的 `fault_trace_opts`（同一个 `kg` 图）。
+   确定性只读查询，中断重放不产生副作用。连接复用管理员已配置的 `fault_trace_opts`（同一个 `kg3` 图）。
 3. **装配链路**：`answer.produce_maintenance_plan_answer` 用模板 + 证据确定性装配六段式方案、生成 Markdown 与
    “思考过程”，并由 `verify_report` 做前置校验门（报告里每个数字必须作为完整数字出现在证据中，条款号必须来自
    模板的依据条款）；校验不过不通过发布门。
@@ -56,9 +58,9 @@ Owner：backend/package/yuxi/knowledge/maintenance_plan/tool.py
 
 - **方案内容交给大模型润色/生成**：方案内容是安全规程，必须逐条可追溯。实际选择是只从图谱证据确定性装配，
   模型仅用于意图解析（temperature 0），装配后再用 `verify_report` 做完整数字集合与条款来源校验。
-- **用电连接拓扑推导停电范围**：`kg` 台账的电连接边几乎为空（只有 3 条演示边），无法支撑拓扑分析。实际选择是
+- **用电连接拓扑推导停电范围**：`kg3` 台账的电连接边几乎为空（只有 3 条演示边），无法支撑拓扑分析。实际选择是
   按设备台账层级推导，并在方案中固定注明“依据设备台账层级推导，执行前须以调度下达的停电范围为准”。
-- **新增独立的 kg 连接配置项**：会与故障溯源重复维护同一张 `kg` 图的连接信息。实际选择是复用 `fault_trace_opts`。
+- **新增独立的 kg 连接配置项**：会与故障溯源重复维护同一张 `kg3` 图的连接信息。实际选择是复用 `fault_trace_opts`。
 - **重名设备由模型自行挑选或默认取第一条**：台账重名普遍（如 `992SVG开关` 当前在 35kV#1、#2、#3 变电站各一台），
   静默选一个会给出错误对象的作业方案。实际选择是候选不唯一时走 `interrupt` 让用户确认（SRS 方案二）。
 - **班组/备件直接对接生产管理系统**：本期无接口。实际选择是先入演示数据并在方案中如实标注
