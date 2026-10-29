@@ -40,7 +40,9 @@ services:
     ports:
       - "${YUXI_NEW_WEB_TUGRAPH_PORT:-8081}:80"
     volumes:
-      - ./tugraph:/usr/share/nginx/graph:ro
+      # resource 目录以读写挂载：容器内还要把 index.html 作为单文件挂到它下面，
+      # 只读挂载会让 Docker 无法创建该挂载点（nginx 本身不写这个目录）。
+      - ./tugraph:/usr/share/nginx/graph
       - ./tugraph-index.html:/usr/share/nginx/graph/index.html:ro
       - ./nginx-tugraph.conf:/etc/nginx/conf.d/default.conf:ro
       - ../docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
