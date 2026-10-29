@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-import hashlib
+import base64
+import binascii
 import json
 import re
 from collections.abc import Awaitable, Callable
@@ -344,54 +345,64 @@ def build_intent_plan(query: PowerSpecQuery) -> dict[str, Any]:
     }
 
 
-# 确认卡片把计划指纹写进选项值，随用户选择持久化到 checkpoint；resume 重放时按同一指纹
-# 校验重算的计划，避免执行用户没有确认过的另一份计划。
+# 确认卡片把「用户确认的计划」整体编码进选项值，随用户选择持久化到 checkpoint。
+# resume 重放时直接用它作为检索条件：用户确认的就是最终口径，不拿模型重算结果去校验它。
 CONFIRM_VALUE_PREFIX = "confirm#"
 
 
-def intent_plan_signature(intent_plan: dict[str, Any]) -> tuple[str, ...]:
-    """确认计划的可比对字段：只覆盖确认卡片上用户实际看到并确认的语义。
+def encode_confirmed_plan(intent_plan: dict[str, Any]) -> str:
+    """把确认计划编码进选项值；只保留重建检索条件所需的字段。"""
 
-    检索关键词（``normalized_terms``/``unknown_terms``）与重述句（``normalized_query``）
-    由模型生成，同一提示词重跑也会变化；把它们算进指纹会让恢复正常失败。维度按集合比较，
-    不因模型输出顺序不同而判为不一致。
-    """
-
-    dimensions = intent_plan.get("answer_dimensions") or ()
-    return (
-        f"intent={intent_plan.get('intent')!r}",
-        f"device_type={intent_plan.get('device_type')!r}",
-        f"voltage_level={intent_plan.get('voltage_level')!r}",
-        f"answer_dimensions={tuple(sorted(str(item) for item in dimensions))!r}",
-    )
+    payload = json.dumps(intent_plan, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii").rstrip("=")
 
 
-def plan_token(intent_plan: dict[str, Any]) -> str:
-    """计划指纹的短哈希；作为确认选项值的一部分往返。"""
-
-    payload = json.dumps(intent_plan_signature(intent_plan), ensure_ascii=False)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
-
-
-def parse_confirmation_token(value: Any) -> str | None:
-    """从确认结果里取出随卡片往返的计划指纹；没有指纹时返回 None。"""
+def decode_confirmed_plan(value: Any) -> dict[str, Any] | None:
+    """从确认结果里还原用户确认过的计划；没有或不合法时返回 None。"""
 
     if isinstance(value, dict):
         for item in value.values():
-            token = parse_confirmation_token(item)
-            if token is not None:
-                return token
+            plan = decode_confirmed_plan(item)
+            if plan is not None:
+                return plan
         return None
     if isinstance(value, (list, tuple)):
         for item in value:
-            token = parse_confirmation_token(item)
-            if token is not None:
-                return token
+            plan = decode_confirmed_plan(item)
+            if plan is not None:
+                return plan
         return None
     text = str(value or "").strip()
-    if text.startswith(CONFIRM_VALUE_PREFIX):
-        return text[len(CONFIRM_VALUE_PREFIX) :] or None
-    return None
+    if not text.startswith(CONFIRM_VALUE_PREFIX):
+        return None
+    encoded = text[len(CONFIRM_VALUE_PREFIX) :]
+    try:
+        padded = encoded + "=" * (-len(encoded) % 4)
+        plan = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+    except (ValueError, binascii.Error, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return plan if isinstance(plan, dict) else None
+
+
+def query_from_confirmed_plan(plan: dict[str, Any], *, fallback: PowerSpecQuery) -> PowerSpecQuery:
+    """用用户确认的计划重建检索条件；字段不合法时退回调用方给出的查询。"""
+
+    query_text = str(plan.get("normalized_query") or "").strip()
+    if not query_text:
+        return fallback
+    try:
+        return PowerSpecQuery(
+            query=query_text,
+            intent=str(plan.get("intent") or fallback.intent),
+            device_name=plan.get("device_name") or fallback.device_name,
+            device_type=plan.get("device_type"),
+            voltage_level=plan.get("voltage_level"),
+            answer_dimensions=[str(item) for item in (plan.get("answer_dimensions") or [])],
+            normalized_terms=[str(item) for item in (plan.get("normalized_terms") or [])],
+            unknown_terms=[str(item) for item in (plan.get("unknown_terms") or [])],
+        )
+    except (ValueError, TypeError):
+        return fallback
 
 
 def build_confirmation_payload(intent_plan: dict[str, Any]) -> dict[str, Any]:
@@ -411,7 +422,7 @@ def build_confirmation_payload(intent_plan: dict[str, Any]) -> dict[str, Any]:
                     f"问题维度={', '.join(intent_plan['answer_dimensions']) or '未识别'}。是否正确？"
                 ),
                 "options": [
-                    {"label": "正确，继续检索", "value": f"{CONFIRM_VALUE_PREFIX}{plan_token(intent_plan)}"},
+                    {"label": "正确，继续检索", "value": f"{CONFIRM_VALUE_PREFIX}{encode_confirmed_plan(intent_plan)}"},
                     {"label": "不正确，我要补充/修改", "value": "correct"},
                 ],
                 "multi_select": False,

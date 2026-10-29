@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 from collections.abc import Awaitable, Callable
@@ -356,54 +355,9 @@ def build_intent_plan(query: FaultTraceQuery) -> dict[str, Any]:
     }
 
 
-# 确认卡片把计划指纹放进选项值，随用户选择持久化到 checkpoint；resume 重放时按同一指纹
-# 校验重算的计划，避免执行用户没有确认过的另一份计划。
-CONFIRM_VALUE_PREFIX = "confirm#"
-
-
-def intent_plan_signature(intent_plan: dict[str, Any]) -> tuple[str, ...]:
-    """确认计划的可比对字段：只覆盖确认卡片上用户实际看到并确认的设备与现象。
-
-    现象按集合比较，不因模型输出顺序或重复而判为不一致；图片识别结果属于用户确认过的
-    内容，一并纳入。
-    """
-
-    phenomena = intent_plan.get("phenomena") or ()
-    return (
-        f"device_name={str(intent_plan.get('device_name') or '')!r}",
-        f"device_type={str(intent_plan.get('device_type') or '')!r}",
-        f"voltage_level={str(intent_plan.get('voltage_level') or '')!r}",
-        f"image_fault_name={str(intent_plan.get('image_fault_name') or '')!r}",
-        f"phenomena={tuple(sorted({str(item) for item in phenomena}))!r}",
-    )
-
-
-def plan_token(intent_plan: dict[str, Any]) -> str:
-    """计划指纹的短哈希；作为确认选项值的一部分往返。"""
-
-    payload = json.dumps(intent_plan_signature(intent_plan), ensure_ascii=False)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
-
-
-def parse_confirmation_token(value: Any) -> str | None:
-    """从确认结果里取出随卡片往返的计划指纹；没有指纹时返回 None。"""
-
-    if isinstance(value, dict):
-        for item in value.values():
-            token = parse_confirmation_token(item)
-            if token is not None:
-                return token
-        return None
-    if isinstance(value, (list, tuple)):
-        for item in value:
-            token = parse_confirmation_token(item)
-            if token is not None:
-                return token
-        return None
-    text = str(value or "").strip()
-    if text.startswith(CONFIRM_VALUE_PREFIX):
-        return text[len(CONFIRM_VALUE_PREFIX) :] or None
-    return None
+# 确认卡片的“正确”选项就是一个普通确认值。恢复时直接按已确认继续，不拿模型重算的
+# 计划做一致性校验：用户确认即最终口径，模型识别偏差由用户的修正流程处理。
+CONFIRM_VALUE = "confirm"
 
 
 def build_confirmation_payload(intent_plan: dict[str, Any]) -> dict[str, Any]:
@@ -428,7 +382,7 @@ def build_confirmation_payload(intent_plan: dict[str, Any]) -> dict[str, Any]:
                 "question_id": INTENT_QUESTION_ID,
                 "question": question,
                 "options": [
-                    {"label": "正确，继续溯源", "value": f"{CONFIRM_VALUE_PREFIX}{plan_token(intent_plan)}"},
+                    {"label": "正确，继续溯源", "value": CONFIRM_VALUE},
                     {"label": "不正确，我要补充/修改", "value": "correct"},
                 ],
                 "multi_select": False,
@@ -482,8 +436,6 @@ def parse_intent_confirmation(value: Any) -> tuple[str, str | None]:
         return "invalid", None
     if isinstance(value, str):
         text = value.strip()
-        if text.startswith(CONFIRM_VALUE_PREFIX):
-            return "confirm", None
         if text.lower() in {"confirm", "confirmed"} or text in {"正确，继续溯源", "正确"}:
             return "confirm", None
         if text.lower() in {"correct", "reject"} or text in {"不正确，我要补充/修改", "不正确"}:

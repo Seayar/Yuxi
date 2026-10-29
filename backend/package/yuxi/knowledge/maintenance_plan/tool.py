@@ -53,9 +53,18 @@ from yuxi.knowledge.maintenance_plan.contracts import (
 from yuxi.knowledge.maintenance_plan.intent import extract_plan_intent, rule_extract
 from yuxi.utils import logger
 
-# ``graph_plan`` 在函数内延迟导入：本模块由 ``yuxi.agents.toolkits`` 在包初始化时导入，
+# ``graph_plan`` 在调用时延迟导入：本模块由 ``yuxi.agents.toolkits`` 在包初始化时导入，
 # 而 ``graph_plan`` 又依赖 ``yuxi.agents.toolkits``；模块级互相导入会让
 # ``import yuxi.knowledge.maintenance_plan.graph_plan`` 先失败于循环导入。
+
+
+def _graph_plan():
+    """调用时解析 ``graph_plan`` 模块；测试与调用方对模块属性的替换因此仍然生效。"""
+
+    from yuxi.knowledge.maintenance_plan import graph_plan
+
+    return graph_plan
+
 
 # 意图识别开关与模型调用参数（与故障溯源同款，只有开关名换成本模块的）
 MAINTENANCE_PLAN_INTENT_ENABLED = os.getenv("MAINTENANCE_PLAN_INTENT_ENABLED", "true").strip().lower() not in {
@@ -129,14 +138,12 @@ async def generate_maintenance_plan(query_text: str, runtime: ToolRuntime = None
         query = resolved
 
     client = TuGraphClient(config)
-    from yuxi.knowledge.maintenance_plan.graph_plan import collect_plan_evidence
-
     try:
         located = await _locate_device(client, query, model_call=model_call, rounds=rounds)
         if isinstance(located, str):
             return located
         query, device = located
-        evidence = await asyncio.to_thread(collect_plan_evidence, client, query, device)
+        evidence = await asyncio.to_thread(_graph_plan().collect_plan_evidence, client, query, device)
     except TuGraphError as exc:
         logger.warning(f"处置方案图谱查询失败: {exc}")
         return _remember(context, PLAN_GRAPH_NOT_CONFIGURED_MESSAGE)
@@ -224,10 +231,8 @@ async def _locate_device(
     ``MAX_CHOICE_ROUNDS``），用户没有给出可用选择时在预算内重发中断。
     """
 
-    from yuxi.knowledge.maintenance_plan.graph_plan import search_devices
-
     while True:
-        candidates = await asyncio.to_thread(search_devices, client, query)
+        candidates = await asyncio.to_thread(_graph_plan().search_devices, client, query)
         if not candidates:
             return NO_DEVICE_MESSAGE
         picked = _pick_device(candidates, query, rounds)

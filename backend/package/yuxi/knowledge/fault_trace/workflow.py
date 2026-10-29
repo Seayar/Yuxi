@@ -39,7 +39,6 @@ from yuxi.knowledge.fault_trace.contracts import (
     IMAGE_NOT_FOUND_MESSAGE,
     IMAGE_NO_FAULT_MESSAGE,
     IMAGE_SERVICE_UNAVAILABLE_MESSAGE,
-    INTENT_PLAN_CHANGED_MESSAGE,
     NO_FAULT_GRAPH_MESSAGE,
     REALTIME_UNAVAILABLE_STATUSES,
     REL_CAUSE_TYPE,
@@ -69,9 +68,7 @@ from yuxi.knowledge.fault_trace.intent import (
     build_intent_plan,
     extract_correction_text,
     extract_fault_trace_intent,
-    parse_confirmation_token,
     parse_intent_confirmation,
-    plan_token,
 )
 from yuxi.knowledge.fault_trace.ledger import LedgerDevice, ledger_repository
 from yuxi.knowledge.fault_trace.realtime import read_realtime_values
@@ -889,20 +886,8 @@ async def _prepare_device(
         answer = interrupt(build_confirmation_payload(intent_plan))
         decision, correction = parse_intent_confirmation(answer)
         if decision == "confirm":
-            # 会回传选项值的客户端（web/ 的确认卡片）带计划指纹，与重算结果不一致时拒绝执行；
-            # 未回传指纹的客户端只能按既有行为放行，并留下可观察的告警，不能把用户永久挡在
-            # 确认循环里。
-            confirmed_token = parse_confirmation_token(answer)
-            if confirmed_token is None:
-                logger.warning("故障溯源确认恢复值缺少计划指纹，按已确认处理（客户端未回传选项值）")
-            elif confirmed_token != plan_token(intent_plan):
-                emitter.emit(
-                    "parse_fault",
-                    "failed",
-                    content=INTENT_PLAN_CHANGED_MESSAGE,
-                    error={"code": "intent_plan_changed", "message": INTENT_PLAN_CHANGED_MESSAGE},
-                )
-                return INTENT_PLAN_CHANGED_MESSAGE
+            # 用户确认即最终口径：直接按已校验的设备继续，不拿模型重算的计划做一致性校验。
+            return prepared
             return prepared
         if decision == "invalid" or not correction:
             correction = extract_correction_text(interrupt(build_correction_payload(intent_plan)))

@@ -101,22 +101,26 @@ def test_input_constraint_image_only_still_needs_text():
     assert applied.clarification_required is False
 
 
-def test_plan_token_tracks_device_and_phenomena_only():
-    """指纹覆盖用户确认的设备与现象，现象顺序与重复不影响结果。"""
+def test_confirmation_payload_uses_plain_confirm_value():
+    """确认卡片的“正确”选项就是普通确认值，恢复时不需要再和重算结果比对。"""
 
-    base = {
-        "device_name": "3B-7Y",
-        "device_type": "架空线路",
-        "voltage_level": "10kV",
-        "phenomena": ["树木倒伏", "放电"],
-        "image_fault_name": "异物",
-    }
-
-    assert intent_module.plan_token(base) == intent_module.plan_token(
-        {**base, "phenomena": ["放电", "树木倒伏", "树木倒伏"]}
+    payload = intent_module.build_confirmation_payload(
+        {
+            "device_name": "3B-7Y",
+            "device_type": "架空线路",
+            "voltage_level": "10kV",
+            "phenomena": ["树木倒伏"],
+            "image_fault_name": None,
+        }
     )
-    assert intent_module.plan_token(base) != intent_module.plan_token({**base, "device_name": "3B-8Y"})
-    assert intent_module.plan_token(base) != intent_module.plan_token({**base, "phenomena": ["树木倒伏"]})
+
+    option = payload["questions"][0]["options"][0]
+    assert option["label"] == "正确，继续溯源"
+    assert option["value"] == intent_module.CONFIRM_VALUE
+    assert intent_module.parse_intent_confirmation({payload["questions"][0]["question_id"]: option["value"]}) == (
+        "confirm",
+        None,
+    )
 
 
 def test_confirmation_payload_and_parse():

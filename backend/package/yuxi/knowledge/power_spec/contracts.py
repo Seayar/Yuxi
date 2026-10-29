@@ -24,13 +24,11 @@ PowerSpecIntent = Literal["设备参数查询", "检修标准查询", "安全规
 NO_EVIDENCE_MESSAGE = "未检索到资料"
 KNOWLEDGE_BASE_NOT_READY_MESSAGE = "电力规范知识库尚未完成条款级重建"
 INTENT_ATTEMPTS_EXHAUSTED_MESSAGE = "多次未确认问题意图，请重新描述您的电力规范问题"
-INTENT_PLAN_CHANGED_MESSAGE = "意图识别结果与已确认内容不一致，请重新确认检索问题"
 PLAIN_TOOL_MESSAGES = frozenset(
     {
         NO_EVIDENCE_MESSAGE,
         KNOWLEDGE_BASE_NOT_READY_MESSAGE,
         INTENT_ATTEMPTS_EXHAUSTED_MESSAGE,
-        INTENT_PLAN_CHANGED_MESSAGE,
     }
 )
 

@@ -35,7 +35,6 @@ IMAGE_NOT_FOUND_MESSAGE = "未找到该设备的故障图片，且描述中缺�
 IMAGE_NO_FAULT_MESSAGE = "图片中未识别到故障现象，且描述中缺少故障现象，请补充故障现象后重新提交"
 IMAGE_SERVICE_UNAVAILABLE_MESSAGE = "故障图片识别服务暂时不可用，请补充故障现象或稍后重试"
 REPORT_VERIFICATION_FAILED_MESSAGE = "溯源报告未通过证据校验，暂不发布；请补充实时数据或稍后重试"
-INTENT_PLAN_CHANGED_MESSAGE = "意图识别结果与已确认内容不一致，请重新确认故障设备与现象"
 # 意图识别阶段的澄清话术：与发布门共用同一份文案，避免工具与契约各写一句。
 CLARIFY_INFO_MISSING_MESSAGE = "未能识别完整的故障信息，请明确故障设备和故障现象"
 CLARIFY_PHENOMENON_MISSING_MESSAGE = (
@@ -53,7 +52,6 @@ PLAIN_TOOL_MESSAGES = frozenset(
         IMAGE_NO_FAULT_MESSAGE,
         IMAGE_SERVICE_UNAVAILABLE_MESSAGE,
         REPORT_VERIFICATION_FAILED_MESSAGE,
-        INTENT_PLAN_CHANGED_MESSAGE,
         CLARIFY_INFO_MISSING_MESSAGE,
         CLARIFY_PHENOMENON_MISSING_MESSAGE,
     }

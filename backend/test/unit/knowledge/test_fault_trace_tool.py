@@ -16,7 +16,6 @@ from yuxi.knowledge.fault_trace.contracts import (
     FAULT_GRAPH_UNAVAILABLE_MESSAGE,
     FAULT_TRACE_AGENT_SLUG,
     IMAGE_NOT_FOUND_MESSAGE,
-    INTENT_PLAN_CHANGED_MESSAGE,
     NO_FAULT_GRAPH_MESSAGE,
     FaultTraceQuery,
     RealtimeValue,
@@ -504,9 +503,7 @@ async def test_trace_fault_confirms_after_device_validation(monkeypatch):
         workflow_module,
         "interrupt",
         # 模拟前端点“正确，继续溯源”：把卡片上展示的选项值原样回传，含计划指纹。
-        lambda payload: {
-            payload["questions"][0]["question_id"]: payload["questions"][0]["options"][0]["value"]
-        },
+        lambda payload: {payload["questions"][0]["question_id"]: payload["questions"][0]["options"][0]["value"]},
     )
 
     result = await FAULT_FN(
@@ -666,25 +663,15 @@ async def test_trace_fault_uses_model_summary_and_reasoning(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_trace_fault_rejects_plan_changed_after_confirmation(monkeypatch):
-    """恢复后重放识别出的计划与用户确认过的计划不一致时，不执行新计划。
-
-    真实链路里 ``interrupt`` 在 resume 时返回 checkpoint 中保存的选项值；这里用一个
-    记录首次选项值的假 ``interrupt`` 复现同一行为：用户确认的是第一份计划，重放重算
-    出第二份计划时载荷里的指纹对不上，工具必须返回结构化失败。
-    """
+async def test_trace_fault_continues_when_replay_reidentifies_differently(monkeypatch):
+    """用户确认后重放识别出别的现象时也继续溯源，不返回“不一致”文案。"""
 
     _patch_success(monkeypatch)
-    confirmed: list[str] = []
 
-    def confirm_once(payload):
-        options = payload["questions"][0]["options"]
-        value = options[0]["value"]
-        if not confirmed:
-            confirmed.append(value)
-        return {payload["questions"][0]["question_id"]: confirmed[0]}
+    def confirming(payload):
+        return {payload["questions"][0]["question_id"]: payload["questions"][0]["options"][0]["value"]}
 
-    monkeypatch.setattr(workflow_module, "interrupt", confirm_once)
+    monkeypatch.setattr(workflow_module, "interrupt", confirming)
 
     first = await FAULT_FN(query_text="3B-7Y 通道内树木倒伏压覆导线", runtime=_runtime())
     assert "report" in first
@@ -694,14 +681,15 @@ async def test_trace_fault_rejects_plan_changed_after_confirmation(monkeypatch):
 
     monkeypatch.setattr(workflow_module, "extract_fault_trace_intent", changed_extract)
 
-    result = await FAULT_FN(query_text="3B-7Y 通道异常", runtime=_runtime())
+    second = await FAULT_FN(query_text="3B-7Y 通道异常", runtime=_runtime())
 
-    assert result == INTENT_PLAN_CHANGED_MESSAGE
+    assert "report" in second
+    assert second["report"]["location"]["verdict"] in {"established", "rejected", "unknown"}
 
 
 @pytest.mark.asyncio
-async def test_trace_fault_confirmation_token_survives_replay(monkeypatch):
-    """同一份计划被确认两次（首轮与 resume 重放）时按令牌放行，不重复询问。"""
+async def test_trace_fault_confirmation_value_is_plain_confirm(monkeypatch):
+    """确认卡片的“正确”选项就是普通确认值，不再携带需要比对的信息。"""
 
     _patch_success(monkeypatch)
     asked: list[dict] = []
@@ -712,9 +700,7 @@ async def test_trace_fault_confirmation_token_survives_replay(monkeypatch):
 
     monkeypatch.setattr(workflow_module, "interrupt", confirming)
 
-    first = await FAULT_FN(query_text="3B-7Y 通道内树木倒伏压覆导线", runtime=_runtime())
-    second = await FAULT_FN(query_text="3B-7Y 通道内树木倒伏压覆导线", runtime=_runtime())
+    result = await FAULT_FN(query_text="3B-7Y 通道内树木倒伏压覆导线", runtime=_runtime())
 
-    assert "report" in first and "report" in second
-    assert len(asked) == 2
-    assert asked[0]["questions"][0]["options"][0]["value"].startswith("confirm#")
+    assert "report" in result
+    assert asked[0]["questions"][0]["options"][0]["value"] == "confirm"

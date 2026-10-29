@@ -1,8 +1,7 @@
 """确认卡片在真实 LangGraph 中断/恢复下的行为。
 
-用真实 ``StateGraph`` + ``interrupt`` 证明：resume 时会拿到 checkpoint 里保存的选项值，
-节点重算出的计划与保存值里的指纹可以比对；这样 ``workflow`` 里的“重放重算不一致”守卫
-才有运行时依据，而不是只靠假 ``interrupt`` 的模拟。
+用户点“正确”后，恢复值就是选项值 ``confirm``；节点据此继续，不做任何“与重算结果是否
+一致”的校验。这里用真实 ``StateGraph`` + ``interrupt`` 证明恢复值按保存内容返回。
 """
 
 from __future__ import annotations
@@ -15,37 +14,31 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
 from yuxi.knowledge.fault_trace.intent import (
+    CONFIRM_VALUE,
     build_confirmation_payload,
-    parse_confirmation_token,
     parse_intent_confirmation,
-    plan_token,
 )
 
 pytestmark = pytest.mark.unit
 
-PLANS = [
-    {"device_name": "3B-7Y", "device_type": "架空线路", "voltage_level": "10kV", "phenomena": ["树木倒伏"]},
-    {"device_name": "3B-7Y", "device_type": "架空线路", "voltage_level": "10kV", "phenomena": ["异物搭挂"]},
-]
+PLAN = {
+    "device_name": "3B-7Y",
+    "device_type": "架空线路",
+    "voltage_level": "10kV",
+    "phenomena": ["树木倒伏"],
+    "image_fault_name": None,
+}
 
 
-class _State(TypedDict):
-    plan_index: int
+class _State(TypedDict, total=False):
     result: dict[str, Any]
 
 
-def _build_graph(plans: list[dict[str, Any]]):
-    async def confirm(state: _State):
-        plan = plans[state["plan_index"]]
-        answer = interrupt(build_confirmation_payload(plan))
+def _build_graph() -> Any:
+    async def confirm(_state: _State):
+        answer = interrupt(build_confirmation_payload(PLAN))
         decision, _correction = parse_intent_confirmation(answer)
-        return {
-            "result": {
-                "decision": decision,
-                "confirmed_token": parse_confirmation_token(answer),
-                "expected_token": plan_token(plan),
-            }
-        }
+        return {"result": {"decision": decision, "answer": answer}}
 
     builder = StateGraph(_State)
     builder.add_node("confirm", confirm)
@@ -54,62 +47,31 @@ def _build_graph(plans: list[dict[str, Any]]):
     return builder.compile(checkpointer=InMemorySaver())
 
 
-CONFIG = {"configurable": {"thread_id": "t-1"}}
+@pytest.mark.asyncio
+async def test_resume_returns_saved_confirm_value():
+    """恢复时节点拿到保存的 ``confirm``，直接判定为确认。"""
 
+    graph = _build_graph()
+    config = {"configurable": {"thread_id": "confirm-1"}}
+    first = await graph.ainvoke({}, config=config)
+    question = first["__interrupt__"][0].value["questions"][0]
+    assert question["options"][0]["value"] == CONFIRM_VALUE
 
-async def _interrupt_value(graph: Any, plan_index: int) -> tuple[dict[str, Any], dict[str, Any]]:
-    """跑到中断点，返回展示给用户的载荷与 pending 状态。"""
+    final = await graph.ainvoke(
+        Command(resume={question["question_id"]: question["options"][0]["value"]}), config=config
+    )
 
-    await graph.ainvoke({"plan_index": plan_index, "result": {}}, CONFIG)
-    state = await graph.aget_state(CONFIG)
-    payload = state.tasks[0].interrupts[0].value
-    return payload, state.values
-
-
-def _confirm_answer(payload: dict[str, Any]) -> dict[str, Any]:
-    question = payload["questions"][0]
-    return {question["question_id"]: question["options"][0]["value"]}
+    assert final["result"]["decision"] == "confirm"
 
 
 @pytest.mark.asyncio
-async def test_resume_returns_saved_option_value():
-    """同一份计划恢复时，节点拿到的是 checkpoint 保存的选项值，指纹一致。"""
+async def test_plain_confirm_answer_also_counts():
+    """只回传 ``confirm`` 的客户端同样被当作确认，没有额外校验会失败。"""
 
-    graph = _build_graph(PLANS)
-    payload, _values = await _interrupt_value(graph, 0)
+    graph = _build_graph()
+    config = {"configurable": {"thread_id": "confirm-2"}}
+    await graph.ainvoke({}, config=config)
 
-    final = await graph.ainvoke(Command(resume=_confirm_answer(payload)), CONFIG)
-
-    assert final["result"]["decision"] == "confirm"
-    assert final["result"]["confirmed_token"] == final["result"]["expected_token"]
-
-
-@pytest.mark.asyncio
-async def test_resume_with_changed_plan_is_detectable():
-    """重放重算出另一份计划时，保存值里的指纹与新计划不一致，可被判为漂移。"""
-
-    graph = _build_graph(PLANS)
-    payload, _values = await _interrupt_value(graph, 0)
-    saved_answer = _confirm_answer(payload)
-
-    # 新一次运行（等价于 resume 后重放）用的是不同计划，但恢复值仍是用户确认过的那个。
-    graph_replay = _build_graph(PLANS)
-    await graph_replay.ainvoke({"plan_index": 1, "result": {}}, {"configurable": {"thread_id": "t-2"}})
-    final = await graph_replay.ainvoke(Command(resume=saved_answer), {"configurable": {"thread_id": "t-2"}})
+    final = await graph.ainvoke(Command(resume={"fault_trace_intent_confirm": "confirm"}), config=config)
 
     assert final["result"]["decision"] == "confirm"
-    assert final["result"]["confirmed_token"] != final["result"]["expected_token"]
-
-
-@pytest.mark.asyncio
-async def test_plain_confirm_without_token_stays_detectable():
-    """恢复值只有“confirm”时没有指纹，同样能被识别出来（守卫按不一致处理）。"""
-
-    graph = _build_graph(PLANS)
-    await graph.ainvoke({"plan_index": 0, "result": {}}, CONFIG)
-
-    final = await graph.ainvoke(Command(resume={"fault_trace_intent_confirm": "confirm"}), CONFIG)
-
-    assert final["result"]["decision"] == "confirm"
-    assert final["result"]["confirmed_token"] is None
-    assert final["result"]["confirmed_token"] != final["result"]["expected_token"]

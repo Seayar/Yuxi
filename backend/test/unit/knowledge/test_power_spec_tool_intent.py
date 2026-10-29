@@ -3,14 +3,14 @@ import pytest
 from yuxi.knowledge.power_spec import tool as tool_module
 from yuxi.knowledge.power_spec.contracts import (
     INTENT_ATTEMPTS_EXHAUSTED_MESSAGE,
-    INTENT_PLAN_CHANGED_MESSAGE,
     PowerSpecQuery,
 )
 from yuxi.knowledge.power_spec.intent import (
+    decode_confirmed_plan,
+    encode_confirmed_plan,
     extract_correction_text,
     parse_intent_confirmation,
     parse_power_spec_query,
-    plan_token,
 )
 from yuxi.knowledge.power_spec.tool import NO_EVIDENCE_MESSAGE, search_power_spec
 
@@ -203,88 +203,93 @@ def test_tool_schema_hides_confirmation_from_model():
     assert parsed.model_dump() == {"query_text": QUESTION, "kb_id": None}
 
 
-@pytest.mark.asyncio
-async def test_confirm_without_plan_token_is_accepted(monkeypatch):
-    """不回传选项值的客户端（预构建前端）按已确认放行，不能被永久挡在确认循环里。"""
+def _confirmed_answer(plan: dict) -> dict:
+    """构造“用户点了正确”的恢复值：选项值里带着整份确认计划。"""
 
+    return {"power_spec_intent_confirm": f"confirm#{encode_confirmed_plan(plan)}"}
+
+
+@pytest.mark.asyncio
+async def test_confirmed_plan_is_used_for_retrieval(monkeypatch):
+    """用户确认的计划就是检索条件：重放识别出别的字段时也按确认的计划检索，不报错。"""
+
+    seen: list[PowerSpecQuery] = []
+
+    async def capture(_executor, _config, _kb_id, query, _reranker, _warnings):
+        seen.append(query)
+        return []
+
+    monkeypatch.setattr(tool_module, "_retrieve_for_query", capture)
+    _install(monkeypatch)
+    monkeypatch.setattr(
+        tool_module,
+        "interrupt",
+        lambda _payload: _confirmed_answer(
+            {
+                "intent": "检修标准查询",
+                "device_type": "变压器",
+                "voltage_level": "220kV",
+                "answer_dimensions": ["周期"],
+                "normalized_terms": ["周期", "变压器"],
+                "unknown_terms": [],
+                "normalized_query": "220kV 变压器色谱周期",
+            }
+        ),
+    )
+
+    async def model_redentifies_differently(_query_text, **_kwargs):
+        return PowerSpecQuery(
+            query="110kV 开关柜触头温度限值",
+            intent="设备参数查询",
+            voltage_level="110kV",
+        )
+
+    monkeypatch.setattr(tool_module, "extract_power_spec_intent", model_redentifies_differently)
+
+    result = await search_power_spec.coroutine(query_text=QUESTION, confirmed_intent=False, runtime=Runtime())
+
+    assert result == NO_EVIDENCE_MESSAGE
+    assert seen and seen[-1].voltage_level == "220kV"
+    assert seen[-1].query == "220kV 变压器色谱周期"
+
+
+@pytest.mark.asyncio
+async def test_missing_plan_value_falls_back_to_recomputed_query(monkeypatch):
+    """只回传 confirm 的客户端没有计划可还原，按本次识别的结果检索，同样不报错。"""
+
+    seen: list[PowerSpecQuery] = []
+
+    async def capture(_executor, _config, _kb_id, query, _reranker, _warnings):
+        seen.append(query)
+        return []
+
+    monkeypatch.setattr(tool_module, "_retrieve_for_query", capture)
     _install(monkeypatch, {"power_spec_intent_confirm": "confirm"})
 
     result = await search_power_spec.coroutine(query_text=QUESTION, confirmed_intent=False, runtime=Runtime())
 
     assert result == NO_EVIDENCE_MESSAGE
+    assert seen and seen[-1].voltage_level == "220kV"
 
 
-@pytest.mark.asyncio
-async def test_replay_with_changed_plan_is_rejected(monkeypatch):
-    """重放的识别结果与用户确认过的计划不一致时，不按新计划检索。
+def test_confirmed_plan_roundtrips_through_option_value():
+    """选项值里的计划能原样还原；损坏或旧格式的取值返回 None，不抛异常。"""
 
-    真实链路里 ``interrupt`` 在 resume 时返回 checkpoint 保存的选项值；这里用记录首次
-    选项值的假 ``interrupt`` 复现：用户确认第一份计划，重放重算出第二份计划时应拒绝。
-    """
-
-    confirmed: list[str] = []
-    shown: list[dict] = []
-
-    def confirm_once(payload):
-        shown.append(payload)
-        if not confirmed:
-            confirmed.append(payload["questions"][0]["options"][0]["value"])
-        return {payload["questions"][0]["question_id"]: confirmed[0]}
-
-    _install(monkeypatch)
-    monkeypatch.setattr(tool_module, "interrupt", confirm_once)
-    await search_power_spec.coroutine(query_text=QUESTION, confirmed_intent=False, runtime=Runtime())
-
-    async def changed_intent(query_text, *, model_call=None, previous=None, feedback=None):
-        return PowerSpecQuery(query="110kV 开关柜触头温度限值", intent="设备参数查询", voltage_level="110kV")
-
-    monkeypatch.setattr(tool_module, "extract_power_spec_intent", changed_intent)
-
-    result = await search_power_spec.coroutine(
-        query_text="110kV 开关柜触头温度限值是多少",
-        confirmed_intent=False,
-        runtime=Runtime(),
-    )
-
-    assert result == INTENT_PLAN_CHANGED_MESSAGE
-    assert shown[0]["questions"][0]["options"][0]["value"].startswith("confirm#")
-
-
-def test_plan_token_tracks_only_fields_the_user_confirmed():
-    """指纹只覆盖确认卡片上的语义；模型每次都会变的关键词与重述句不能参与。"""
-
-    base = {
+    plan = {
         "intent": "检修标准查询",
         "device_type": "变压器",
         "voltage_level": "220kV",
         "answer_dimensions": ["周期"],
-        "normalized_terms": ["周期", "变压器", "DGA"],
-        "unknown_terms": ["DGA"],
+        "normalized_terms": ["周期"],
+        "unknown_terms": [],
         "normalized_query": "220kV 变压器色谱周期",
     }
-    volatile = {
-        **base,
-        "normalized_terms": ["周期", "变压器", "检修规程"],
-        "unknown_terms": ["检修规程"],
-        "normalized_query": "220kV 变压器色谱试验多久一次？",
-    }
+    answer = _confirmed_answer(plan)
 
-    assert plan_token(base) == plan_token(volatile)
-    assert plan_token(base) != plan_token({**base, "voltage_level": "110kV"})
-    assert plan_token(base) != plan_token({**base, "answer_dimensions": ["周期", "限值"]})
-
-
-def test_plan_token_ignores_dimension_order():
-    """同一组维度按集合比较，不因模型输出顺序不同而判为不一致。"""
-
-    base = {
-        "intent": "检修标准查询",
-        "device_type": "变压器",
-        "voltage_level": "220kV",
-        "answer_dimensions": ["周期", "限值"],
-    }
-
-    assert plan_token(base) == plan_token({**base, "answer_dimensions": ["限值", "周期"]})
+    assert decode_confirmed_plan(answer) == plan
+    assert decode_confirmed_plan({"power_spec_intent_confirm": "confirm"}) is None
+    assert decode_confirmed_plan({"power_spec_intent_confirm": "confirm#不是base64"}) is None
+    assert decode_confirmed_plan(None) is None
 
 
 def test_parse_intent_confirmation_accepts_frontend_answer_shapes():

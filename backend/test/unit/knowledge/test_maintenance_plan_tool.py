@@ -15,6 +15,7 @@ from typing import Any, TypedDict
 import pytest
 from langgraph.types import interrupt as LANGGRAPH_INTERRUPT
 
+from yuxi.knowledge.maintenance_plan import graph_plan as graph_plan_module
 from yuxi.knowledge.maintenance_plan import tool as tool_module
 from yuxi.knowledge.maintenance_plan.contracts import (
     CHOICE_ABORTED_MESSAGE,
@@ -65,7 +66,7 @@ class _FakeOption:
 class _FakeClient:
     """假 kg 客户端：不查询，只记录实例与 close。"""
 
-    instances: list["_FakeClient"] = []
+    instances: list[_FakeClient] = []
 
     def __init__(self, config) -> None:
         self.config = config
@@ -148,9 +149,7 @@ def _evidence(device: DeviceCandidate, *, template: WorkTemplate | None = None) 
         template=template,
         test_items=["绝缘电阻试验"],
         patrol_items=["外观检查"],
-        safety_distance=SafetyDistance(
-            voltage_level="10kV", no_outage_m=0.7, work_range_m=0.35, live_work_m=0.4
-        ),
+        safety_distance=SafetyDistance(voltage_level="10kV", no_outage_m=0.7, work_range_m=0.35, live_work_m=0.4),
         team=TeamInfo(name="#3开闭所运维班", member_count=4, leader="李工", managed_area="#3开闭所"),
         spares=[SpareInfo(name="断路器", model="ZN63", quantity=2, location="备件库")],
         retrieval_log=["按台账检索到目标设备"],
@@ -199,7 +198,7 @@ def _patch_search(monkeypatch, handler):
         calls.append(query)
         return handler(len(calls), query)
 
-    monkeypatch.setattr(tool_module, "search_devices", fake)
+    monkeypatch.setattr(graph_plan_module, "search_devices", fake)
     return calls
 
 
@@ -212,7 +211,7 @@ def _patch_evidence(monkeypatch, handler):
         calls.append((query, device))
         return handler(query, device)
 
-    monkeypatch.setattr(tool_module, "collect_plan_evidence", fake)
+    monkeypatch.setattr(graph_plan_module, "collect_plan_evidence", fake)
     return calls
 
 
@@ -234,7 +233,9 @@ def _ready_pipeline(env, *, candidates=None, evidence=None, device=None):
 
     target = device or (candidates or [_candidate("LGR#1", "3k18")])[0]
     search_calls = _patch_search(env.monkeypatch, lambda _n, _q: candidates or [target])
-    evidence_calls = _patch_evidence(env.monkeypatch, lambda _q, _d: evidence or _evidence(target, template=_template()))
+    evidence_calls = _patch_evidence(
+        env.monkeypatch, lambda _q, _d: evidence or _evidence(target, template=_template())
+    )
     return search_calls, evidence_calls
 
 
@@ -459,13 +460,13 @@ async def test_device_free_text_triggers_research_with_previous(env):
     resolved = _candidate("LGR#992B", "992SVG开关", path="35kV#2变电站 > 992SVG开关")
     intent_calls = _patch_intent(
         env.monkeypatch,
-        lambda text, previous: _query(device_name="992SVG开关")
-        if previous is None
-        else _query(device_name="992SVG开关", location_hint=text),
+        lambda text, previous: (
+            _query(device_name="992SVG开关")
+            if previous is None
+            else _query(device_name="992SVG开关", location_hint=text)
+        ),
     )
-    search_calls = _patch_search(
-        env.monkeypatch, lambda n, _q: [first, second] if n == 1 else [resolved]
-    )
+    search_calls = _patch_search(env.monkeypatch, lambda n, _q: [first, second] if n == 1 else [resolved])
     evidence_calls = _patch_evidence(env.monkeypatch, lambda _q, d: _evidence(d, template=_template()))
     env.interrupt.values = ["35kV#2变电站"]
 
@@ -743,8 +744,8 @@ async def test_graph_queries_run_in_worker_thread(env):
         seen["evidence"] = threading.current_thread()
         return _evidence(target, template=_template())
 
-    env.monkeypatch.setattr(tool_module, "search_devices", fake_search)
-    env.monkeypatch.setattr(tool_module, "collect_plan_evidence", fake_evidence)
+    env.monkeypatch.setattr(graph_plan_module, "search_devices", fake_search)
+    env.monkeypatch.setattr(graph_plan_module, "collect_plan_evidence", fake_evidence)
 
     result = await GENERATE(query_text="更换#3开闭所3k18断路器", runtime=SimpleNamespace(context=_context()))
 

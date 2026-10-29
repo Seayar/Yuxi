@@ -14,7 +14,6 @@ from yuxi.agents.toolkits.registry import tool
 from yuxi.knowledge.power_spec.answer import build_subagent_caller, produce_power_spec_answer
 from yuxi.knowledge.power_spec.contracts import (
     INTENT_ATTEMPTS_EXHAUSTED_MESSAGE,
-    INTENT_PLAN_CHANGED_MESSAGE,
     KNOWLEDGE_BASE_NOT_READY_MESSAGE,
     NO_EVIDENCE_MESSAGE,
     POWER_SPEC_AGENT_SLUG,
@@ -28,11 +27,11 @@ from yuxi.knowledge.power_spec.intent import (
     build_confirmation_payload,
     build_correction_payload,
     build_intent_plan,
+    decode_confirmed_plan,
     extract_correction_text,
     extract_power_spec_intent,
-    parse_confirmation_token,
     parse_intent_confirmation,
-    plan_token,
+    query_from_confirmed_plan,
 )
 from yuxi.knowledge.power_spec.retrieval import (
     PowerSpecSearchService,
@@ -473,14 +472,11 @@ async def _confirm_intent_with_user(query_text: str, *, context: Any) -> PowerSp
         answer = interrupt(build_confirmation_payload(intent_plan))
         decision, correction = parse_intent_confirmation(answer)
         if decision == "confirm":
-            # 会回传选项值的客户端（web/ 的确认卡片）带计划指纹，与重算结果不一致时拒绝执行；
-            # 未回传指纹的客户端（预构建的 new-web）只能按既有行为放行，并留下可观察的告警，
-            # 不能因为它们不认指纹就把用户永久挡在确认循环里。
-            confirmed_token = parse_confirmation_token(answer)
-            if confirmed_token is None:
-                logger.warning("意图确认恢复值缺少计划指纹，按已确认处理（客户端未回传选项值）")
-            elif confirmed_token != plan_token(intent_plan):
-                return INTENT_PLAN_CHANGED_MESSAGE
+            # 用户确认即最终检索条件：卡片把计划整体随选项值带回，直接用它检索。
+            # 不拿模型重算结果做一致性校验——用户已在卡片上确认，模型识别偏差由用户修正流程处理。
+            confirmed_plan = decode_confirmed_plan(answer)
+            if confirmed_plan is not None:
+                return query_from_confirmed_plan(confirmed_plan, fallback=query)
             return query
         if decision == "invalid" or not correction:
             correction = extract_correction_text(interrupt(build_correction_payload(intent_plan)))
