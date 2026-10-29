@@ -262,6 +262,32 @@ def test_resolve_device_type_falls_back_to_ledger_id_edge():
     assert name == "架空线路"
     assert node["id"] == "DEV#架空线路"
     belongs_queries = [cypher for cypher, params in client.queries if params.get("rel") == "属于"]
-    assert all("ORDER BY" in cypher for cypher in belongs_queries)
+    # TuGraph 4.5.2 的 cypher 计划器不接受 ORDER BY coalesce(...)，排序必须在客户端做。
+    assert all("ORDER BY" not in cypher for cypher in belongs_queries)
     # 空台账 ID 只在设备没有台账 ID 时才会被排除；这里有值，两个条件都应出现在同一条查询里。
     assert all("$device_id" in cypher and "$ledger_id" in cypher for cypher in belongs_queries)
+
+
+def test_resolve_device_type_picks_smallest_name_when_server_order_is_unstable():
+    """服务端返回顺序不稳定：同一组类型节点必须始终取名称/id 最小的一个。"""
+
+    class _UnsortedClient:
+        def __init__(self) -> None:
+            self.queries: list[tuple[str, dict]] = []
+
+        def run(self, cypher: str, **params):
+            self.queries.append((cypher, params))
+            if params.get("rel") != "属于":
+                return []
+            return [
+                {"b": {"名称": "箱式变电站", "id": "DEV#箱式变电站"}},
+                {"b": {"名称": "架空线路", "id": "DEV#架空线路"}},
+            ]
+
+    device = {"id": "LGR#x", "name": "x", "type": "device", "properties": {"台账ID列表": "3b7y"}}
+    client = _UnsortedClient()
+
+    name, node = resolve_device_type(client, device)
+
+    assert name == "架空线路"
+    assert node["id"] == "DEV#架空线路"

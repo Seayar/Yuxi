@@ -80,7 +80,7 @@ def resolve_device_type(client: Any, device: dict[str, Any]) -> tuple[str | None
         records = client.run(
             "MATCH (a)-[r]->(b) WHERE type(r) = $rel AND labels(a)[0] = $src AND labels(b)[0] = $dst "
             f"AND ({' OR '.join(matchers)}) "
-            "RETURN b ORDER BY coalesce(b.名称, '') LIMIT $node_limit",
+            "RETURN b LIMIT $node_limit",
             rel="属于",
             src=KG_DEVICE_LABEL,
             dst=KG_DEVICE_TYPE_LABEL,
@@ -90,7 +90,10 @@ def resolve_device_type(client: Any, device: dict[str, Any]) -> tuple[str | None
         )
         type_nodes = _add_nodes(device_evidence, records, "b", KG_DEVICE_TYPE_LABEL)
         if type_nodes:
-            return str(type_nodes[0].get("name") or "") or None, type_nodes[0]
+            # 排序在客户端完成：TuGraph 4.5.2 的 cypher 计划器不接受 ``ORDER BY coalesce(...)``
+            # （CypherException），而返回顺序本身不稳定。按名称、id 排序保证首项确定。
+            first = min(type_nodes, key=lambda node: (str(node.get("name") or ""), str(node.get("id") or "")))
+            return str(first.get("name") or "") or None, first
 
     properties = device.get("properties") or {}
     device_class = str(properties.get("设备分类") or properties.get("台账分类") or "").strip()
