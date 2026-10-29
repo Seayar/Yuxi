@@ -1,4 +1,4 @@
-# 自有前端独立部署（new-web）
+# 自有前端独立部署（new-web 双服务）
 
 状态：implemented
 类型：architecture
@@ -6,50 +6,52 @@ Owner：new-web/docker-compose.yml
 
 ## 问题
 
-`/root/dist.7z` 是团队自行开发的前端构建产物（Vite 静态站，标题「复杂配电网智能辅助决策系统」，含 `power-search` 电力规范页），与仓库内 `web/`（上游 Yuxi 前端）不是同一份应用。仓库现有的 `web` 服务以 Vite dev server 形态跑上游源码，无法托管这份外部构建产物；需要在不改动上游 `docker-compose.yml`、不重启既有服务的前提下，把该静态站按同源语义部署出来。
+团队自行开发的前端有两份构建产物：
 
-关键约束：构建产物的 `assets/js/config.js` 写死 `window.__backend_api_url = location.origin`，且所有业务请求为 `${origin}/api/...`（含 SSE `/api/agent/runs/{id}/events`）。因此前端必须与其 API 同源，不能直接指向 `:5050`（跨源）。
+- `dist-web-main.7z`：主页面（Vite 静态站，标题「复杂配电网智能辅助决策系统」），`assets/js/config.js` 写死 `window.__backend_api_url = location.origin`，所有业务请求为 `${origin}/api/...`（含 SSE `/api/agent/runs/{id}/events`）。
+- `dist-web-tugraph.7z`：知识图谱页（UMI 静态资源，只有 `resource/**`），主页面通过 `window.__external_page_config.TU_GRAPH.url` 以 iframe 嵌入，并等待子页 `postMessage` 的 `TUGRAPH_READY`。
+
+图谱页运行期还会请求同源 `/api/*`（例如 `/api/get_procedure_demo`）并读取 `/resource/graph-config.json`，因此它必须与 TuGraph DB Web 后端同源；主页面则必须与应用 API 同源。仓库内 `web/` 服务是上游 Yuxi 的 Vite dev server，无法托管这两份构建产物。页面代码还要能从宿主机目录直接替换，用于后续升级前端版本。
 
 ## 决策
 
-在 `new-web/` 下自包含部署，使用 `nginx:alpine` 托管 `new-web/dist`，并反代 `/api/` 到主 compose 的 `api:5050`、`/minio/public/` 到 `minio:9000`，从而形成同源入口。
+在 `new-web/` 下自包含部署，两个 `nginx:alpine` 容器，页面文件全部由宿主机目录挂载：
 
-本记录 Owner 是 `new-web/docker-compose.yml`（拥有部署拓扑：镜像、端口、网络接入、挂载）。站点本身的反代与 SPA 回退语义由 `new-web/nginx.conf` 拥有，静态文件由 `new-web/dist/` 拥有；三者在同一变更中一起生效，任一被改动都需回看本记录。
+| 服务 | 容器 | 宿主机端口 | 挂载与反代 |
+|---|---|---|---|
+| `new-web` | `yuxi-new-web` | `8080`（`YUXI_NEW_WEB_PORT`） | `/usr/share/nginx/html` ← `./dist`；`assets/js/config.js` 单独覆盖；`/api/` → `api:5050`，`/minio/public/` → `minio:9000` |
+| `new-web-tugraph` | `yuxi-new-web-tugraph` | `8081`（`YUXI_NEW_WEB_TUGRAPH_PORT`） | `/usr/share/nginx/graph` ← `./tugraph`；`index.html` 单独覆盖；`/api/` → TuGraph DB Web 后端（当前 `192.168.138.5:8000`） |
 
-- 静态文件放在 `new-web/dist/`（已被 `.gitignore` 的 `dist` 规则忽略，不进入版本控制）。
-- 站点配置 `new-web/nginx.conf` 与主仓库 `docker/nginx/default.conf` 保持同一套反代语义（`proxy_buffering off` 以支持 SSE，`client_max_body_size 20M`）。
-- 独立 `new-web/docker-compose.yml` 通过 `external` 网络接入 `yuxi_app-network`，因此可独立启停、不依赖主 compose 启动顺序，也不把新服务写进会被上游合并频繁改动的根 compose。
-- **HTTPS**：可信入口为 443，自签证书（`new-web/certs/`，gitignored，SAN 覆盖 `192.168.138.10`/`127.0.0.1`/`localhost`）；HTTP `8080`（`YUXI_NEW_WEB_PORT`）保留并 301 重定向到 443（面向浏览器入口；仍以 `http://…:8080/api` 为 base 的调用方跟随重定向会降级为 GET，API 已同源走 HTTPS，可接受）。nginx 终止 TLS 后仍以 `http://api:5050` 反代，前端 `location.origin` 即 `https://<host>`，同源语义不变。
+- 站点配置分别由 `new-web/nginx-main.conf`、`new-web/nginx-tugraph.conf` 拥有；主页面保留与主仓库 `docker/nginx/default.conf` 一致的 SSE 与上传语义（`proxy_buffering off`、`client_max_body_size 20M`）。
+- 主页面运行期配置由 `new-web/config.js` 拥有并单独挂载覆盖 `dist/assets/js/config.js`，升级 `dist` 不会丢失接口地址与图谱入口；`TU_GRAPH.url` 指向 `${location.hostname}:8081`。
+- 图谱页 `index.html` 由 `new-web/tugraph-index.html` 拥有并单独挂载，入口脚本固定为 `/resource/umi.js`；解包 `dist-web-tugraph.7z` 后把 `resource/umi.*.js` 复制为 `resource/umi.js`，因此替换 `resource/` 不需要改 `index.html`。
+- `./dist`、`./tugraph` 与 `*.7z` 被 `.gitignore` 忽略；`docker-compose.yml`、两个 nginx 配置、`config.js`、`tugraph-index.html` 进入版本控制。
+- 独立 compose 通过 `external` 网络接入 `yuxi_app-network`，可独立启停，不修改上游根 compose。
+- 只提供 HTTP 入口（8080/8081）。`new-web/certs/` 保留为将来加 TLS 的素材，当前 compose 不挂载。
 
 ## 替代方案
 
-1. **写进根 `docker-compose.yml` 的 `web` 服务**：会改变既有服务的镜像来源，且根 compose 需要与上游持续合并，新服务在其中易产生冲突；停用需回滚共享文件。
-2. **复用上游 `web` 的 production 阶段镜像**：该阶段从 `web/` 源码构建，与 `dist.7z` 构建产物不是同一份应用，无法托管。
-3. **`window.__backend_api_url` 指向 `http://<host>:5050`**：构成跨源请求，需要放开 CORS，并让前端直接暴露后端端口，与既有同源部署形态不一致。
+1. **单容器两个 server 块**：图谱页固定请求根路径 `/resource/*`，与主页面的 `/assets/*` 同源部署会互相干扰，无法用子路径隔离；因此分配独立端口（独立 origin）。
+2. **图谱页只做静态托管**：缺少 `/api/*` 后端会直接显示“图谱加载失败”，必须与 TuGraph DB Web 后端同源，故用 nginx 反代。
+3. **把资源直接覆盖到 TuGraph DB Web 宿主机的 static 目录**：后端在另一台机器（192.168.138.5），本仓库部署只覆盖本服务器，且无法保证对方目录可写与可回滚。
+4. **写进根 `docker-compose.yml`**：会与上游持续合并产生冲突，且停用需回滚共享文件。
+5. **`window.__backend_api_url` 指向 `:5050`**：构成跨源请求，需要放开 CORS 并暴露后端端口，与同源语义不一致。
 
 ## 后果
 
-- 新增一个长期维护面：`new-web/` 需要在其构建产物更新时重新解包并替换 `dist/`，`docker-compose up -d` 后 nginx 直接读取挂载目录，无需重建镜像。
-- 该服务与主 compose 只在网络层耦合：`api` / `minio` 服务名是它解析依赖的契约，重命名主 compose 服务会破坏反代。
-- 后端每 20MB 以上的上传（`client_max_body_size`）会被 nginx 拒绝；与上游生产配置一致。
-- 前端静态资源无版本前缀失效策略，替换 `dist/` 后浏览器可能命中旧缓存。
-- **自签证书**：浏览器首次访问会报证书不受信任，需在各客户端导入 `new-web/certs/server.crt` 或手动信任；证书有效期到 2027-11-10，到期前需重新签发并替换 `new-web/certs/`（无需重建镜像，nginx 直接读挂载目录）。内网无公网域名，未采用 Let's Encrypt。`new-web/certs/` 是未跟踪目录，部署前必须先按下面命令生成（缺失时 nginx 报 `cannot load certificate` 并 crash-loop）：
-```bash
-mkdir -p new-web/certs
-openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 397 \
-  -keyout new-web/certs/server.key -out new-web/certs/server.crt \
-  -subj "/CN=192.168.138.10" \
-  -addext "subjectAltName=IP:192.168.138.10,IP:127.0.0.1,DNS:localhost"
-chmod 600 new-web/certs/server.key
-```
+- 升级前端不需要重建镜像：替换 `new-web/dist/` 或 `new-web/tugraph/resource/` 后 `docker-compose restart`（或 `up -d`）即可；`config.js` 与 `tugraph-index.html` 不随产物被覆盖。
+- 图谱页与后端版本绑定：`new-web-tugraph` 只提供前端静态资源，`/api/*` 全部落到 `192.168.138.5:8000`；后端地址变化时只需改 `new-web/nginx-tugraph.conf` 的 `proxy_pass`。
+- 主页面依赖 `api`/`minio` 两个服务名，重命名主 compose 服务会破坏反代。
+- 两张前端都直接暴露 HTTP：内网可接受，公网部署需在前面加 TLS 反向代理。
+- 静态资源无版本前缀失效策略，替换目录后浏览器可能命中旧缓存；升级后可让用户强制刷新。
+- 图谱页 `index.html` 由宿主机单文件覆盖，因此 `./tugraph` 目录必须可写挂载（只读目录无法在其下创建挂载点）。
 
 ## 验证
 
-实测（2026-10-09）：
+实测（2026-10-29，服务器 192.168.138.10）：
 
-- HTTPS：`curl -sk https://127.0.0.1/` 与 `https://192.168.138.10/` → 200 `text/html`；`/assets/js/app-DQpUYnPz.js` → 200 `application/javascript`；SPA 深链 `/power-search` → 200（`try_files` 回退）。
-- 反代经 TLS：`GET /api/system/health|ready` → 200（`{"status":"ok","version":"0.7.3"}`）；`POST /api/auth/token` → FastAPI 422 校验响应（已到达真实后端）。
-- 重定向：`http://<host>:8080/`、SPA 深链、SSE 路径与 `POST /api/auth/token` 均 301 → `https://<host>/`，Location 不带端口。
-- TLS：`openssl s_client` 确认 TLSv1.2/1.3、ECDHE-RSA-AES256-GCM-SHA384，TLS1.0/1.1 被拒；证书 SAN 覆盖 `IP:192.168.138.10`、`IP:127.0.0.1`、`DNS:localhost`。
-- 浏览器（忽略自签错误上下文）实测 `https://192.168.138.10/login` 渲染、`window.__backend_api_url === location.origin`（https）、`#root` 挂载、控制台无错误。
-- 未验证范围：使用真实账号的登录后主流程与 SSE 长连接未做端到端验证（缺可用凭据）；`/minio/public/` 反代未以真实对象验证；自签证书在真实客户端的信任流程未逐机验证。
+- 主页面：`GET http://127.0.0.1:8080/` → 200（2961 字节新构建）；`/assets/js/app-BdQeJm21.js`、`/assets/js/app-BiebSLq1.js`、`/assets/styles/index-BC-nmoKe.css`、`/vite.svg` → 200。
+- 运行期配置：`GET /assets/js/config.js` 返回挂载版本，其中 `window.__backend_api_url = location.origin`、`TU_GRAPH.url` 指向 `:8081`。
+- 主页面反代：`GET /api/system/health`、`/api/system/ready` → 200。
+- 图谱页：`GET http://127.0.0.1:8081/` → 200；`/resource/umi.js` → 200（1,082,293 字节）；`/resource/graph-config.json` → 200；`POST /api/get_procedure_demo` → 200（已到达 TuGraph DB Web 后端）。
+- 未验证范围：浏览器内 iframe 的 `TUGRAPH_READY` 握手与图谱页交互未做端到端验证（需人工打开页面）；`/minio/public/` 未以真实对象验证；登录后的 SSE 长连接未验证。

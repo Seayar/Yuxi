@@ -93,3 +93,4 @@ new-web/certs/
 三区台账接口数据_调整版.json
 new-web/*.7z
 new-web/tugraph/
+new-web/dist.bak-*
