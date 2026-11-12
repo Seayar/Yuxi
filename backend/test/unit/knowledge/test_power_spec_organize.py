@@ -11,8 +11,8 @@ from yuxi.knowledge.power_spec.answer import (
     ORGANIZER_SLUG,
     REVIEWER_INSTRUCTION,
     REVIEWER_SLUG,
+    OrganizedDraft,
     SubagentReply,
-    build_organizer_message,
     build_subagent_caller,
     organize_review_compose,
     parse_organized_draft,
@@ -112,7 +112,7 @@ class BrokenComposer:
         raise RuntimeError("模型不可用")
 
 
-def _run(caller, composer, *, dimensions=("周期",), evidences=None, sub_questions=()):
+def _run(caller, composer, *, dimensions=("周期",), evidences=None):
     return organize_review_compose(
         question=QUESTION,
         dimensions=dimensions,
@@ -120,7 +120,6 @@ def _run(caller, composer, *, dimensions=("周期",), evidences=None, sub_questi
         call_subagent=caller,
         call_compose=composer,
         tool_call_id="call-1",
-        sub_questions=sub_questions,
     )
 
 
@@ -409,6 +408,23 @@ def test_parse_organized_draft_accepts_clause_no():
     assert draft.clauses[0].clause_no == "6.1"
 
 
+def test_organized_draft_contract_drops_per_question_answers():
+    """负向：整理输出契约没有逐题 answers，模型多写该字段也被忽略。"""
+
+    assert "answers" not in OrganizedDraft.model_fields
+    draft = parse_organized_draft(
+        json.dumps(
+            {
+                "clauses": [{"citation_key": "file-1#6.1", "body": "内容"}],
+                "answers": [{"question": "子问题", "answer": "结论"}],
+            },
+            ensure_ascii=False,
+        )
+    )
+
+    assert not hasattr(draft, "answers")
+
+
 def test_render_draft_for_review_contains_fields_and_notes():
     draft = parse_organized_draft(
         json.dumps({"clauses": [{"citation_key": "file-1#6.1", "body": "内容", "clause_no": "6.1"}], "notes": "说明"})
@@ -470,52 +486,6 @@ def test_ungrounded_numbers_still_flags_invented_values():
 
 def test_ungrounded_numbers_normalizes_fullwidth_digits():
     assert ungrounded_numbers("周期 １２ 个月", ["周期 12 个月"]) == []
-
-
-def test_organizer_message_lists_multiple_questions():
-    """整理者必须看到每个子问题，不能只看到合并后的长问题。"""
-
-    message = build_organizer_message(
-        "整体问题",
-        [Evidence(BODY)],
-        ["静置时间", "绝缘状态"],
-        ["子问题一：静置时间是多少？", "子问题二：如何判断绝缘状态？"],
-    )
-
-    assert "用户一次提出的多个问题" in message
-    assert "1. 子问题一：静置时间是多少？" in message
-    assert "2. 子问题二：如何判断绝缘状态？" in message
-    assert "不要只回答第一个" in message
-
-
-@pytest.mark.asyncio
-async def test_multi_question_answers_survive_organize_review_compose():
-    """整理者给出的逐题结论必须经过审查与合并保留下来。"""
-
-    draft = json.dumps(
-        {
-            "clauses": [{"citation_key": "file-1#6.1", "body": FINAL_BODY}],
-            "answers": [
-                {
-                    "question": "220kV 变压器色谱周期是多少？",
-                    "answer": "220kV 变压器每 6 个月执行一次。",
-                    "citation_keys": ["file-1#6.1"],
-                }
-            ],
-        },
-        ensure_ascii=False,
-    )
-    answer = await _run(
-        Caller([draft], [_opinions()]),
-        Composer([draft]),
-        dimensions=("周期",),
-        sub_questions=("220kV 变压器色谱周期是多少？",),
-    )
-
-    assert answer is not None
-    assert len(answer.draft.answers) == 1
-    assert answer.draft.answers[0].answer == "220kV 变压器每 6 个月执行一次。"
-    assert answer.draft.answers[0].citation_keys == ["file-1#6.1"]
 
 
 def test_ungrounded_numbers_allows_numbers_from_the_question():

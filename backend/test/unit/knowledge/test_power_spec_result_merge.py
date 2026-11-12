@@ -1,7 +1,7 @@
 import pytest
 
 from yuxi.knowledge.power_spec import tool as tool_module
-from yuxi.knowledge.power_spec.contracts import PowerSpecQuery, PowerSpecSubQuery
+from yuxi.knowledge.power_spec.contracts import PowerSpecQuery
 from yuxi.knowledge.power_spec.intent import parse_power_spec_query
 from yuxi.knowledge.power_spec.tool import (
     _angle_routes,
@@ -9,7 +9,6 @@ from yuxi.knowledge.power_spec.tool import (
     _merge_results,
     _needs_angle_expansion,
     _retrieval_routes,
-    _subquestion_routes,
 )
 
 
@@ -61,26 +60,8 @@ def test_base_entry_wins_when_both_paths_return_the_same_chunk():
     assert not merged[0]["metadata"].get("keyword_only")
 
 
-def test_subquestion_routes_split_explicit_multi_question_markers():
-    """显式“问题1./问题2.”必须拆成独立检索路线，否则长问题会被一个子话题主导。"""
-
-    text = "问题1. 500kV 变压器注油后静置时间是多少小时？ 问题2. 局放超标时如何结合 DGA 判断绝缘状态？"
-
-    assert _subquestion_routes(text) == [
-        "500kV 变压器注油后静置时间是多少小时？",
-        "局放超标时如何结合 DGA 判断绝缘状态？",
-    ]
-
-
-def test_subquestion_routes_ignore_decimal_and_voltage_lists():
-    """负向：1.5Um、10kV、35kV 这类数值不能被当成问题编号拆开。"""
-
-    assert _subquestion_routes("在 1.5Um/√3 试验电压下局放超标怎么办？") == []
-    assert _subquestion_routes("10kV、35kV 及 110kV 高压设备不停电时的最小安全距离是多少？") == []
-
-
-def test_retrieval_routes_keep_rewrite_original_and_subquestions():
-    """路线顺序固定为改写问题、原始问题、子问题，并受上限约束。"""
+def test_retrieval_routes_keep_rewrite_and_original_question():
+    """路线顺序固定为改写问题、原始问题；负向：显式“问题1./问题2.”不再拆成独立路线。"""
 
     query = PowerSpecQuery(query="改写后的问题", intent="其他类型")
     routes = _retrieval_routes("问题1. 子问题一的具体内容是什么？ 问题2. 子问题二的具体内容是什么？", query)
@@ -88,29 +69,6 @@ def test_retrieval_routes_keep_rewrite_original_and_subquestions():
     assert routes == [
         "改写后的问题",
         "问题1. 子问题一的具体内容是什么？ 问题2. 子问题二的具体内容是什么？",
-        "子问题一的具体内容是什么？",
-        "子问题二的具体内容是什么？",
-    ]
-
-
-def test_retrieval_routes_use_model_split_sub_queries():
-    """模型拆出的子问题优先进入召回路线，显式正则只做兜底去重。"""
-
-    text = "问题1. 子问题一的具体内容是什么？ 问题2. 子问题二的具体内容是什么？"
-    query = PowerSpecQuery(
-        query="改写后的问题",
-        intent="其他类型",
-        sub_queries=[
-            PowerSpecSubQuery(query="子问题一的具体内容是什么？"),
-            PowerSpecSubQuery(query="子问题二的具体内容是什么？"),
-        ],
-    )
-
-    assert _retrieval_routes(text, query) == [
-        "改写后的问题",
-        "子问题一的具体内容是什么？",
-        "子问题二的具体内容是什么？",
-        text,
     ]
 
 

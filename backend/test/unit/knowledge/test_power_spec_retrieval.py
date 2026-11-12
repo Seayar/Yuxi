@@ -422,16 +422,12 @@ def _graph_evidence(
     *,
     standard_no: str = "DL/T 408-2023",
     rank: int = 1,
-    group: int = 0,
-    matched_group: int = 0,
 ) -> SpecClauseEvidence:
     return _evidence(document_id, clause_no, score=None, standard_no=standard_no).model_copy(
         update={
             "metadata": {
                 "qa_graph_hit": True,
                 "graph_rank": rank,
-                "graph_group": group,
-                "graph_matched_group": matched_group,
                 "raw_clause_body": "图谱命中的知识库条款正文 0.70m 1.00m 1.50m。",
             }
         }
@@ -480,37 +476,11 @@ async def test_graph_hit_absorbs_duplicate_vector_clause_with_standard_format_di
     assert result.evidence[0].metadata["qa_graph_hit"] is True
 
 
-@pytest.mark.asyncio
-async def test_graph_evidence_balances_question_groups_before_limit():
-    """多问题图谱证据按组轮转，第二组不能被第一组的长表格挤掉。"""
-
-    query = PowerSpecQuery(query="多问题", intent="检修标准查询")
-
-    async def graph_search(_query):
-        return []
-
-    async def vector_search(_query_text):
-        return []
-
-    pinned = [_graph_evidence("doc-1", f"1.{index}", group=1) for index in range(6)]
-    pinned.append(_graph_evidence("doc-2", "Q2", group=2))
-
-    result = await PowerSpecSearchService(graph_search, vector_search).search(
-        query,
-        limit=6,
-        graph_hit_evidence=pinned,
-    )
-
-    keys = [item.citation_key for item in result.evidence]
-    assert len(keys) == 6
-    assert "doc-2#Q2" in keys
-
-
-def test_order_graph_evidence_first_prioritizes_matched_subquestion_group():
-    group_one = _graph_evidence("doc-1", "1.1", rank=1, group=1, matched_group=2)
-    group_two = _graph_evidence("doc-1", "2.1", rank=2, group=2, matched_group=2)
+def test_order_graph_evidence_first_orders_graph_evidence_by_rank():
+    second = _graph_evidence("doc-1", "2.1", rank=2)
+    first = _graph_evidence("doc-1", "1.1", rank=1)
     vector = _evidence("doc-2", "9.1", score=0.9)
 
-    ordered = order_graph_evidence_first([group_one, group_two, vector])
+    ordered = order_graph_evidence_first([second, first, vector])
 
-    assert [item.citation_key for item in ordered] == ["doc-1#2.1", "doc-1#1.1", "doc-2#9.1"]
+    assert [item.citation_key for item in ordered] == ["doc-1#1.1", "doc-1#2.1", "doc-2#9.1"]

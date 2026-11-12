@@ -1,6 +1,5 @@
 from yuxi.knowledge.power_spec.answer import (
     SRS_CARD_FIELDS,
-    QuestionAnswer,
     apply_organized_clauses,
     format_power_spec_results,
 )
@@ -135,22 +134,18 @@ def test_render_srs_cards_allows_relative_pdf_url():
     assert f"[[PDF:{source_url}]]" in markdown
 
 
-def test_apply_organized_clauses_renders_question_answers_before_cards():
-    """多问题时先发布逐题结论，再发布规范卡片。"""
+def test_apply_organized_clauses_publishes_cards_without_summary_prefix():
+    """答案只由规范卡片组成：卡片前不再有逐题结论摘要。"""
 
     clause = type(
         "Clause",
         (),
         {"citation_key": "doc-1#6.2.1", "clause_no": None, "body": "有人值班变电站每日巡视一次。"},
     )()
-    answers = [QuestionAnswer(question="巡检周期是多少？", answer="每日巡视一次。", citation_keys=["doc-1#6.2.1"])]
 
-    result = apply_organized_clauses("巡检周期", [_evidence()], [clause], answers=answers)
+    result = apply_organized_clauses("巡检周期", [_evidence()], [clause])
 
-    assert result["answer_markdown"].startswith("### 问题回答")
-    assert "**1. 巡检周期是多少？**" in result["answer_markdown"]
-    assert "每日巡视一次。" in result["answer_markdown"]
-    assert result["answer_markdown"].index("### 问题回答") < result["answer_markdown"].index("### 规范卡片 1")
+    assert result["answer_markdown"].startswith("### 规范卡片 1")
 
 
 def test_apply_organized_clauses_uses_model_values_but_keeps_code_format():
@@ -219,14 +214,18 @@ def test_apply_organized_clauses_publishes_only_organized_clauses():
     assert "### 规范卡片 2" not in result["answer_markdown"]
 
 
-def _graph_evidence(source_url: str | None = None) -> SpecClauseEvidence:
+def _graph_evidence(
+    source_url: str | None = None,
+    *,
+    rank: int = 1,
+    clause_no: str = "6.2.1",
+) -> SpecClauseEvidence:
     return _evidence(
         source_url=source_url,
+        clause_no=clause_no,
         metadata={
             "qa_graph_hit": True,
-            "graph_rank": 1,
-            "graph_group": 0,
-            "graph_matched_group": 0,
+            "graph_rank": rank,
             "raw_clause_body": "变压器巡检周期：有人值班变电站每日巡视。",
         },
     )
@@ -251,6 +250,17 @@ def test_apply_organized_clauses_pins_graph_card_first_and_uses_kb_body():
     assert "模型改写的图谱条款" not in result["items"][0]["clause_body"]
     assert result["items"][1]["clause_body"] == "模型整理的其它条款"
     assert result["answer_markdown"].index("### 规范卡片 1") < result["answer_markdown"].index("### 规范卡片 2")
+
+
+def test_apply_organized_clauses_orders_two_graph_cards_by_rank():
+    """多张图谱卡按“排序”置前，不依赖输入顺序。"""
+
+    second = _graph_evidence(rank=2, clause_no="9.9")
+    first = _graph_evidence(rank=1, clause_no="6.2.1")
+
+    result = apply_organized_clauses("巡检", [second, first], [])
+
+    assert [item["clause_no"] for item in result["items"]] == ["6.2.1", "9.9"]
 
 
 def test_apply_organized_clauses_forces_missing_graph_card_first():

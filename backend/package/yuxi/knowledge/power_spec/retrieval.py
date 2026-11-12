@@ -28,7 +28,7 @@ VectorSearch = Callable[[str], Awaitable[Sequence[SpecClauseEvidence]]]
 
 # 进入整理阶段的条款数上限。实测召回池里已包含正确条款、但 top-5 会把它丢掉
 # （50 题：召回池命中 96%，最终证据只有 72%）。条款级语料的正文很短（百字量级），
-# 放宽到 20 条的 prompt 成本可控；多问题与比对类问题需要更多条款才能覆盖两个子问题。
+# 放宽到 20 条的 prompt 成本可控；宽问题与比对类问题需要更多条款才能覆盖多个方面。
 MAX_EVIDENCE_CLAUSES = 20
 # 秩融合常数：与候选排名同量级，避免首位过权，行业常用 60。
 RRF_K = 60
@@ -80,7 +80,7 @@ class PowerSpecSearchService:
             if item.status != "现行":
                 continue
             pinned_groups.setdefault(_evidence_group_key(item), item)
-        pinned = _balance_pinned_evidence(list(pinned_groups.values()))
+        pinned = list(pinned_groups.values())
         vector_evidence = await self._vector_search(query.query)
         dimension_terms = query.answer_dimensions
         ranking_terms = query.normalized_terms or dimension_terms
@@ -171,30 +171,6 @@ def _evidence_group_key(item: SpecClauseEvidence) -> tuple[str, str]:
     return standard, clause
 
 
-def _balance_pinned_evidence(pinned: Sequence[SpecClauseEvidence]) -> list[SpecClauseEvidence]:
-    """按图谱问题分组轮转排序，避免第一组条款占满名额、截断后续子问题证据。"""
-
-    by_group: dict[int, list[SpecClauseEvidence]] = {}
-    for item in pinned:
-        group = _as_int((item.metadata or {}).get("graph_group"), default=0)
-        by_group.setdefault(group, []).append(item)
-    if len(by_group) <= 1:
-        return list(pinned)
-    ordered: list[SpecClauseEvidence] = []
-    offsets = dict.fromkeys(by_group, 0)
-    while len(ordered) < len(pinned):
-        advanced = False
-        for group in sorted(by_group):
-            offset = offsets[group]
-            if offset < len(by_group[group]):
-                ordered.append(by_group[group][offset])
-                offsets[group] = offset + 1
-                advanced = True
-        if not advanced:
-            break
-    return ordered
-
-
 def _group_key(group: Sequence[tuple[float, SpecClauseEvidence, list[str]]]) -> tuple[str, str]:
     """返回一个候选分组的规范化键。"""
 
@@ -204,15 +180,11 @@ def _group_key(group: Sequence[tuple[float, SpecClauseEvidence, list[str]]]) -> 
 def order_graph_evidence_first(evidences: Sequence[SpecClauseEvidence]) -> list[SpecClauseEvidence]:
     """把图谱命中证据稳定地排在最前，其余证据保持原有相对顺序。"""
 
-    def _sort_key(item: SpecClauseEvidence) -> tuple[int, int, int]:
+    def _sort_key(item: SpecClauseEvidence) -> tuple[int, int]:
         metadata = item.metadata or {}
         if not metadata.get("qa_graph_hit"):
-            return (1, 0, 0)
-        group = _as_int(metadata.get("graph_group"), default=0)
-        matched_group = _as_int(metadata.get("graph_matched_group"), default=0)
-        rank = _as_int(metadata.get("graph_rank"), default=0)
-        group_priority = 0 if matched_group == 0 or group == matched_group else 1
-        return (0, group_priority, rank)
+            return (1, 0)
+        return (0, _as_int(metadata.get("graph_rank"), default=0))
 
     return sorted(evidences, key=_sort_key)
 

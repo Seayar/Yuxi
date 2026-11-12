@@ -80,23 +80,12 @@ class OrganizedClause(BaseModel):
     clause_no: str | None = None
 
 
-class QuestionAnswer(BaseModel):
-    """整理子智能体针对一个子问题给出的简短结论。"""
-
-    model_config = ConfigDict(frozen=True)
-
-    question: str = Field(min_length=1)
-    answer: str = Field(min_length=1)
-    citation_keys: list[str] = Field(default_factory=list)
-
-
 class OrganizedDraft(BaseModel):
     """整理子智能体的结构化输出。"""
 
     model_config = ConfigDict(frozen=True)
 
     clauses: list[OrganizedClause] = Field(default_factory=list)
-    answers: list[QuestionAnswer] = Field(default_factory=list)
     notes: str | None = None
 
 
@@ -119,7 +108,7 @@ ORGANIZER_INSTRUCTION = """你是电力规范内容整理子智能体。
 
 输出格式：整段回答必须是且只是一个 JSON 对象，以 { 开头、以 } 结尾。
 不要输出分析、推理、说明或英文叙述，不要用 Markdown 代码块包裹。
-{"clauses":[{"citation_key":"原样返回","clause_no":"本条款展示编号","body":"整理后的条款内容"}],"answers":[{"question":"子问题原文","answer":"仅依据原文的简短结论","citation_keys":["file-1#6.1"]}],"notes":"可选的一句话说明"}
+{"clauses":[{"citation_key":"原样返回","clause_no":"本条款展示编号","body":"整理后的条款内容"}],"notes":"可选的一句话说明"}
 
 整理规则：
 1. 关注维度由调用方给出，直接使用，不要自行判断、收窄或扩大维度。
@@ -138,11 +127,7 @@ ORGANIZER_INSTRUCTION = """你是电力规范内容整理子智能体。
 禁止重新编号，禁止改变数字含义。
 8. 每条输入条款都必须出现在输出中，citation_key 必须与输入完全一致。
 缺少任何一条都视为输出不完整。
-9. body 中不要出现省略号（如 ... 或 ……），省略内容通过少写内容表达。
-10. 调用方给出多个子问题时，answers 必须为每个子问题各输出一条；
-answer 只能使用给定原文中的数值、条件和结论，不得新增原文没有的内容；
-确实无法从给定条款回答时写「未在给定条款中找到依据」。
-只有一个问题时 answers 为空数组；不要凭空补写问题或结论。"""
+9. body 中不要出现省略号（如 ... 或 ……），省略内容通过少写内容表达。"""
 
 REVIEWER_INSTRUCTION = """你是电力规范内容的忠实性审查子智能体，负责核对另一智能体的整理内容是否忠实于给定原文。
 调用方会同时给你原始条款原文和待审结论。
@@ -180,7 +165,7 @@ COMPOSE_INSTRUCTION = """你是电力规范答案的最终合并者。调用方�
 
 输出格式：整段回答必须是且只是一个 JSON 对象，以 { 开头、以 } 结尾。
 不要输出分析、推理、说明或英文叙述，不要用 Markdown 代码块包裹。
-{"clauses":[{"citation_key":"原样返回","clause_no":"展示编号","body":"最终条款内容"}],"answers":[{"question":"子问题原文","answer":"最终简短结论","citation_keys":["file-1#6.1"]}],"notes":"可选的一句话说明"}
+{"clauses":[{"citation_key":"原样返回","clause_no":"展示编号","body":"最终条款内容"}],"notes":"可选的一句话说明"}
 
 规则：
 1. 逐条输出，citation_key 必须与输入完全一致，不要新增或删除条款。
@@ -191,10 +176,7 @@ COMPOSE_INSTRUCTION = """你是电力规范答案的最终合并者。调用方�
 5. 审查意见与整理内容冲突、或看起来是审查自身理解有误时，保留整理内容，不要跟着改错。
 6. 不得新增整理内容和审查意见都没有的数字、页码或结论，不得为了「看起来完整」补写内容。
 7. body 不得为空，也不得只写「本条款未涉及该问题」这类占位说明。
-8. body 中不要出现省略号（如 ... 或 ……）。
-9. answers 必须保留输入中的每个子问题，顺序不变；
-只允许按审查意见修正引用原文的数值、条件或表述，
-不得删除问题、合并问题或补写原文没有的结论。"""
+8. body 中不要出现省略号（如 ... 或 ……）。"""
 
 # 最新需求规格说明书规定的卡片字段与顺序，代码拥有格式，模型只提供字段值。
 SRS_CARD_FIELDS: tuple[tuple[str, str], ...] = (
@@ -211,7 +193,6 @@ def build_organizer_message(
     question: str,
     evidences: Sequence[Any],
     dimensions: Sequence[str] = (),
-    sub_questions: Sequence[str] = (),
 ) -> str:
     """构造整理任务的输入，只提供问题、上游已识别的维度与受限证据。"""
 
@@ -222,20 +203,11 @@ def build_organizer_message(
         "## 用户问题",
         question,
         "",
+        "## 本次问题的关注维度（由上游意图识别给出，不要自行判断）",
+        dimension_text,
+        "",
+        "## 检索到的规范条款原文",
     ]
-    clean_sub_questions = [str(item).strip() for item in sub_questions if str(item).strip()]
-    if clean_sub_questions:
-        lines.extend(["## 用户一次提出的多个问题（逐条覆盖，不要只回答第一个）"])
-        lines.extend(f"{index}. {item}" for index, item in enumerate(clean_sub_questions, start=1))
-        lines.append("")
-    lines.extend(
-        [
-            "## 本次问题的关注维度（由上游意图识别给出，不要自行判断）",
-            dimension_text,
-            "",
-            "## 检索到的规范条款原文",
-        ]
-    )
     for evidence in evidences:
         body = str(getattr(evidence, "clause_body", "") or "")[:MAX_EVIDENCE_BODY_CHARS]
         lines.extend(
@@ -278,7 +250,6 @@ def build_compose_message(
     dimensions: Sequence[str],
     draft: OrganizedDraft,
     issues: Sequence[ReviewIssue],
-    sub_questions: Sequence[str] = (),
 ) -> str:
     """构造最终整理任务的输入：整理内容与审查意见。"""
 
@@ -289,34 +260,17 @@ def build_compose_message(
         "## 用户问题",
         question,
         "",
+        "## 本次问题的关注维度",
+        dimension_text,
+        "",
+        "## 整理者输出的条款内容",
     ]
-    clean_sub_questions = [str(item).strip() for item in sub_questions if str(item).strip()]
-    if clean_sub_questions:
-        lines.extend(["## 用户一次提出的多个问题（必须逐条保留 answers）"])
-        lines.extend(f"{index}. {item}" for index, item in enumerate(clean_sub_questions, start=1))
-        lines.append("")
-    lines.extend(
-        [
-            "## 本次问题的关注维度",
-            dimension_text,
-            "",
-            "## 整理者输出的条款内容",
-        ]
-    )
     for clause in draft.clauses:
         lines.append(f"### citation_key: {clause.citation_key}")
         if clause.clause_no:
             lines.append(f"条款编号：{clause.clause_no}")
         lines.append(f"整理内容：{clause.body}")
         lines.append("")
-    if draft.answers:
-        lines.append("## 整理者给出的问题回答")
-        for item in draft.answers:
-            lines.append(f"### 问题：{item.question}")
-            lines.append(f"回答：{item.answer}")
-            if item.citation_keys:
-                lines.append(f"引用：{', '.join(item.citation_keys)}")
-            lines.append("")
     lines.append("## 审查意见")
     if issues:
         for index, issue in enumerate(issues, start=1):
@@ -339,14 +293,6 @@ def render_draft_for_review(draft: OrganizedDraft) -> str:
             lines.append(f"条款编号：{clause.clause_no}")
         lines.append(f"整理内容：{clause.body}")
         lines.append("")
-    if draft.answers:
-        lines.append("## 问题回答")
-        for item in draft.answers:
-            lines.append(f"问题：{item.question}")
-            lines.append(f"回答：{item.answer}")
-            if item.citation_keys:
-                lines.append(f"引用：{', '.join(item.citation_keys)}")
-            lines.append("")
     if draft.notes:
         lines.extend([f"说明：{draft.notes}", ""])
     return "\n".join(lines).strip()
@@ -361,8 +307,6 @@ def draft_content_text(draft: OrganizedDraft) -> str:
     parts: list[str] = []
     for clause in draft.clauses:
         parts.append(clause.body)
-    for item in draft.answers:
-        parts.append(item.answer)
     if draft.notes:
         parts.append(draft.notes)
     return "\n".join(part for part in parts if part)
@@ -480,7 +424,6 @@ async def organize_review_compose(
     call_subagent: SubagentCaller,
     call_compose: ComposeCall,
     tool_call_id: str,
-    sub_questions: Sequence[str] = (),
 ) -> OrganizedAnswer | None:
     """整理一次、审查一次，再由父 Agent 的模型合并成最终条款内容。
 
@@ -491,7 +434,7 @@ async def organize_review_compose(
     organizer = await _call_subagent(
         call_subagent,
         slug=ORGANIZER_SLUG,
-        message=build_organizer_message(question, evidences, dimensions, sub_questions),
+        message=build_organizer_message(question, evidences, dimensions),
         tool_call_id=f"{tool_call_id}#organize",
     )
     if organizer is None:
@@ -531,7 +474,7 @@ async def organize_review_compose(
         logger.info("电力规范审查未提出问题")
 
     try:
-        composed = await call_compose(build_compose_message(question, dimensions, draft, issues, sub_questions))
+        composed = await call_compose(build_compose_message(question, dimensions, draft, issues))
         final = parse_organized_draft(composed)
     except Exception as exc:  # noqa: BLE001
         logger.warning(f"电力规范最终整理失败，回退固定卡片: {exc}")
@@ -630,7 +573,6 @@ async def produce_power_spec_answer(
         call_subagent=call_subagent,
         call_compose=call_compose,
         tool_call_id=tool_call_id,
-        sub_questions=[sub.query for sub in query.sub_queries],
     )
     if answer is None:
         return _fixed_card_payload(fallback)
@@ -639,7 +581,6 @@ async def produce_power_spec_answer(
         query.query,
         evidences,
         answer.draft.clauses,
-        answers=answer.draft.answers,
     )
     if not rendered["items"]:
         logger.warning("电力规范最终整理没有可用条款，回退固定卡片")
@@ -707,7 +648,6 @@ def apply_organized_clauses(
     query: str,
     evidence: Sequence[SpecClauseEvidence],
     clauses: Sequence[Any],
-    answers: Sequence[QuestionAnswer] = (),
 ) -> dict:
     """把整理子智能体给出的字段值套进代码渲染的规范卡片。
 
@@ -745,18 +685,7 @@ def apply_organized_clauses(
     rendered = graph_rendered + rendered
     items = [item for item, _source_url in rendered]
     cards_markdown = render_srs_cards(items, [source_url for _item, source_url in rendered])
-    if answers:
-        cards_markdown = f"{render_question_answers(answers)}\n\n{cards_markdown}"
     return {"items": items, "answer_markdown": cards_markdown}
-
-
-def render_question_answers(answers: Sequence[QuestionAnswer]) -> str:
-    """把多问题的简短结论渲染在卡片之前，先回答每个子问题。"""
-
-    lines = ["### 问题回答", ""]
-    for index, item in enumerate(answers, start=1):
-        lines.extend([f"**{index}. {item.question}**", "", item.answer, ""])
-    return "\n".join(lines).rstrip()
 
 
 def _format_item(query: str, item: SpecClauseEvidence) -> dict:

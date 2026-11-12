@@ -12,7 +12,7 @@ Owner：backend/package/yuxi/knowledge/power_spec/tool.py
 
 ## 决策
 
-1. **多路主召回**：一次工具调用内按“改写问题、原始问题、显式子问题、宽问题角度”分别执行 `executor.aquery`，最多 7 路。显式子问题只识别 `问题1.`、`1.` 这类标记，不把 `1.5Um`、`10kV、35kV` 当成问题编号。原始问题路线保留用户原话，避免模型改写漂移直接丢掉正确条款。
+1. **多路主召回**：一次工具调用内按“改写问题、原始问题、宽问题角度”分别执行 `executor.aquery`，最多 7 路。原始问题路线保留用户原话，避免模型改写漂移直接丢掉正确条款。
 2. **宽问题角度扩展**：问题包含“注意事项、有哪些、如何检查/处理、要求、内容、措施”等宽问法、且关注维度不超过 1 个时，按设备与电压拆出安装与交接试验、运行巡视与维护、检修与预防性试验、保护与监测、冷却/绝缘油/接地等角度，每个角度单独召回；角度数量由 `POWER_SPEC_ANGLE_ROUTES` 控制，默认 5。没有设备类型时不扩展，避免凭空拼查询。
 3. **召回宽度回到知识库能力**：`recall_top_k=50`、`bm25_top_k=50`、`final_top_k=30`，与知识库自身的 hybrid 配置一致；工具不再把候选池压得比 `query_kb` 更窄。
 4. **证据上限放宽到 20 条**：`MAX_EVIDENCE_CLAUSES` 从 12 改为 20，覆盖排序在 13–20 名、但确实回答问题的条款；条款正文很短，prompt 成本可控。
@@ -32,7 +32,7 @@ Owner：backend/package/yuxi/knowledge/power_spec/tool.py
 
 - 单次检索最多执行 7 路主召回加 1 路关键词召回；宽问题的角度扩展会增加重排调用与检索耗时，但相对条款字段校对与整理/审查阶段（数十秒到百秒级）仍是小头。
 - 进入条款校对和整理阶段的证据最多 20 条，模型调用成本与延迟上升；整理/合并阶段仍以整理者返回的条款为准，审查不再按相关性裁剪。单条正文仍按 `MAX_EVIDENCE_BODY_CHARS` 截断，20 条同时是超长表格时可能触及子智能体上下文，需要按实际语料观察降级日志。
-- 多问题与比对类问题的候选覆盖提升；宽问题的角度扩展会带入更多相邻条款，排序仍由重排分与 RRF 决定，角度关键词需要按真实问题继续调优。
+- 宽问题的角度扩展会带入更多相邻条款，排序仍由重排分与 RRF 决定，角度关键词需要按真实问题继续调优。
 - 表格行问题仍依赖条款元数据把表格并入所属条款；如果表格被切到独立 chunk 且无法映射到条款，检索层不会凭空补出该条款。
 - 未改变意图确认、结果缓存、发布门和“一次真实检索”的对外行为；同一轮重复调用仍返回缓存结果。
 
@@ -40,9 +40,7 @@ Owner：backend/package/yuxi/knowledge/power_spec/tool.py
 
 | 主张 | 证据 |
 | --- | --- |
-| 显式子问题被拆成独立路线 | `test_subquestion_routes_split_explicit_multi_question_markers` |
-| 小数与电压列表不被误拆 | `test_subquestion_routes_ignore_decimal_and_voltage_lists` |
-| 路线顺序与上限正确 | `test_retrieval_routes_keep_rewrite_original_and_subquestions` |
+| 路线顺序为改写问题、原始问题 | `test_retrieval_routes_keep_rewrite_and_original_question` |
 | 宽问题按设备与电压拆出角度 | `test_broad_question_expands_to_device_angles`、`test_broad_question_routes_include_angles` |
 | 具体数值问题不扩展角度 | `test_specific_numeric_question_does_not_expand_angles` |
 | 无设备时不凭空拼角度 | `test_broad_question_without_device_does_not_expand_angles` |
@@ -54,9 +52,10 @@ Owner：backend/package/yuxi/knowledge/power_spec/tool.py
 | 相关单元回归 | `python -m pytest test/unit/knowledge/test_power_spec_result_merge.py test/unit/knowledge/test_power_spec_retrieval.py test/unit/knowledge/test_power_spec_answer_organization.py test/unit/knowledge/test_power_spec_tool_intent.py -q`：65 passed |
 | 宽问题真实检索冒烟 | 「110kV 电力变压器注意事项」：`routes=6`、`angles=5`、`vector_count=16`（改动前同问题为 5 条候选） |
 
-检索层人工评测使用仓库内 50 题测试集（`srs/power_rag_testset-v20汇总.xlsx`）中的 40 道可回答题、56 个金标条款。严格字面匹配下，当前单路流程命中 35/56，放宽候选池后 37/56；表格行引用按数值签名复核后，MULTI_02、MULTI_08、COMP_01 的表格内容实际已在证据中。子问题路线把 MULTI_03、MULTI_15 从 0/2 提升到 1/2。该评测是检索层脚本，不是端到端答案准确率；最终卡片数还受整理/审查阶段裁剪影响，未在本记录中声称端到端提升。
+检索层人工评测使用仓库内 50 题测试集（`srs/power_rag_testset-v20汇总.xlsx`）中的 40 道可回答题、56 个金标条款。严格字面匹配下，单路流程命中 35/56，放宽候选池后 37/56；表格行引用按数值签名复核后，MULTI_02、MULTI_08、COMP_01 的表格内容实际已在证据中。该评测是检索层脚本，不是端到端答案准确率；最终卡片数还受整理/审查阶段裁剪影响，未在本记录中声称端到端提升。当时的显式子问题路线把 MULTI_03、MULTI_15 从 0/2 提升到 1/2，该路线已按[移除电力规范检索的多问题拆分与逐题回答](2026-11-12-power-spec-remove-multi-question-split.md)删除。
 
 ## 相关决策
 
 - [电力规范检索重排可选与 RRF 排序](2026-10-21-power-spec-rerank-optional-and-rrf.md)：保留关键词路 floor 与 RRF 名次融合。
 - [电力规范条款分块聚合](2026-10-15-power-spec-clause-chunk-aggregation.md)：同条款多分块合并规则不变。
+- [移除电力规范检索的多问题拆分与逐题回答](2026-11-12-power-spec-remove-multi-question-split.md)：显式子问题路线被该记录取代，宽问题角度扩展与 `route_hits` 加权保留。

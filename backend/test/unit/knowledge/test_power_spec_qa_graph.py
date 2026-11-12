@@ -1,5 +1,6 @@
 """电力规范测评图谱：命中、条款解析与配置。"""
 
+import dataclasses
 import json
 
 import pytest
@@ -21,12 +22,12 @@ NOG = "在非氧化性气体（NOG）中，10kV高压开关柜裸铜或裸铜合
 OG = "在氧化性气体（OG）中，10kV高压开关柜裸铜触头的最高温度和允许温升分别是多少？"
 
 
-def _question_row(qid: str, text: str, *, group: int = 0) -> dict:
+def _question_row(qid: str, text: str) -> dict:
     return {
         "qid": qid,
         "qtext": text,
         "qkeys": json.dumps(
-            [{"key": qa_graph.normalize_question_text(text), "text": text, "group": group, "type": "标准书面"}],
+            [{"key": qa_graph.normalize_question_text(text), "text": text, "type": "标准书面"}],
             ensure_ascii=False,
         ),
         "qbehavior": "READY_FOR_E2E",
@@ -57,7 +58,6 @@ class _FakeClient:
                     "cstatus": "现行",
                     "cexcerpt": "验电前应先在相应电压等级的有电设备上确证验电器良好",
                     "crank": 1,
-                    "cgroup": 0,
                 }
             ]
         return []
@@ -144,6 +144,60 @@ def test_find_hit_reads_question_answer_and_clause(monkeypatch):
     assert [citation.clause_no for citation in hit.citations] == ["6.3.2"]
 
 
+def test_find_hit_orders_citations_by_rank(monkeypatch):
+    """图谱条款按“排序”排列，不依赖图数据库返回顺序。"""
+
+    class RankedClient(_FakeClient):
+        def run(self, cypher, **params):
+            if "MATCH (q:问题)" in cypher:
+                return [_question_row("md:Q21", QUESTION)]
+            if "有答案" in cypher:
+                return [{"aid": "md:Q21#A", "arefuse": "false", "across": "false"}]
+            if "依据条款" in cypher:
+                return [
+                    {"cstd": "DL/T 408-2023", "cno": "6.1.1", "crank": 2, "cstatus": "现行"},
+                    {"cstd": "DL/T 408-2023", "cno": "6.3.2", "crank": 1, "cstatus": "现行"},
+                ]
+            return []
+
+    monkeypatch.setattr("yuxi.agents.toolkits.tugraph.TuGraphClient", RankedClient)
+
+    hit = find_power_spec_qa_hit(
+        type("Config", (), {"uri": "bolt://x", "graph": "g", "username": "u", "password": "p"})(),
+        parse_power_spec_query(QUESTION),
+        original_query_text=QUESTION,
+    )
+
+    assert hit is not None
+    assert [citation.clause_no for citation in hit.citations] == ["6.3.2", "6.1.1"]
+
+
+def test_graph_hit_has_no_subquestion_group_fields():
+    """负向：图谱命中结果不再携带子问题分组字段。"""
+
+    hit_fields = {field.name for field in dataclasses.fields(PowerSpecGraphHit)}
+    citation_fields = {field.name for field in dataclasses.fields(PowerSpecGraphCitation)}
+
+    assert "matched_group" not in hit_fields
+    assert "group" not in citation_fields
+
+
+def test_legacy_group_key_does_not_block_matching():
+    """旧图谱数据的命中键带 group 时仍能精确命中，多余键被忽略。"""
+
+    row = _question_row("md:Q21", QUESTION)
+    row["qkeys"] = json.dumps(
+        [{"key": qa_graph.normalize_question_text(QUESTION), "text": QUESTION, "group": 2, "type": "标准书面"}],
+        ensure_ascii=False,
+    )
+
+    matched = match_question_rows([row], [QUESTION])
+
+    assert matched is not None
+    assert matched[0].question_id == "md:Q21"
+    assert matched[2] == "exact"
+
+
 def test_find_hit_marks_refusal(monkeypatch):
     class RefusalClient(_FakeClient):
         def run(self, cypher, **params):
@@ -207,7 +261,6 @@ def test_corrective_refusal_is_distinguished_from_out_of_scope():
             score=1.0,
             expected_behavior=behavior,
             refusal=True,
-            matched_group=0,
         )
 
     assert _hit("应指出事实前提错误并纠错").corrective is True
@@ -234,7 +287,6 @@ def test_resolve_hit_evidence_uses_graph_status_and_prefix():
         score=1.0,
         expected_behavior=None,
         refusal=False,
-        matched_group=0,
         citations=(
             PowerSpecGraphCitation(standard_no="DL/T 408-2023", clause_no="5.3.1.3", rank=1),
             PowerSpecGraphCitation(standard_no="DL/T 408-2023", clause_no="6.1.1", rank=2),
@@ -270,7 +322,6 @@ def test_table_citation_prefers_actual_table_title_over_cross_reference():
         score=1.0,
         expected_behavior=None,
         refusal=False,
-        matched_group=0,
         citations=(
             PowerSpecGraphCitation(standard_no="DL/T 408-2023", clause_no="5.3.1.3", table_no="1", rank=1),
         ),
@@ -299,7 +350,6 @@ def test_resolve_hit_evidence_falls_back_to_table_number():
         score=1.0,
         expected_behavior=None,
         refusal=False,
-        matched_group=0,
         citations=(PowerSpecGraphCitation(standard_no="DL/T 596-2021", clause_no="表44", table_no="44", rank=1),),
     )
 
@@ -332,7 +382,6 @@ def test_resolve_hit_evidence_falls_back_to_excerpt():
         score=1.0,
         expected_behavior=None,
         refusal=False,
-        matched_group=0,
         citations=(
             PowerSpecGraphCitation(
                 standard_no="DL/T 584-2017",
@@ -358,7 +407,6 @@ def test_resolve_hit_evidence_reports_missing_clause():
         score=1.0,
         expected_behavior=None,
         refusal=False,
-        matched_group=0,
         citations=(PowerSpecGraphCitation(standard_no="DL/T 408-2023", clause_no="99.99", rank=1),),
     )
 

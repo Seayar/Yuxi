@@ -197,7 +197,6 @@ def _graph_hit(
         score=1.0,
         expected_behavior=expected_behavior,
         refusal=refusal,
-        matched_group=0,
         citations=() if refusal else (PowerSpecGraphCitation(standard_no="DL/T 408-2023", clause_no="6.3.2", rank=1),),
         answer_text=answer_text,
         cross_source=cross_source,
@@ -271,7 +270,6 @@ async def test_graph_hit_unresolvable_with_clarification_returns_clarification(m
         score=1.0,
         expected_behavior="READY_FOR_E2E",
         refusal=False,
-        matched_group=0,
         citations=(PowerSpecGraphCitation(standard_no="DL/T 9999-9999", clause_no="1.1", rank=1),),
     )
 

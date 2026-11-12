@@ -1,8 +1,10 @@
 # 电力规范多问题意图拆分与逐题回答
 
-状态：implemented
+状态：archived
 类型：feature
-Owner：backend/package/yuxi/knowledge/power_spec/intent.py
+Owner：docs/develop-guides/decisions/implemented/2026-11-12-power-spec-remove-multi-question-split.md
+
+本记录记录的能力已被 [移除电力规范检索的多问题拆分与逐题回答](../implemented/2026-11-12-power-spec-remove-multi-question-split.md) 完全移除，仅保留为历史背景。
 
 ## 问题
 

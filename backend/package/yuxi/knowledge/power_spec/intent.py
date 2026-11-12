@@ -13,8 +13,6 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from yuxi.knowledge.power_spec.contracts import (
     PowerSpecIntent,
     PowerSpecQuery,
-    PowerSpecSubQuery,
-    SUBQUESTION_SPLIT_PATTERN,
 )
 from yuxi.utils import logger
 
@@ -164,17 +162,8 @@ PowerSpecIntentModelCall = Callable[[str], Awaitable[str | dict[str, Any]]]
 INTENT_VALUES: tuple[str, ...] = ("设备参数查询", "检修标准查询", "安全规范查询", "其他类型")
 MAX_KEYWORDS = 12
 MAX_DIMENSIONS = 8
-MAX_SUB_QUESTIONS = 6
 
 INTENT_PROMPT = """你是电力规范检索的意图识别助手。请阅读用户问题，只输出一个 JSON 对象。
-
-用户可能只问一个问题，也可能一次提出多个独立问题（例如“问题1...问题2...”、分号分隔的多个问句、并列的多个查询）。先判断问题数量：
-- 只有一个问题：输出顶层字段，sub_questions 为空数组 []。
-- 多个独立问题：顶层 question 保留完整、可检索的改写；sub_questions 按原顺序列出每个独立问题，至少 2 项。
-  每个子问题单独判断 intent、device_type、device_name、voltage_level、answer_dimensions、keywords，
-  不能把第一个问题的电压或设备套到第二个。
-- 改写每个子问题时必须保留原句中的比较、差值、计算、条件链和多步要求；不要只保留其中一个数值或一个子步骤。
-- 不要拆分同一个问题里的多个关注维度（例如“温升和周期分别是多少”是一个问题）；只有题干明确分成多个问句或编号时才拆分。
 
 字段要求：
 1. question：把用户问题改写成一个完整、独立、可检索的规范问题，补齐被省略的语境。
@@ -186,8 +175,6 @@ INTENT_PROMPT = """你是电力规范检索的意图识别助手。请阅读用�
 6. answer_dimensions：用户真正想了解的维度，例如 温升、周期、绝缘电阻、注意值。不要罗列问题中没问到的维度。
 7. keywords：用于知识库检索的关键词或短语，3 到 8 个，覆盖设备、电压等级和维度。
 不要包含 请问、多少、怎么、是否 这类没有检索价值的词。
-8. sub_questions：多个独立问题时的数组，每项包含 question、intent、device_type、device_name、
-voltage_level、answer_dimensions、keywords；只有一个问题时为 []。
 
 只输出 JSON，不要解释，不要 Markdown 代码块。"""
 
@@ -198,25 +185,6 @@ def _coerce_terms_value(value: Any) -> Any:
     if value is None or isinstance(value, (list, tuple)):
         return value
     return [part.strip() for part in re.split(r"[、,，;；/]", str(value)) if part.strip()]
-
-
-class PowerSpecIntentQuestion(BaseModel):
-    """表示模型从多问题输入中拆分出的一个子问题。"""
-
-    model_config = ConfigDict(frozen=True)
-
-    question: str = Field(min_length=1)
-    intent: str = Field(default="其他类型")
-    device_name: str | None = None
-    device_type: str | None = None
-    voltage_level: str | None = None
-    answer_dimensions: list[str] = Field(default_factory=list)
-    keywords: list[str] = Field(default_factory=list)
-
-    @field_validator("answer_dimensions", "keywords", mode="before")
-    @classmethod
-    def _coerce_terms(cls, value: Any) -> Any:
-        return _coerce_terms_value(value)
 
 
 class PowerSpecIntentResult(BaseModel):
@@ -231,7 +199,6 @@ class PowerSpecIntentResult(BaseModel):
     voltage_level: str | None = None
     answer_dimensions: list[str] = Field(default_factory=list)
     keywords: list[str] = Field(default_factory=list)
-    sub_questions: list[PowerSpecIntentQuestion] = Field(default_factory=list)
 
     @field_validator("answer_dimensions", "keywords", mode="before")
     @classmethod
@@ -280,7 +247,6 @@ def build_intent_prompt(
                     "device_type": previous.device_type,
                     "voltage_level": previous.voltage_level,
                     "answer_dimensions": previous.answer_dimensions,
-                    "sub_questions": [sub.model_dump(mode="json") for sub in previous.sub_queries],
                 },
                 ensure_ascii=False,
             )
@@ -298,14 +264,6 @@ def build_power_spec_query(result: PowerSpecIntentResult, *, fallback_query: str
     keywords = _clean_terms(result.keywords, limit=MAX_KEYWORDS)
     device_type = _clean_optional(result.device_type)
     voltage_level = _clean_optional(result.voltage_level)
-    sub_queries = _build_sub_queries(result.sub_questions)
-    original_parts = _split_explicit_sub_questions(fallback_query)
-    if sub_queries and len(original_parts) == len(sub_queries):
-        # 模型只负责拆分与字段识别，子问题文本保留用户原句，避免“相差多少/如何计算”
-        # 这类多步要求被改写丢失。
-        sub_queries = [
-            sub.model_copy(update={"query": part}) for sub, part in zip(sub_queries, original_parts, strict=True)
-        ]
     terms = list(
         dict.fromkeys(
             [
@@ -313,11 +271,10 @@ def build_power_spec_query(result: PowerSpecIntentResult, *, fallback_query: str
                 *([device_type] if device_type else []),
                 *([voltage_level] if voltage_level else []),
                 *keywords,
-                *[term for sub_query in sub_queries for term in sub_query.normalized_terms],
             ]
         )
     )
-    clarification_required = intent == "其他类型" and not device_type and not voltage_level and not sub_queries
+    clarification_required = intent == "其他类型" and not device_type and not voltage_level
     return PowerSpecQuery(
         query=result.question.strip() or fallback_query,
         intent=intent,
@@ -329,58 +286,7 @@ def build_power_spec_query(result: PowerSpecIntentResult, *, fallback_query: str
         unknown_terms=[term for term in terms if term not in dimensions],
         clarification_required=clarification_required,
         clarification_message=("未能识别完整的查询信息，请明确查询类型或设备信息" if clarification_required else None),
-        sub_queries=sub_queries,
     )
-
-
-def _split_explicit_sub_questions(text: str) -> list[str]:
-    """按“问题1./1.”等显式编号拆出保留原句的子问题。"""
-
-    parts = [part.strip(" \n。；;") for part in SUBQUESTION_SPLIT_PATTERN.split(str(text or ""))]
-    return [part for part in parts if len(part) >= 8]
-
-
-def _build_sub_queries(items: list[PowerSpecIntentQuestion]) -> list[PowerSpecSubQuery]:
-    """把模型拆出的子问题转换为下游模型；少于两个时不启用多问题模式。"""
-
-    sub_queries: list[PowerSpecSubQuery] = []
-    seen: set[str] = set()
-    for item in items:
-        text = item.question.strip()
-        if not text or text in seen:
-            continue
-        intent: PowerSpecIntent = item.intent if item.intent in INTENT_VALUES else "其他类型"  # type: ignore[assignment]
-        dimensions = _clean_terms(item.answer_dimensions, limit=MAX_DIMENSIONS)
-        keywords = _clean_terms(item.keywords, limit=MAX_KEYWORDS)
-        device_type = _clean_optional(item.device_type)
-        voltage_level = _clean_optional(item.voltage_level)
-        terms = list(
-            dict.fromkeys(
-                [
-                    *dimensions,
-                    *([device_type] if device_type else []),
-                    *([voltage_level] if voltage_level else []),
-                    *keywords,
-                ]
-            )
-        )
-        try:
-            sub_query = PowerSpecSubQuery(
-                query=text,
-                intent=intent,
-                device_name=_clean_optional(item.device_name),
-                device_type=device_type,
-                voltage_level=voltage_level,
-                answer_dimensions=dimensions,
-                normalized_terms=terms,
-            )
-        except ValidationError:
-            continue
-        seen.add(text)
-        sub_queries.append(sub_query)
-        if len(sub_queries) >= MAX_SUB_QUESTIONS:
-            break
-    return sub_queries if len(sub_queries) >= 2 else []
 
 
 def _parse_intent(raw: str | dict[str, Any]) -> PowerSpecIntentResult:
@@ -445,7 +351,6 @@ def build_intent_plan(query: PowerSpecQuery) -> dict[str, Any]:
         "normalized_terms": query.normalized_terms,
         "unknown_terms": query.unknown_terms,
         "normalized_query": query.query,
-        "sub_questions": [sub.model_dump(mode="json") for sub in query.sub_queries],
     }
 
 
@@ -494,14 +399,6 @@ def query_from_confirmed_plan(plan: dict[str, Any], *, fallback: PowerSpecQuery)
     query_text = str(plan.get("normalized_query") or "").strip()
     if not query_text:
         return fallback
-    sub_queries: list[PowerSpecSubQuery] = []
-    for item in (plan.get("sub_questions") or [])[:MAX_SUB_QUESTIONS]:
-        if not isinstance(item, dict):
-            continue
-        try:
-            sub_queries.append(PowerSpecSubQuery.model_validate(item))
-        except (ValidationError, ValueError, TypeError):
-            continue
     try:
         return PowerSpecQuery(
             query=query_text,
@@ -512,7 +409,6 @@ def query_from_confirmed_plan(plan: dict[str, Any], *, fallback: PowerSpecQuery)
             answer_dimensions=[str(item) for item in (plan.get("answer_dimensions") or [])],
             normalized_terms=[str(item) for item in (plan.get("normalized_terms") or [])],
             unknown_terms=[str(item) for item in (plan.get("unknown_terms") or [])],
-            sub_queries=sub_queries,
         )
     except (ValueError, TypeError):
         return fallback
@@ -521,31 +417,14 @@ def query_from_confirmed_plan(plan: dict[str, Any], *, fallback: PowerSpecQuery)
 def build_confirmation_payload(intent_plan: dict[str, Any]) -> dict[str, Any]:
     """构造意图确认卡片，展示模型对问题的重述与识别结果。"""
 
-    sub_questions = intent_plan.get("sub_questions") or []
-    if sub_questions:
-        lines = [f"我对您一次提出的 {len(sub_questions)} 个问题的理解是："]
-        for index, item in enumerate(sub_questions, start=1):
-            dimensions = item.get("answer_dimensions") or []
-            if isinstance(dimensions, str):
-                dimensions = [dimensions]
-            lines.append(
-                f"{index}. {item.get('query') or ''}"
-                f"（类型={item.get('intent') or '其他类型'}；"
-                f"设备={item.get('device_type') or '未识别'}；"
-                f"电压等级={item.get('voltage_level') or '未识别'}；"
-                f"维度={', '.join(str(value) for value in dimensions) or '未识别'}）"
-            )
-        lines.append(f"整体检索口径：{intent_plan['normalized_query']}。是否正确？")
-        question_text = "\n".join(lines)
-    else:
-        question_text = (
-            "我对您问题的理解是："
-            f"{intent_plan['normalized_query']}。"
-            f"查询类型={intent_plan['intent']}；"
-            f"设备={intent_plan['device_type'] or '未识别'}；"
-            f"电压等级={intent_plan['voltage_level'] or '未识别'}；"
-            f"问题维度={', '.join(intent_plan['answer_dimensions']) or '未识别'}。是否正确？"
-        )
+    question_text = (
+        "我对您问题的理解是："
+        f"{intent_plan['normalized_query']}。"
+        f"查询类型={intent_plan['intent']}；"
+        f"设备={intent_plan['device_type'] or '未识别'}；"
+        f"电压等级={intent_plan['voltage_level'] or '未识别'}；"
+        f"问题维度={', '.join(intent_plan['answer_dimensions']) or '未识别'}。是否正确？"
+    )
     return {
         "source": "power_spec_intent_confirmation",
         "questions": [

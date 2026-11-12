@@ -57,7 +57,7 @@ _CLAUSE_QUERY = """
 MATCH (a:答案 {id: $aid})-[r:依据条款]->(c:条款)
 RETURN c.标准编号 AS cstd, c.条款号 AS cno, c.条款标题 AS ctitle,
        c.表号 AS ctable, c.标准页 AS cpage, c.PDF页 AS cpdf, c.章节 AS csection,
-       c.状态 AS cstatus, r.原文片段 AS cexcerpt, r.排序 AS crank, r.分组 AS cgroup
+       c.状态 AS cstatus, r.原文片段 AS cexcerpt, r.排序 AS crank
 LIMIT $clause_limit
 """
 
@@ -83,7 +83,6 @@ class PowerSpecGraphCitation:
     excerpt: str | None = None
     status: str = "现行"
     rank: int = 1
-    group: int = 0
 
 
 @dataclass(frozen=True)
@@ -97,7 +96,6 @@ class PowerSpecGraphHit:
     score: float
     expected_behavior: str | None
     refusal: bool
-    matched_group: int
     citations: tuple[PowerSpecGraphCitation, ...] = ()
     answer_text: str | None = None
     cross_source: bool = False
@@ -122,7 +120,6 @@ class GraphResolution:
 class _QuestionKey:
     key: str
     text: str
-    group: int
     kind: str
     index: int
 
@@ -239,7 +236,7 @@ def find_power_spec_qa_hit(
     client = TuGraphClient(config)
     try:
         rows = client.run(_QUESTION_QUERY, question_limit=POWER_SPEC_QA_GRAPH_QUESTION_LIMIT)
-        texts = [query.query, original_query_text, *[sub.query for sub in query.sub_queries]]
+        texts = [query.query, original_query_text]
         matched = match_question_rows(rows, [text for text in dict.fromkeys(texts) if text])
         if matched is None:
             return None
@@ -261,7 +258,7 @@ def find_power_spec_qa_hit(
                 clause_limit=POWER_SPEC_QA_GRAPH_CLAUSE_LIMIT,
             )
             citations = _load_citations(citation_rows)
-        citations.sort(key=lambda item: _citation_sort_key(item, key.group))
+        citations.sort(key=lambda item: (item.rank, _natural_clause_key(clause_identity_key(item.clause_no))))
         return PowerSpecGraphHit(
             question_id=row.question_id,
             question=row.question,
@@ -270,7 +267,6 @@ def find_power_spec_qa_hit(
             score=score,
             expected_behavior=row.expected_behavior,
             refusal=refusal,
-            matched_group=key.group,
             citations=tuple(citations),
             answer_text=_optional_text(answer.get("atext")),
             cross_source=_truthy(answer.get("across")),
@@ -336,7 +332,7 @@ def _question_row(raw: Mapping[str, Any]) -> _QuestionRow | None:
         return None
     keys = _load_keys(raw.get("qkeys"))
     if not keys:
-        keys = (_QuestionKey(normalize_question_text(question), question, 0, "标准书面", 0),)
+        keys = (_QuestionKey(normalize_question_text(question), question, "标准书面", 0),)
     return _QuestionRow(
         question_id=question_id,
         question=question,
@@ -355,17 +351,15 @@ def _load_keys(raw: Any) -> tuple[_QuestionKey, ...]:
     for index, item in enumerate(payload):
         if isinstance(item, str):
             text = item
-            group = 0
             kind = "标准书面"
         elif isinstance(item, Mapping):
             text = str(item.get("text") or item.get("key") or "").strip()
-            group = _as_int(item.get("group"), 0)
             kind = str(item.get("type") or "标准书面")
         else:
             continue
         key = normalize_question_text(text)
         if key and all(existing.key != key for existing in keys):
-            keys.append(_QuestionKey(key=key, text=text, group=group, kind=kind, index=index))
+            keys.append(_QuestionKey(key=key, text=text, kind=kind, index=index))
     return tuple(keys)
 
 
@@ -391,7 +385,6 @@ def _load_citations(rows: Sequence[Mapping[str, Any]]) -> list[PowerSpecGraphCit
                 excerpt=_optional_text(row.get("cexcerpt")),
                 status=_optional_text(row.get("cstatus")) or "现行",
                 rank=max(_as_int(row.get("crank"), 1), 1),
-                group=max(_as_int(row.get("cgroup"), 0), 0),
             )
         )
     return citations
@@ -554,8 +547,6 @@ def _build_graph_evidence(
         metadata={
             "qa_graph_hit": True,
             "graph_rank": citation.rank,
-            "graph_group": citation.group,
-            "graph_matched_group": hit.matched_group,
             "graph_question_id": hit.question_id,
             "graph_matched_variant": hit.matched_variant,
             "graph_match_kind": hit.match_kind,
@@ -604,14 +595,6 @@ def _format_standard_match(match: re.Match[str]) -> str:
 
 def _negation_set(text: str) -> frozenset[str]:
     return frozenset(marker for marker in _NEGATION_MARKERS if marker in text)
-
-
-def _citation_sort_key(
-    citation: PowerSpecGraphCitation,
-    matched_group: int,
-) -> tuple[int, int, tuple[tuple[int, int | str], ...]]:
-    group_priority = 0 if matched_group == 0 or citation.group == matched_group else 1
-    return (group_priority, citation.rank, _natural_clause_key(clause_identity_key(citation.clause_no)))
 
 
 def _natural_clause_key(value: str) -> tuple[tuple[int, int | str], ...]:

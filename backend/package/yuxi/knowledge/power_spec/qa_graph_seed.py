@@ -30,7 +30,6 @@ from typing import Any
 
 from neo4j import GraphDatabase
 
-from yuxi.knowledge.power_spec.contracts import SUBQUESTION_SPLIT_PATTERN
 from yuxi.knowledge.power_spec.qa_graph import (
     PowerSpecGraphCitation,
     PowerSpecGraphHit,
@@ -127,7 +126,7 @@ _EDGE_SCHEMAS: dict[str, tuple[tuple[str, str], tuple[tuple[str, str, str], ...]
     "有答案": (("问题", "答案"), ()),
     "依据条款": (
         ("答案", "条款"),
-        (("排序", "rank", "INT64"), ("分组", "grp", "INT64"), ("原文片段", "excerpt", "STRING")),
+        (("排序", "rank", "INT64"), ("原文片段", "excerpt", "STRING")),
     ),
     "属于标准": (("条款", "标准"), ()),
 }
@@ -143,7 +142,6 @@ class SeedVariant:
 
     text: str
     kind: str
-    group: int = 0
 
 
 @dataclass(frozen=True)
@@ -157,7 +155,6 @@ class SeedCitation:
     excerpt: str | None = None
     status: str = "现行"
     rank: int = 1
-    group: int = 0
 
 
 @dataclass(frozen=True)
@@ -309,7 +306,7 @@ def _parse_compact_xlsx_question(
         answer=answer,
         atomic_claims=claims_by_number.get(number, ()),
         scoring=scoring,
-        variants=tuple(_dedup_variants(_variant_group(text, "标准书面"))),
+        variants=tuple(_dedup_variants([SeedVariant(text, "标准书面")])),
         citations=tuple(citations),
         refusal=refusal,
         cross_source=False,
@@ -559,7 +556,6 @@ def seed_graph(
                     dst_value=clause_id,
                     set_props=(
                         ("排序", "rank", citation.rank),
-                        ("分组", "grp", citation.group),
                         ("原文片段", "excerpt", citation.excerpt or citation.section or ""),
                     ),
                 )
@@ -685,7 +681,8 @@ def _parse_xlsx_question(sheet_type: str, row: Sequence[Any]) -> SeedQuestion:
         ("口语化", _text(row[4])),
         ("行业俗语", _text(row[5])),
     ):
-        variants.extend(_variant_group(value, kind))
+        if value.strip():
+            variants.append(SeedVariant(value, kind))
     citations = _parse_section_citations(section, standard_basis, context=_text(row[9]))
     refusal = sheet_type == "neg" or "拒答" in expected_behavior
     if refusal:
@@ -713,7 +710,7 @@ def _parse_xlsx_question(sheet_type: str, row: Sequence[Any]) -> SeedQuestion:
 
 
 def _markdown_variants(block: str, title: str, *, modern: bool) -> list[SeedVariant]:
-    variants = [SeedVariant(title, "标准书面", 0)]
+    variants = [SeedVariant(title, "标准书面")]
     if modern:
         section = _section(block, r"^###\s*2\.\s*用户问法变体", r"^###\s*3\.")
         table_variants = _new_table_variants(section)
@@ -724,7 +721,7 @@ def _markdown_variants(block: str, title: str, *, modern: bool) -> list[SeedVari
     if modern:
         question = _bold_after(block, r"###\s*1\.\s*用户问题")
         if question:
-            variants.append(SeedVariant(question, "标准书面", 0))
+            variants.append(SeedVariant(question, "标准书面"))
     return _dedup_variants(variants)
 
 
@@ -739,7 +736,7 @@ def _legacy_table_variants(section: str) -> list[SeedVariant]:
         for round_text in re.split(r"<br\s*/?>", text):
             round_text = re.sub(r"第\s*\d+\s*轮[：:]\s*", "", round_text).strip()
             if round_text:
-                variants.append(SeedVariant(round_text, kind, 0))
+                variants.append(SeedVariant(round_text, kind))
     return variants
 
 
@@ -752,7 +749,7 @@ def _new_table_variants(section: str) -> list[SeedVariant]:
         cells = [cell.strip() for cell in stripped.strip("|").split("|")]
         if len(cells) < 2 or set(cells[0]) <= {"-", " "} or cells[0] in {"问法类型", "编号"}:
             continue
-        variants.append(SeedVariant(cells[1], cells[0], 0))
+        variants.append(SeedVariant(cells[1], cells[0]))
     return variants
 
 
@@ -826,12 +823,11 @@ def _parse_section_citations(
     citations: list[SeedCitation] = []
     rank = 0
     for index, raw_line in enumerate(line for line in section.splitlines() if line.strip()):
-        group = 0
         line = raw_line.strip()
-        leading = re.match(r"^(\d{1,2})\s*[.、]\s*(.*)$", line)
+        # 测评集可能用 “1.” “2.” 给依据条款编号；编号不是条款号，解析条款前先剥掉。
+        leading = re.match(r"^\d{1,2}\s*[.、]\s*(.*)$", line)
         if leading:
-            group = int(leading.group(1))
-            line = leading.group(2).strip()
+            line = leading.group(1).strip()
         fallback = target_standards[min(index, len(target_standards) - 1)] if target_standards else None
         pairs = _parse_standard_clause_pairs(line, [fallback] if fallback else target_standards[:1])
         if not pairs:
@@ -849,7 +845,6 @@ def _parse_section_citations(
                             table_no=table,
                             excerpt=context or raw_line.strip(),
                             rank=rank,
-                            group=group,
                         )
                     )
             continue
@@ -863,7 +858,6 @@ def _parse_section_citations(
                     table_no=_table_no(pair_text),
                     excerpt=context or pair_text,
                     rank=rank,
-                    group=group,
                 )
             )
     return _dedup_citations(citations)
@@ -995,20 +989,9 @@ def _dedup_citations(citations: Sequence[SeedCitation]) -> list[SeedCitation]:
                 excerpt=citation.excerpt,
                 status=citation.status,
                 rank=len(result) + 1,
-                group=citation.group,
             )
         )
     return result
-
-
-def _variant_group(text: str, kind: str) -> list[SeedVariant]:
-    if not text:
-        return []
-    variants = [SeedVariant(text, kind, 0)]
-    parts = [part.strip(" \n。；;") for part in SUBQUESTION_SPLIT_PATTERN.split(text)]
-    for index, part in enumerate(part for part in parts if len(part) >= 6):
-        variants.append(SeedVariant(part, f"{kind}#问题{index + 1}", index + 1))
-    return variants
 
 
 def _dedup_variants(variants: Sequence[SeedVariant]) -> list[SeedVariant]:
@@ -1204,13 +1187,12 @@ def _question_props(question: SeedQuestion) -> dict[str, Any]:
         {
             "key": normalize_question_text(variant.text),
             "text": variant.text,
-            "group": variant.group,
             "type": variant.kind,
         }
         for variant in question.variants
         if normalize_question_text(variant.text)
     ]
-    variants = [{"text": item.text, "type": item.kind, "group": item.group} for item in question.variants]
+    variants = [{"text": item.text, "type": item.kind} for item in question.variants]
     return {
         "id": question.question_id,
         "题号": question.number,
@@ -1253,7 +1235,6 @@ def _seed_hit(question: SeedQuestion) -> PowerSpecGraphHit:
         score=1.0,
         expected_behavior=question.expected_behavior,
         refusal=question.refusal,
-        matched_group=0,
         citations=tuple(
             PowerSpecGraphCitation(
                 standard_no=citation.standard_no,
@@ -1263,7 +1244,6 @@ def _seed_hit(question: SeedQuestion) -> PowerSpecGraphHit:
                 excerpt=citation.excerpt,
                 status=citation.status,
                 rank=citation.rank,
-                group=citation.group,
             )
             for citation in question.citations
         ),

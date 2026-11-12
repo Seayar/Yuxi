@@ -218,12 +218,9 @@ def _first_card_hit(cards: list[dict[str, Any]], citations: list[dict[str, Any]]
 
 
 def _format_answer_for_judge(record: dict[str, Any]) -> str:
-    """把最终卡片压成裁判可读的文本，优先保留问题回答摘要、前几张图谱卡和表格正文。"""
+    """把最终卡片压成裁判可读的文本，优先保留前几张图谱卡和表格正文。"""
 
     answer = str(record.get("answer") or "")
-    if "### 问题回答" in answer:
-        # 多问题回答摘要位于卡片之前；它本身就是答案，必须让裁判看到。
-        return answer[:JUDGE_ANSWER_CHARS]
     cards = record.get("cards") or []
     if not cards:
         return answer[:JUDGE_ANSWER_CHARS]
@@ -491,7 +488,7 @@ def _judge_prompt(record: dict[str, Any]) -> str:
 {_format_answer_for_judge(record)}
 
 ## 答案形态
-AI 答案可能以“### 问题回答”摘要开头，后面是若干规范卡片。摘要和卡片都属于答案；条款正文就是规范原文，表格中的数值按表头和行列条件读取。不要把“没有单独写成一句结论”当作未回答：只要摘要、卡片或表格中包含与问题条件一致的数值、单位和条件，就算覆盖关键事实。第一张卡片是图谱 pinned 的直接映射；第一张是引言时，继续查看后续卡片中的表格行。
+AI 答案是若干规范卡片；条款正文就是规范原文，表格中的数值按表头和行列条件读取。不要把“没有单独写成一句结论”当作未回答：只要卡片或表格中包含与问题条件一致的数值、单位和条件，就算覆盖关键事实。第一张卡片是图谱 pinned 的直接映射；第一张是引言时，继续查看后续卡片中的表格行。
 
 ## 判定规则
 1. 先逐条查找标准答案的关键事实（数值、单位、条件、标准编号、条款/表号）是否能在卡片正文或表格中找到。

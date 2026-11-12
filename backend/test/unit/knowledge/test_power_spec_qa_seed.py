@@ -93,7 +93,7 @@ def _seed_question(**overrides) -> SeedQuestion:
         "answer": "检查本体。",
         "atomic_claims": ("检查本体。",),
         "scoring": "正确=1分。",
-        "variants": (SeedVariant("主变巡视检查什么？", "标准书面", 0),),
+        "variants": (SeedVariant("主变巡视检查什么？", "标准书面"),),
         "citations": (
             SeedCitation(
                 "DL/T 393—2021",
@@ -306,6 +306,7 @@ def test_seed_graph_writes_schema_nodes_and_edges(monkeypatch):
     statements = [cypher for session in driver.sessions for cypher, _params in session.calls]
     assert any("CALL db.createVertexLabel('问题'" in statement for statement in statements)
     assert any("CALL db.createEdgeLabel('依据条款'" in statement for statement in statements)
+    assert all("分组" not in statement and "grp" not in statement for statement in statements)
     edge_calls = [
         params
         for session in driver.sessions
@@ -319,8 +320,8 @@ def test_seed_graph_writes_schema_nodes_and_edges(monkeypatch):
 def test_question_props_contain_all_matching_keys():
     question = _seed_question(
         variants=(
-            SeedVariant("主变巡视检查什么？", "标准书面", 0),
-            SeedVariant("主变平时巡检都看什么？", "语音口语句", 0),
+            SeedVariant("主变巡视检查什么？", "标准书面"),
+            SeedVariant("主变平时巡检都看什么？", "语音口语句"),
         )
     )
 
@@ -328,8 +329,24 @@ def test_question_props_contain_all_matching_keys():
     keys = json.loads(props["命中键"])
 
     assert [item["text"] for item in keys] == ["主变巡视检查什么？", "主变平时巡检都看什么？"]
+    assert set(keys[0]) == {"key", "text", "type"}
     assert props["来源"] == "md"
     assert props["跨源要求"] == "false"
+
+
+def test_section_citations_strip_leading_item_numbering():
+    """测评集用“1./2.”给依据条款编号时，编号不进入条款号。"""
+
+    citations = seed_module._parse_section_citations(
+        "1. DL/T 408-2023 6.3.2\n2. DL/T 596-2021 4.5",
+        "DL/T 408-2023",
+    )
+
+    assert [(item.standard_no, item.clause_no) for item in citations] == [
+        ("DL/T 408-2023", "6.3.2"),
+        ("DL/T 596-2021", "4.5"),
+    ]
+    assert [item.rank for item in citations] == [1, 2]
 
 
 def test_refusal_seed_has_no_citation_but_valid_props():

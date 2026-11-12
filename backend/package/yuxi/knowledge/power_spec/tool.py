@@ -22,7 +22,6 @@ from yuxi.knowledge.power_spec.contracts import (
     POWER_SPEC_THINKING_STEPS,
     PowerSpecQuery,
     SpecClauseEvidence,
-    SUBQUESTION_SPLIT_PATTERN,
 )
 from yuxi.knowledge.power_spec.ingestion import is_power_spec_metadata_ready
 from yuxi.knowledge.power_spec.qa_graph import (
@@ -65,8 +64,8 @@ POWER_SPEC_RETRIEVAL_OPTIONS = {
     "graph_top_k": 20,
     "final_top_k": 30,
 }
-# 一个用户问题最多拆成几条主检索路线：改写问题、原始问题、多问题中的每个子问题，
-# 以及宽问题的角度扩展。超过这个数量后新增路线的边际收益低于重排与延迟成本。
+# 一个用户问题最多拆成几条主检索路线：改写问题、原始问题与宽问题的角度扩展。
+# 超过这个数量后新增路线的边际收益低于重排与延迟成本。
 POWER_SPEC_MAX_PRIMARY_ROUTES = 7
 # 宽问题（注意事项/有哪些/如何检查处理）按设备维度拆出的角度数量；每个角度单独召回，
 # 弥补单个泛查询在稠密检索里只覆盖一个子话题的问题。
@@ -524,7 +523,6 @@ def _qa_graph_payload(
         "matched_variant": hit.matched_variant if hit else None,
         "match_kind": hit.match_kind if hit else None,
         "score": hit.score if hit else None,
-        "matched_group": hit.matched_group if hit else None,
         "citation_count": len(hit.citations) if hit else 0,
         "resolved_count": resolved_count,
         "unmatched": [f"{item.standard_no} {item.clause_no}" for item in unmatched],
@@ -554,10 +552,9 @@ async def _retrieve_for_query(
     *,
     original_query_text: str,
 ) -> list[dict[str, Any]]:
-    """按改写问题、原始问题、显式子问题、宽问题角度与关键词召回，多路结果按 chunk 合并。
+    """按改写问题、原始问题、宽问题角度与关键词召回，多路结果按 chunk 合并。
 
-    单个长问题在稠密检索里容易被其中一个子话题主导；多问题（问题1./问题2.）尤其明显，
-    第一个子问题的正确条款可能完全进不了候选池。宽问题（注意事项/有哪些/如何检查处理）
+    单个长问题在稠密检索里容易被其中一个子话题主导。宽问题（注意事项/有哪些/如何检查处理）
     还会按设备与电压拆成安装、运行、检修试验、保护、冷却/油/接地等角度，让每个角度都有
     独立进入候选池的机会。关键词路仍走 floor 规则，避免泛化词劫持排序。
     未配置重排模型时所有路线都关闭重排。
@@ -618,14 +615,12 @@ async def _retrieve_for_query(
 
 
 def _retrieval_routes(original_query_text: str, query: PowerSpecQuery) -> list[str]:
-    """返回主检索路线：改写问题、模型拆出的子问题、原始问题、显式子问题与角度。"""
+    """返回主检索路线：改写问题、原始问题与宽问题角度。"""
 
     routes = [query.query.strip()]
-    routes.extend(sub.query.strip() for sub in query.sub_queries)
     original = original_query_text.strip()
     if original and original != routes[0]:
         routes.append(original)
-    routes.extend(_subquestion_routes(original))
     if _needs_angle_expansion(original, query):
         routes.extend(_angle_routes(query))
     return list(dict.fromkeys(route for route in routes if route))[:POWER_SPEC_MAX_PRIMARY_ROUTES]
@@ -650,15 +645,6 @@ def _angle_routes(query: PowerSpecQuery) -> list[str]:
         return []
     prefix = " ".join(part for part in (query.voltage_level, device) if part)
     return [f"{prefix} {angle}" for angle in _POWER_SPEC_ANGLE_CHECKLIST[:POWER_SPEC_ANGLE_ROUTES]]
-
-
-def _subquestion_routes(text: str) -> list[str]:
-    """按显式多问题标记拆分子问题；没有标记时返回空列表。"""
-
-    parts = [part.strip(" \n。；;") for part in SUBQUESTION_SPLIT_PATTERN.split(text)]
-    if len(parts) <= 1:
-        return []
-    return [part for part in parts if len(part) >= 8][:POWER_SPEC_MAX_PRIMARY_ROUTES]
 
 
 def _merge_primary_results(result_sets: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:

@@ -1,15 +1,10 @@
 from __future__ import annotations
 
-import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from yuxi.thinking import ThinkingStepSpec, register_thinking_steps
-
-# 显式子问题标记：只识别“问题1.”、“1.”这类编号，`1.5Um`、`10kV、35kV` 不当成编号。
-# 检索路线拆分（tool）、意图拆分（intent）与测评集入库（qa_graph_seed）共用这一条规则。
-SUBQUESTION_SPLIT_PATTERN = re.compile(r"(?:^|[\s。；;])(?:问题\s*\d+|\d{1,2}[.、](?!\d))\s*[.、:：]?\s*")
 
 
 POWER_SPEC_THINKING_STEPS = (
@@ -40,20 +35,6 @@ PLAIN_TOOL_MESSAGES = frozenset(
 )
 
 
-class PowerSpecSubQuery(BaseModel):
-    """表示一次多问题查询中拆分出的单个独立子问题。"""
-
-    model_config = ConfigDict(frozen=True)
-
-    query: str = Field(min_length=1)
-    intent: PowerSpecIntent = "其他类型"
-    device_name: str | None = None
-    device_type: str | None = None
-    voltage_level: str | None = None
-    answer_dimensions: list[str] = Field(default_factory=list)
-    normalized_terms: list[str] = Field(default_factory=list)
-
-
 class PowerSpecQuery(BaseModel):
     """表示一次意图分析后的电力规范查询。"""
 
@@ -69,7 +50,6 @@ class PowerSpecQuery(BaseModel):
     unknown_terms: list[str] = Field(default_factory=list)
     clarification_required: bool = False
     clarification_message: str | None = None
-    sub_queries: list[PowerSpecSubQuery] = Field(default_factory=list)
 
 
 class SpecClauseEvidence(BaseModel):
