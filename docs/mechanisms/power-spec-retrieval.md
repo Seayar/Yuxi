@@ -220,7 +220,9 @@ sequenceDiagram
 - [电力规范路由接入](https://github.com/xerrors/Yuxi/blob/main/backend/server/routers/knowledge_router.py)：解析任务追加条款提取，分页读全 Markdown
 - [条款解析与重建](https://github.com/xerrors/Yuxi/blob/main/backend/package/yuxi/knowledge/power_spec/ingestion.py)：标准信息、条款边界、范围识别、质量门与元数据重建
 - [意图分析](https://github.com/xerrors/Yuxi/blob/main/backend/package/yuxi/knowledge/power_spec/intent.py)：模型意图识别、规则兜底与确认卡片
-- [召回与校验](https://github.com/xerrors/Yuxi/blob/main/backend/package/yuxi/knowledge/power_spec/retrieval.py)：证据适配、现行过滤、维度匹配、投影校验与字段校对
+- [测评图谱运行时](https://github.com/xerrors/Yuxi/blob/main/backend/package/yuxi/knowledge/power_spec/qa_graph.py)：问题命中、TuGraph 只读查询、知识库条款解析与证据构造
+- [测评图谱导入](https://github.com/xerrors/Yuxi/blob/main/backend/package/yuxi/knowledge/power_spec/qa_graph_seed.py)：两套测评集解析、质量门、图创建、Schema 与幂等写入
+- [召回与校验](https://github.com/xerrors/Yuxi/blob/main/backend/package/yuxi/knowledge/power_spec/retrieval.py)：证据适配、图谱优先融合、现行过滤、维度匹配、投影校验与字段校对
 - [答案组织与渲染](https://github.com/xerrors/Yuxi/blob/main/backend/package/yuxi/knowledge/power_spec/answer.py)：整理、审查与最终合并编排、四字段卡片渲染
 - [检索工具](https://github.com/xerrors/Yuxi/blob/main/backend/package/yuxi/knowledge/power_spec/tool.py)：权限、意图确认、行为链编排与结果缓存
 - [数据契约](https://github.com/xerrors/Yuxi/blob/main/backend/package/yuxi/knowledge/power_spec/contracts.py)：查询、证据与验证结果模型
@@ -234,6 +236,52 @@ sequenceDiagram
 ## 分层调试
 
 每一层都能独立调用，因此可以先用一次调用定位断点，再决定是否需要重建数据。以下命令都在仓库根目录执行，`api` 是后端容器。命令使用 Compose v2 的 `docker compose` 形式，只提供旧版入口的环境改用 `docker-compose`，参数不变。
+
+### 测评图谱导入与调试
+
+开发环境的 `api` 服务只读挂载 `./srs:/app/srs`。先 dry-run 检查两套测评集解析与质量门，再写入图；`--kb-id` 会用真实知识库校验每条条款映射，`--strict-kb` 在 READY 题存在缺口时阻止写图。
+
+```bash
+docker compose exec -T api python -m yuxi.knowledge.power_spec.qa_graph_seed \
+  --xlsx /app/srs/power_rag_testset-V2-最新.xlsx \
+  --md /app/srs/模块一电力规范检索_最终50题测试集_Q01-Q50.md \
+  --kb-id kb_xxx --strict-kb --dry-run
+
+docker compose exec -T -e POWER_SPEC_GRAPH_PASSWORD='<password>' api \
+  python -m yuxi.knowledge.power_spec.qa_graph_seed \
+  --xlsx /app/srs/power_rag_testset-V2-最新.xlsx \
+  --md /app/srs/模块一电力规范检索_最终50题测试集_Q01-Q50.md \
+  --uri bolt://<tugraph-host>:7688 --graph power_spec_qa --username admin --replace
+```
+
+判据：dry-run 输出 `questions=100`、`answers=100`，非拒答题都有条款映射；`--strict-kb` 的 `required_failures` 为空。写图后 `write.counts` 的 `问题`/`答案` 应等于 100，`条款`/`标准`/`有答案`/`依据条款`/`属于标准` 与 `counts` 计划一致。`--replace` 会先清空目标图的数据与 schema，修改测评集、导入规则或 Schema 后使用它，避免旧边和旧属性残留。
+
+运行时命中可直接用 Python 复现：构造 `PowerSpecQuery`，调用 `find_power_spec_qa_hit` 后把 `PowerSpecRepository` 的 ready 元数据交给 `resolve_hit_evidence`，检查首条证据的 `standard_no`、`clause_no` 和 `metadata["qa_graph_hit"]`。图谱未配置时检查 `power_spec_graph_opts`；图谱已配置但查询失败时检查 `power_spec_qa` 图是否存在以及 Bolt 地址/凭据。
+
+### 50 题全单跳精简回归集
+
+`backend/scripts/build_power_spec_50_single_hop.py` 从两套测评集生成 `srs/power_rag_testset_50_single_hop_verified.xlsx`。工作簿只保留 7 个业务字段，包含 22 道 xlsx 单跳题（15 道标准问法 + 7 道同题口语变体）和 28 道 md 单跳题；xlsx 多跳、比对、拒答以及 md 阻断、跨源、负向题不进入该集。隐藏工作表 `内部数据` 保存原子事实，供答案级裁判使用，不属于 7 个业务字段。
+
+生成脚本逐题校验基线裁判 1.0、引用非空、md 为 `READY_FOR_E2E`、题干不含显式多问题编号和图谱 `exact` 命中。`qa_graph_seed.load_xlsx_questions` 识别 `序号` 表头后按精简格式解析，`补充用例` 映射为 md 来源。
+
+```bash
+docker compose exec -T api python scripts/build_power_spec_50_single_hop.py \
+  --xlsx /app/srs/power_rag_testset-V2-最新.xlsx \
+  --md /app/srs/模块一电力规范检索_最终50题测试集_Q01-Q50.md \
+  --baseline-report /app/srs/power_spec_eval/report.json \
+  --output /app/runtime/power_spec_50_single_hop/power_rag_testset_50_single_hop_verified.xlsx
+
+docker compose exec -T api python -m yuxi.knowledge.power_spec.qa_graph_seed \
+  --xlsx /app/srs/power_rag_testset_50_single_hop_verified.xlsx \
+  --kb-id kb_xxx --strict-kb --dry-run
+
+docker compose exec -T api python scripts/evaluate_power_spec_answers.py run \
+  --xlsx /app/srs/power_rag_testset_50_single_hop_verified.xlsx --no-md \
+  --kb-id kb_xxx --uid <运行账号 uid> --model local:Qwen3.6-35B-A3B-w8a8 \
+  --output-dir /app/runtime/power_spec_50_single_hop --concurrency 2 --evidence-limit 6
+```
+
+判据：生成脚本输出 50 题、22 道单跳、28 道补充、7 道变体且图谱全部 `exact`；`--strict-kb` 的 `required_failures` 为空；全量裁判 `correct >= 48/50`。5 题试点为 5/5；50 题首轮为 48/50（96.0%），xlsx 22/22、md 26/28，`md:Q01`、`md:Q11` 未通过，复跑待完成。该集是精选单跳回归集，不是随机抽样；全量 100 题准确率仍以 `srs/power_spec_eval/report.md` 的 72/100 为准。决策记录见 [电力规范 50 题全单跳精选集](../develop-guides/decisions/proposed/2026-11-02-power-spec-50-single-hop-benchmark.md)。
 
 ### 环境自检
 
