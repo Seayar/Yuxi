@@ -7,9 +7,12 @@ from types import SimpleNamespace
 import pytest
 
 from yuxi.knowledge.power_spec.answer import (
+    COMPOSE_INSTRUCTION,
     ORGANIZER_SLUG,
+    REVIEWER_INSTRUCTION,
     REVIEWER_SLUG,
     SubagentReply,
+    build_organizer_message,
     build_subagent_caller,
     organize_review_compose,
     parse_organized_draft,
@@ -109,7 +112,7 @@ class BrokenComposer:
         raise RuntimeError("模型不可用")
 
 
-def _run(caller, composer, *, dimensions=("周期",), evidences=None):
+def _run(caller, composer, *, dimensions=("周期",), evidences=None, sub_questions=()):
     return organize_review_compose(
         question=QUESTION,
         dimensions=dimensions,
@@ -117,6 +120,7 @@ def _run(caller, composer, *, dimensions=("周期",), evidences=None):
         call_subagent=caller,
         call_compose=composer,
         tool_call_id="call-1",
+        sub_questions=sub_questions,
     )
 
 
@@ -163,6 +167,45 @@ async def test_review_opinions_are_passed_into_final_compose():
     assert [issue.kind for issue in answer.issues] == ["事实错误"]
     assert "原文按电压等级区分周期" in composer.prompts[0]
     assert answer.draft.clauses[0].body == FINAL_BODY
+
+
+def test_reviewer_instruction_is_faithfulness_only():
+    """审查只核对整理内容是否忠实于原文，不判断条款是否切题或覆盖是否充分。"""
+
+    assert "忠实" in REVIEWER_INSTRUCTION
+    assert "编造" in REVIEWER_INSTRUCTION
+    assert "语义改变" in REVIEWER_INSTRUCTION
+    assert "引用" in REVIEWER_INSTRUCTION
+    assert "不判断条款是否切题" in REVIEWER_INSTRUCTION
+    assert "无关内容" not in REVIEWER_INSTRUCTION
+    assert "遗漏：原文中直接回答用户问题" not in REVIEWER_INSTRUCTION
+
+
+def test_compose_instruction_forbids_relevance_deletion():
+    """最终合并只修正忠实性问题，不得以“与问题无关”为由删除条款或删减正文。"""
+
+    assert "忠实性" in COMPOSE_INSTRUCTION
+    assert "不得因为某条款" in COMPOSE_INSTRUCTION
+    assert "删除该条款" in COMPOSE_INSTRUCTION
+    assert "条款取舍由上游检索决定" in COMPOSE_INSTRUCTION
+
+
+@pytest.mark.asyncio
+async def test_out_of_scope_review_issue_is_not_passed_to_compose():
+    """负向：模型仍输出“无关内容”时，该意见不得进入最终合并提示词。"""
+
+    caller = Caller(
+        [_draft("220kV 变压器周期为 6 个月。")],
+        [_opinions({"kind": "无关内容", "detail": "该条款与用户问题无关，应删除"})],
+    )
+    composer = Composer([_draft(FINAL_BODY)])
+
+    answer = await _run(caller, composer)
+
+    assert answer is not None
+    assert answer.issues == []
+    assert "该条款与用户问题无关" not in composer.prompts[0]
+    assert "审查未提出问题" in composer.prompts[0]
 
 
 @pytest.mark.asyncio
@@ -427,6 +470,52 @@ def test_ungrounded_numbers_still_flags_invented_values():
 
 def test_ungrounded_numbers_normalizes_fullwidth_digits():
     assert ungrounded_numbers("周期 １２ 个月", ["周期 12 个月"]) == []
+
+
+def test_organizer_message_lists_multiple_questions():
+    """整理者必须看到每个子问题，不能只看到合并后的长问题。"""
+
+    message = build_organizer_message(
+        "整体问题",
+        [Evidence(BODY)],
+        ["静置时间", "绝缘状态"],
+        ["子问题一：静置时间是多少？", "子问题二：如何判断绝缘状态？"],
+    )
+
+    assert "用户一次提出的多个问题" in message
+    assert "1. 子问题一：静置时间是多少？" in message
+    assert "2. 子问题二：如何判断绝缘状态？" in message
+    assert "不要只回答第一个" in message
+
+
+@pytest.mark.asyncio
+async def test_multi_question_answers_survive_organize_review_compose():
+    """整理者给出的逐题结论必须经过审查与合并保留下来。"""
+
+    draft = json.dumps(
+        {
+            "clauses": [{"citation_key": "file-1#6.1", "body": FINAL_BODY}],
+            "answers": [
+                {
+                    "question": "220kV 变压器色谱周期是多少？",
+                    "answer": "220kV 变压器每 6 个月执行一次。",
+                    "citation_keys": ["file-1#6.1"],
+                }
+            ],
+        },
+        ensure_ascii=False,
+    )
+    answer = await _run(
+        Caller([draft], [_opinions()]),
+        Composer([draft]),
+        dimensions=("周期",),
+        sub_questions=("220kV 变压器色谱周期是多少？",),
+    )
+
+    assert answer is not None
+    assert len(answer.draft.answers) == 1
+    assert answer.draft.answers[0].answer == "220kV 变压器每 6 个月执行一次。"
+    assert answer.draft.answers[0].citation_keys == ["file-1#6.1"]
 
 
 def test_ungrounded_numbers_allows_numbers_from_the_question():

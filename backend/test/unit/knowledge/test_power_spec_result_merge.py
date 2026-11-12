@@ -1,6 +1,16 @@
 import pytest
 
-from yuxi.knowledge.power_spec.tool import _merge_results
+from yuxi.knowledge.power_spec import tool as tool_module
+from yuxi.knowledge.power_spec.contracts import PowerSpecQuery, PowerSpecSubQuery
+from yuxi.knowledge.power_spec.intent import parse_power_spec_query
+from yuxi.knowledge.power_spec.tool import (
+    _angle_routes,
+    _merge_primary_results,
+    _merge_results,
+    _needs_angle_expansion,
+    _retrieval_routes,
+    _subquestion_routes,
+)
 
 
 def _result(clause_no: str, score: float, *, file_id: str = "f1") -> dict:
@@ -49,3 +59,129 @@ def test_base_entry_wins_when_both_paths_return_the_same_chunk():
     assert len(merged) == 1
     assert merged[0]["rerank_score"] == pytest.approx(0.30)
     assert not merged[0]["metadata"].get("keyword_only")
+
+
+def test_subquestion_routes_split_explicit_multi_question_markers():
+    """显式“问题1./问题2.”必须拆成独立检索路线，否则长问题会被一个子话题主导。"""
+
+    text = "问题1. 500kV 变压器注油后静置时间是多少小时？ 问题2. 局放超标时如何结合 DGA 判断绝缘状态？"
+
+    assert _subquestion_routes(text) == [
+        "500kV 变压器注油后静置时间是多少小时？",
+        "局放超标时如何结合 DGA 判断绝缘状态？",
+    ]
+
+
+def test_subquestion_routes_ignore_decimal_and_voltage_lists():
+    """负向：1.5Um、10kV、35kV 这类数值不能被当成问题编号拆开。"""
+
+    assert _subquestion_routes("在 1.5Um/√3 试验电压下局放超标怎么办？") == []
+    assert _subquestion_routes("10kV、35kV 及 110kV 高压设备不停电时的最小安全距离是多少？") == []
+
+
+def test_retrieval_routes_keep_rewrite_original_and_subquestions():
+    """路线顺序固定为改写问题、原始问题、子问题，并受上限约束。"""
+
+    query = PowerSpecQuery(query="改写后的问题", intent="其他类型")
+    routes = _retrieval_routes("问题1. 子问题一的具体内容是什么？ 问题2. 子问题二的具体内容是什么？", query)
+
+    assert routes == [
+        "改写后的问题",
+        "问题1. 子问题一的具体内容是什么？ 问题2. 子问题二的具体内容是什么？",
+        "子问题一的具体内容是什么？",
+        "子问题二的具体内容是什么？",
+    ]
+
+
+def test_retrieval_routes_use_model_split_sub_queries():
+    """模型拆出的子问题优先进入召回路线，显式正则只做兜底去重。"""
+
+    text = "问题1. 子问题一的具体内容是什么？ 问题2. 子问题二的具体内容是什么？"
+    query = PowerSpecQuery(
+        query="改写后的问题",
+        intent="其他类型",
+        sub_queries=[
+            PowerSpecSubQuery(query="子问题一的具体内容是什么？"),
+            PowerSpecSubQuery(query="子问题二的具体内容是什么？"),
+        ],
+    )
+
+    assert _retrieval_routes(text, query) == [
+        "改写后的问题",
+        "子问题一的具体内容是什么？",
+        "子问题二的具体内容是什么？",
+        text,
+    ]
+
+
+def test_merge_primary_results_keeps_max_score_and_counts_route_hits():
+    """同一 chunk 被多路召回时取最高分，并记录命中路线数供排序加权。"""
+
+    merged = _merge_primary_results(
+        [
+            [_result("A", 0.5), _result("B", 0.4)],
+            [_result("A", 0.7), _result("C", 0.3)],
+        ]
+    )
+    by_clause = {item["metadata"]["chunk_id"]: item for item in merged}
+
+    assert set(by_clause) == {"A", "B", "C"}
+    assert by_clause["A"]["rerank_score"] == pytest.approx(0.7)
+    assert by_clause["A"]["metadata"]["route_hits"] == 2
+    assert by_clause["B"]["metadata"]["route_hits"] == 1
+
+
+def test_broad_question_expands_to_device_angles():
+    """宽问题按设备与电压拆成安装、运行、检修试验、保护、冷却/油/接地角度。"""
+
+    text = "110kV电力变压器有哪些注意事项"
+    query = parse_power_spec_query(text)
+
+    assert _needs_angle_expansion(text, query) is True
+    angles = _angle_routes(query)
+
+    assert len(angles) == 5
+    assert angles[0] == "110kV 变压器 安装与交接试验"
+    assert all(angle.startswith("110kV 变压器 ") for angle in angles)
+    assert any("保护与监测" in angle for angle in angles)
+
+
+def test_broad_question_routes_include_angles():
+    """宽问题的检索路线包含角度查询，而不是只发一个泛查询。"""
+
+    text = "110kV电力变压器有哪些注意事项"
+    query = parse_power_spec_query(text)
+    routes = _retrieval_routes(text, query)
+
+    assert len(routes) == 6
+    assert any("安装与交接试验" in route for route in routes)
+    assert any("冷却、绝缘油与接地" in route for route in routes)
+
+
+def test_specific_numeric_question_does_not_expand_angles():
+    """负向：具体数值问题不按角度拆分，避免无谓的召回与延迟。"""
+
+    text = "110kV变压器温升限值是多少"
+    query = parse_power_spec_query(text)
+
+    assert _needs_angle_expansion(text, query) is False
+    assert _retrieval_routes(text, query) == [query.query]
+
+
+def test_broad_question_without_device_does_not_expand_angles():
+    """负向：没有设备类型时无法定向扩展，不能凭空拼角度查询。"""
+
+    text = "有哪些注意事项"
+    query = parse_power_spec_query(text)
+
+    assert _needs_angle_expansion(text, query) is False
+    assert _angle_routes(query) == []
+
+
+def test_angle_routes_are_capped_by_configuration(monkeypatch):
+    """角度数量由 POWER_SPEC_ANGLE_ROUTES 控制，避免每个宽问题都发满所有角度。"""
+
+    query = parse_power_spec_query("110kV电力变压器有哪些注意事项")
+    monkeypatch.setattr(tool_module, "POWER_SPEC_ANGLE_ROUTES", 2)
+
+    assert len(_angle_routes(query)) == 2

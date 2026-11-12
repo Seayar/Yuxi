@@ -20,6 +20,14 @@ from yuxi.knowledge.power_spec.tool import NO_EVIDENCE_MESSAGE, search_power_spe
 RAW_BODY = "220kV:6个月；35kV～110kV：1年；总烃：150"
 QUESTION = "220kV变压器油中溶解气体分析的周期"
 
+
+@pytest.fixture(autouse=True)
+def _disable_qa_graph(monkeypatch):
+    """答案组织测试默认不访问真实 TuGraph；图谱卡片由专门用例构造。"""
+
+    monkeypatch.setattr(tool_module, "POWER_SPEC_QA_GRAPH_ENABLED", False)
+
+
 # 原文中没有 12，用于验证数字检查能识别编造。
 FABRICATED = "220kV 变压器的试验周期为 12 个月。"
 GROUNDED = "220kV 变压器的试验周期为 6 个月。"
@@ -391,6 +399,7 @@ async def test_keyword_recall_failure_is_visible_in_warnings():
         query,
         "local:reranker",
         warnings,
+        original_query_text=query.query,
     )
 
     assert len(executor.calls) == 2

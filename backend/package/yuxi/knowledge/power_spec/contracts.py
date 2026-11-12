@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from yuxi.thinking import ThinkingStepSpec, register_thinking_steps
+
+# 显式子问题标记：只识别“问题1.”、“1.”这类编号，`1.5Um`、`10kV、35kV` 不当成编号。
+# 检索路线拆分（tool）、意图拆分（intent）与测评集入库（qa_graph_seed）共用这一条规则。
+SUBQUESTION_SPLIT_PATTERN = re.compile(r"(?:^|[\s。；;])(?:问题\s*\d+|\d{1,2}[.、](?!\d))\s*[.、:：]?\s*")
 
 
 POWER_SPEC_THINKING_STEPS = (
@@ -24,13 +29,29 @@ PowerSpecIntent = Literal["设备参数查询", "检修标准查询", "安全规
 NO_EVIDENCE_MESSAGE = "未检索到资料"
 KNOWLEDGE_BASE_NOT_READY_MESSAGE = "电力规范知识库尚未完成条款级重建"
 INTENT_ATTEMPTS_EXHAUSTED_MESSAGE = "多次未确认问题意图，请重新描述您的电力规范问题"
+OUT_OF_SCOPE_MESSAGE = "已上传的电力规范未包含该问题的规定"
 PLAIN_TOOL_MESSAGES = frozenset(
     {
         NO_EVIDENCE_MESSAGE,
         KNOWLEDGE_BASE_NOT_READY_MESSAGE,
         INTENT_ATTEMPTS_EXHAUSTED_MESSAGE,
+        OUT_OF_SCOPE_MESSAGE,
     }
 )
+
+
+class PowerSpecSubQuery(BaseModel):
+    """表示一次多问题查询中拆分出的单个独立子问题。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    query: str = Field(min_length=1)
+    intent: PowerSpecIntent = "其他类型"
+    device_name: str | None = None
+    device_type: str | None = None
+    voltage_level: str | None = None
+    answer_dimensions: list[str] = Field(default_factory=list)
+    normalized_terms: list[str] = Field(default_factory=list)
 
 
 class PowerSpecQuery(BaseModel):
@@ -48,6 +69,7 @@ class PowerSpecQuery(BaseModel):
     unknown_terms: list[str] = Field(default_factory=list)
     clarification_required: bool = False
     clarification_message: str | None = None
+    sub_queries: list[PowerSpecSubQuery] = Field(default_factory=list)
 
 
 class SpecClauseEvidence(BaseModel):
@@ -68,6 +90,8 @@ class SpecClauseEvidence(BaseModel):
     rerank_score: float | None = None
     match_score: float | None = None
     source_file: str | None = None
+    # 卡片末尾 PDF 标记使用的原始文档地址，由检索层从 knowledge_files 解析。
+    source_url: str | None = None
     source_page: int | None = Field(default=None, ge=1)
     source_page_ref: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)

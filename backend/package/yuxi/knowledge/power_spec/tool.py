@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import os
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
 from langgraph.prebuilt.tool_node import ToolRuntime
@@ -16,11 +17,22 @@ from yuxi.knowledge.power_spec.contracts import (
     INTENT_ATTEMPTS_EXHAUSTED_MESSAGE,
     KNOWLEDGE_BASE_NOT_READY_MESSAGE,
     NO_EVIDENCE_MESSAGE,
+    OUT_OF_SCOPE_MESSAGE,
     POWER_SPEC_AGENT_SLUG,
     POWER_SPEC_THINKING_STEPS,
     PowerSpecQuery,
+    SpecClauseEvidence,
+    SUBQUESTION_SPLIT_PATTERN,
 )
 from yuxi.knowledge.power_spec.ingestion import is_power_spec_metadata_ready
+from yuxi.knowledge.power_spec.qa_graph import (
+    POWER_SPEC_QA_GRAPH_ENABLED,
+    PowerSpecGraphCitation,
+    PowerSpecGraphHit,
+    find_power_spec_qa_hit,
+    resolve_hit_evidence,
+    resolve_power_spec_graph_config,
+)
 from yuxi.knowledge.power_spec.intent import (
     MAX_INTENT_ATTEMPTS,
     PowerSpecIntentModelCall,
@@ -46,11 +58,35 @@ from yuxi.utils import logger
 
 
 POWER_SPEC_RETRIEVAL_OPTIONS = {
-    "recall_top_k": 30,
-    "bm25_top_k": 30,
+    # 知识库自身配置就是 recall=50/bm25=50；工具原先压到 30 会让候选池比
+    # query_kb 还窄。召回宽度按知识库能力保留，最终证据条数由检索层单独限制。
+    "recall_top_k": 50,
+    "bm25_top_k": 50,
     "graph_top_k": 20,
-    "final_top_k": 20,
+    "final_top_k": 30,
 }
+# 一个用户问题最多拆成几条主检索路线：改写问题、原始问题、多问题中的每个子问题，
+# 以及宽问题的角度扩展。超过这个数量后新增路线的边际收益低于重排与延迟成本。
+POWER_SPEC_MAX_PRIMARY_ROUTES = 7
+# 宽问题（注意事项/有哪些/如何检查处理）按设备维度拆出的角度数量；每个角度单独召回，
+# 弥补单个泛查询在稠密检索里只覆盖一个子话题的问题。
+POWER_SPEC_ANGLE_ROUTES = int(os.getenv("POWER_SPEC_ANGLE_ROUTES", "5"))
+
+
+class PowerSpecAllRoutesFailedError(RuntimeError):
+    """全部主召回路线都失败时抛出；只允许这种失败在存在图谱命中证据时被降级吞掉。"""
+
+
+# 宽问题的常见问法；命中后按角度拆查询，而不是只发一个“注意事项”泛查询。
+_POWER_SPEC_BROAD_MARKERS = ("注意事项", "有哪些", "如何", "检查", "处理", "要求", "包括", "内容", "措施", "要点")
+# 电力设备通用的关注角度。角度只决定“检索方向”，最终证据仍由重排与条款级过滤决定。
+_POWER_SPEC_ANGLE_CHECKLIST = (
+    "安装与交接试验",
+    "运行巡视与维护",
+    "检修与预防性试验",
+    "保护与监测",
+    "冷却、绝缘油与接地",
+)
 POWER_SPEC_KEYWORD_QUERY_TERMS = int(os.getenv("POWER_SPEC_KEYWORD_QUERY_TERMS", "8"))
 POWER_SPEC_CLAUSE_REVIEW_ENABLED = os.getenv("POWER_SPEC_CLAUSE_REVIEW_ENABLED", "true").strip().lower() not in {
     "0",
@@ -120,7 +156,37 @@ async def search_power_spec(
                 error={"code": "intent_attempts_exhausted", "message": query},
             )
             return query
-    if query.clarification_required:
+    emitter.emit(
+        "parse_query",
+        "completed",
+        content=_intent_summary(query),
+        data=_intent_data(query),
+    )
+
+    degradation_warnings: list[str] = []
+    qa_graph_hit: PowerSpecGraphHit | None = None
+    qa_graph_state = "disabled"
+    qa_graph_error: str | None = None
+    if POWER_SPEC_QA_GRAPH_ENABLED:
+        graph_config = await resolve_power_spec_graph_config()
+        if graph_config is None:
+            qa_graph_state = "unconfigured"
+        else:
+            qa_graph_state = "configured"
+            try:
+                qa_graph_hit = await asyncio.to_thread(
+                    find_power_spec_qa_hit,
+                    graph_config,
+                    query,
+                    original_query_text=query_text,
+                )
+            except Exception as exc:  # noqa: BLE001
+                qa_graph_state = "failed"
+                qa_graph_error = str(exc)
+                logger.warning(f"电力规范问答图谱查询失败，按常规检索继续: {exc}")
+                degradation_warnings.append("知识图谱命中检查失败，已按常规检索继续")
+
+    if query.clarification_required and qa_graph_hit is None:
         emitter.emit(
             "parse_query",
             "waiting",
@@ -133,12 +199,6 @@ async def search_power_spec(
             "needs_clarification": True,
             "thinking_steps": emitter.snapshot(),
         }
-    emitter.emit(
-        "parse_query",
-        "completed",
-        content=_intent_summary(query),
-        data=_intent_data(query),
-    )
 
     emitter.emit("retrieve_kb", "started", content="正在检索规程标准知识库。")
     visible_kbs = await resolve_visible_knowledge_bases_for_context(context)
@@ -161,9 +221,56 @@ async def search_power_spec(
         )
         return NO_EVIDENCE_MESSAGE
 
+    # 纠错/跨源答案与范围外拒答都发布图谱内容，必须在知识库可见性闭合之后：
+    # 没有可见电力规范库的用户拿不到图答案，也拿不到“规范未包含该问题”的结论。
+    if qa_graph_hit is not None and (qa_graph_hit.corrective or qa_graph_hit.cross_source):
+        graph_answer = str(qa_graph_hit.answer_text or "").strip()
+        if graph_answer:
+            # 错误前提/违章和跨源题的回答对象不是某一条规范卡片，图谱答案节点保存的
+            # 纠正/跨源结论就是最终答案；返回可发布的 answer_markdown，避免模型改写。
+            answer_mode = "corrective" if qa_graph_hit.corrective else "cross_source"
+            payload = {
+                "status": "ok",
+                "evidence_found": True,
+                "spec_results": [],
+                "answer_markdown": graph_answer,
+                "retrieval_mode": f"qa_graph_{answer_mode}",
+                "evidence_verified": True,
+                "answer_source": "qa_graph_answer",
+                "answer_verified": True,
+                "warnings": [],
+                "qa_graph": _qa_graph_payload(qa_graph_hit, state=qa_graph_state, error=qa_graph_error),
+                "thinking_steps": [],
+            }
+            emitter.emit(
+                "retrieve_kb",
+                "completed",
+                content="已命中测评图谱中的纠错/跨源答案。",
+                data=payload["qa_graph"],
+            )
+            emitter.emit("locate_clauses", "completed", content="图谱答案已通过答案节点校验。")
+            emitter.emit(
+                "generate_result",
+                "completed",
+                content="已发布图谱纠错/跨源答案。",
+                data={"card_count": 0, "answer_source": "qa_graph_answer", "answer_verified": True},
+            )
+            payload["thinking_steps"] = emitter.snapshot()
+            setattr(context, "_power_spec_search_result", payload)
+            return payload
+
+    if qa_graph_hit is not None and qa_graph_hit.refusal and not qa_graph_hit.corrective:
+        emitter.emit(
+            "retrieve_kb",
+            "failed",
+            content=OUT_OF_SCOPE_MESSAGE,
+            error={"code": "qa_graph_out_of_scope", "message": OUT_OF_SCOPE_MESSAGE},
+        )
+        setattr(context, "_power_spec_search_result", OUT_OF_SCOPE_MESSAGE)
+        return OUT_OF_SCOPE_MESSAGE
+
     config = await knowledge_base.get_kb_config(kb_id)
     reranker_model = config.query_options.get("reranker_model") or None
-    degradation_warnings: list[str] = []
     if not reranker_model:
         # 重排是可选能力：没有它仍然检索，排序退化为召回分数，并把降级原因带进结果。
         logger.warning(f"知识库 {kb_id} 未配置 reranker_model，按召回分数排序")
@@ -173,7 +280,23 @@ async def search_power_spec(
     async with pg_manager.get_async_session_context() as db:
         power_spec_repository = PowerSpecRepository()
         metadata_by_file_id = await power_spec_repository.list_power_spec_extractions(db, kb_id=kb_id)
-    files_ready = sum(1 for metadata in metadata_by_file_id.values() if is_power_spec_metadata_ready(metadata))
+    ready_metadata = {
+        file_id: metadata for file_id, metadata in metadata_by_file_id.items() if is_power_spec_metadata_ready(metadata)
+    }
+    files_ready = len(ready_metadata)
+
+    qa_evidence: list[SpecClauseEvidence] = []
+    qa_unmatched: list[PowerSpecGraphCitation] = []
+    if qa_graph_hit is not None:
+        resolution = resolve_hit_evidence(qa_graph_hit, ready_metadata)
+        qa_evidence = resolution.evidence
+        qa_unmatched = resolution.unmatched
+        if qa_unmatched:
+            degradation_warnings.append(f"知识图谱命中有 {len(qa_unmatched)} 条条款未在知识库中找到，已按常规检索继续")
+        if not qa_evidence:
+            degradation_warnings.append("知识图谱命中但未解析出知识库条款，已按常规检索继续")
+        else:
+            logger.info(f"电力规范问答图谱命中 {qa_graph_hit.question_id}，解析出 {len(qa_evidence)} 条知识库条款")
 
     raw_results: list[dict[str, Any]] | None = None
     evidence_cache = None
@@ -183,19 +306,24 @@ async def search_power_spec(
         nonlocal raw_results, evidence_cache, knowledge_base_not_ready
         if evidence_cache is not None:
             return evidence_cache
-        raw_results = await _retrieve_for_query(
-            executor,
-            config,
-            kb_id,
-            query,
-            reranker_model,
-            degradation_warnings,
-        )
-        ready_file_ids = {
-            file_id for file_id, metadata in metadata_by_file_id.items() if is_power_spec_metadata_ready(metadata)
-        }
+        try:
+            raw_results = await _retrieve_for_query(
+                executor,
+                config,
+                kb_id,
+                query,
+                reranker_model,
+                degradation_warnings,
+                original_query_text=query_text,
+            )
+        except PowerSpecAllRoutesFailedError:
+            if not qa_evidence:
+                raise
+            logger.warning("电力规范常规召回全部失败，使用图谱命中证据继续")
+            degradation_warnings.append("常规召回全部失败，已仅使用知识图谱命中")
+            raw_results = []
         filtered_results = [
-            item for item in raw_results if str((item.get("metadata") or {}).get("file_id") or "") in ready_file_ids
+            item for item in raw_results if str((item.get("metadata") or {}).get("file_id") or "") in ready_metadata
         ]
         knowledge_base_not_ready = not filtered_results and bool(raw_results)
         evidence_cache = adapt_vector_results(filtered_results, metadata_by_file_id, query.query)
@@ -208,16 +336,29 @@ async def search_power_spec(
     async def vector_search(_query_text):
         return await load_evidence()
 
-    result = await PowerSpecSearchService(graph_search, vector_search).search(query)
+    result = await PowerSpecSearchService(graph_search, vector_search).search(
+        query,
+        graph_hit_evidence=qa_evidence,
+    )
     keyword_query = _keyword_query_text(query)
+    qa_graph_data = _qa_graph_payload(
+        qa_graph_hit,
+        state=qa_graph_state,
+        error=qa_graph_error,
+        resolved_count=len(qa_evidence),
+        unmatched=qa_unmatched,
+    )
     retrieval_data = {
         "kb_id": kb_id,
         "files_ready": files_ready,
         "vector_count": len(raw_results or []),
+        "routes": len(_retrieval_routes(query_text, query)),
+        "angles": len(_angle_routes(query)) if _needs_angle_expansion(query_text, query) else 0,
         "keyword_count": len(keyword_query.split()) if keyword_query else 0,
         "candidate_count": len(result.evidence),
         "reranker": reranker_model or "none",
         "degraded": not reranker_model,
+        "qa_graph": qa_graph_data,
     }
     emitter.emit(
         "retrieve_kb",
@@ -226,7 +367,23 @@ async def search_power_spec(
         data=retrieval_data,
     )
 
-    if knowledge_base_not_ready:
+    if result.clarification:
+        # 测评图谱命中但解析不出任何知识库条款、且问题仍需澄清：回到澄清卡片，
+        # 不得把“没有证据的成功”发出去（service 的澄清短路只在这种组合出现）。
+        emitter.emit(
+            "locate_clauses",
+            "waiting",
+            content=result.clarification,
+            data={"clarification": result.clarification, "needs_confirmation": True},
+        )
+        return {
+            "query": query.model_dump(mode="json"),
+            "clarification": result.clarification,
+            "needs_clarification": True,
+            "thinking_steps": emitter.snapshot(),
+        }
+
+    if knowledge_base_not_ready and not qa_evidence:
         emitter.emit(
             "locate_clauses",
             "failed",
@@ -287,8 +444,11 @@ async def search_power_spec(
             error={"code": "generate_result_failed", "message": str(exc)},
         )
         raise
-    retrieval_mode = ("graph+" if any(item.metadata.get("graph_score") is not None for item in reviewed) else "") + (
-        "vector+rerank" if reranker_model else "vector"
+    graph_acknowledged = any(item.metadata.get("graph_score") is not None for item in reviewed)
+    retrieval_mode = (
+        ("qa_graph+" if qa_evidence else "")
+        + ("graph+" if graph_acknowledged else "")
+        + ("vector+rerank" if reranker_model else "vector")
     )
     result_payload = {
         "status": "ok",
@@ -300,6 +460,7 @@ async def search_power_spec(
         "answer_source": organized["answer_source"],
         "answer_verified": organized["answer_verified"],
         "warnings": degradation_warnings,
+        "qa_graph": qa_graph_data,
         "thinking_steps": emitter.snapshot(),
     }
     emitter.emit(
@@ -339,6 +500,39 @@ def _intent_data(query: PowerSpecQuery) -> dict[str, Any]:
     }
 
 
+def _qa_graph_payload(
+    hit: PowerSpecGraphHit | None,
+    *,
+    state: str,
+    error: str | None,
+    resolved_count: int = 0,
+    unmatched: Sequence[PowerSpecGraphCitation] = (),
+) -> dict[str, Any]:
+    """返回工具结果中的图谱命中摘要，供思考链和排障读取。"""
+
+    if hit is None:
+        answer_mode = "none"
+    elif hit.corrective:
+        answer_mode = "corrective"
+    elif hit.cross_source:
+        answer_mode = "cross_source"
+    else:
+        answer_mode = "cards"
+    return {
+        "state": state,
+        "question_id": hit.question_id if hit else None,
+        "matched_variant": hit.matched_variant if hit else None,
+        "match_kind": hit.match_kind if hit else None,
+        "score": hit.score if hit else None,
+        "matched_group": hit.matched_group if hit else None,
+        "citation_count": len(hit.citations) if hit else 0,
+        "resolved_count": resolved_count,
+        "unmatched": [f"{item.standard_no} {item.clause_no}" for item in unmatched],
+        "error": error,
+        "answer_mode": answer_mode,
+    }
+
+
 async def _review_clause_metadata(context: Any, evidence: list[Any]) -> tuple[list[Any], int]:
     """由模型校对条款编号与标题，只应用通过代码校验的字符级修复；返回修复条数。"""
 
@@ -357,27 +551,51 @@ async def _retrieve_for_query(
     query: PowerSpecQuery,
     reranker_model: str | None,
     degradation_warnings: list[str],
+    *,
+    original_query_text: str,
 ) -> list[dict[str, Any]]:
-    """按模型给出的问题与关键词召回，多路结果按 chunk 合并。
+    """按改写问题、原始问题、显式子问题、宽问题角度与关键词召回，多路结果按 chunk 合并。
 
-    模型已经判断过应该用什么词检索，因此除重述后的完整问题外，再用关键词召回一路，
-    弥补长问题在稠密检索中语义被稀释的情况。未配置重排模型时两路都关闭重排。
+    单个长问题在稠密检索里容易被其中一个子话题主导；多问题（问题1./问题2.）尤其明显，
+    第一个子问题的正确条款可能完全进不了候选池。宽问题（注意事项/有哪些/如何检查处理）
+    还会按设备与电压拆成安装、运行、检修试验、保护、冷却/油/接地等角度，让每个角度都有
+    独立进入候选池的机会。关键词路仍走 floor 规则，避免泛化词劫持排序。
+    未配置重排模型时所有路线都关闭重排。
     """
 
     rerank_kwargs = (
         {"use_reranker": True, "reranker_model": reranker_model} if reranker_model else {"use_reranker": False}
     )
-    base = await executor.aquery(
-        query.query,
-        kb_id,
-        config=config,
-        agent_call=True,
-        use_graph_retrieval=False,
-        **rerank_kwargs,
-        **POWER_SPEC_RETRIEVAL_OPTIONS,
-    )
+    routes = _retrieval_routes(original_query_text, query)
+    logger.debug(f"电力规范召回路线（{len(routes)} 路）: {routes}")
+    result_sets: list[list[dict[str, Any]]] = []
+    failed_routes = 0
+    for route in routes:
+        try:
+            result_sets.append(
+                await executor.aquery(
+                    route,
+                    kb_id,
+                    config=config,
+                    agent_call=True,
+                    use_graph_retrieval=False,
+                    **rerank_kwargs,
+                    **POWER_SPEC_RETRIEVAL_OPTIONS,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            failed_routes += 1
+            logger.warning(f"电力规范召回路线失败，跳过: {exc}")
+    if not result_sets:
+        raise PowerSpecAllRoutesFailedError("电力规范所有召回路线均失败")
+    if failed_routes:
+        # 可选召回路线降级必须可观察：结果里带上降级原因，不能只留日志。
+        degradation_warnings.append(f"{failed_routes} 路召回失败，已使用其余 {len(result_sets)} 路结果")
+    base = _merge_primary_results(result_sets)
+
     keyword_query = _keyword_query_text(query)
     if not keyword_query:
+        logger.info(f"电力规范多路召回：{len(routes)} 路问题召回合并 {len(base)} 条")
         return base
     try:
         keyword_results = await executor.aquery(
@@ -391,11 +609,78 @@ async def _retrieve_for_query(
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(f"关键词召回失败，仅使用问题召回: {exc}")
-        # 可选召回路径降级必须可观察：结果里带上降级原因，不能只留日志。
         degradation_warnings.append(f"关键词召回失败，已仅使用问题召回: {exc}")
         return base
-    logger.info(f"电力规范多路召回：问题 {len(base)} 条，关键词「{keyword_query}」{len(keyword_results)} 条")
+    logger.info(
+        f"电力规范多路召回：{len(routes)} 路问题召回 {len(base)} 条，关键词「{keyword_query}」{len(keyword_results)} 条"
+    )
     return _merge_results(base, keyword_results)
+
+
+def _retrieval_routes(original_query_text: str, query: PowerSpecQuery) -> list[str]:
+    """返回主检索路线：改写问题、模型拆出的子问题、原始问题、显式子问题与角度。"""
+
+    routes = [query.query.strip()]
+    routes.extend(sub.query.strip() for sub in query.sub_queries)
+    original = original_query_text.strip()
+    if original and original != routes[0]:
+        routes.append(original)
+    routes.extend(_subquestion_routes(original))
+    if _needs_angle_expansion(original, query):
+        routes.extend(_angle_routes(query))
+    return list(dict.fromkeys(route for route in routes if route))[:POWER_SPEC_MAX_PRIMARY_ROUTES]
+
+
+def _needs_angle_expansion(original_query_text: str, query: PowerSpecQuery) -> bool:
+    """判断宽问题是否需要按角度拆分；具体数值/单维度问题不拆。"""
+
+    text = original_query_text or query.query
+    if not any(marker in text for marker in _POWER_SPEC_BROAD_MARKERS):
+        return False
+    if len(query.answer_dimensions) > 1:
+        return False
+    return bool((query.device_name or query.device_type or "").strip())
+
+
+def _angle_routes(query: PowerSpecQuery) -> list[str]:
+    """按设备与电压拼出角度查询；没有设备时无法定向扩展，返回空列表。"""
+
+    device = (query.device_name or query.device_type or "").strip()
+    if not device:
+        return []
+    prefix = " ".join(part for part in (query.voltage_level, device) if part)
+    return [f"{prefix} {angle}" for angle in _POWER_SPEC_ANGLE_CHECKLIST[:POWER_SPEC_ANGLE_ROUTES]]
+
+
+def _subquestion_routes(text: str) -> list[str]:
+    """按显式多问题标记拆分子问题；没有标记时返回空列表。"""
+
+    parts = [part.strip(" \n。；;") for part in SUBQUESTION_SPLIT_PATTERN.split(text)]
+    if len(parts) <= 1:
+        return []
+    return [part for part in parts if len(part) >= 8][:POWER_SPEC_MAX_PRIMARY_ROUTES]
+
+
+def _merge_primary_results(result_sets: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    """按 chunk 合并多路问题召回，保留最高分并记录命中路线数。"""
+
+    merged: dict[str, dict[str, Any]] = {}
+    for results in result_sets:
+        for item in results:
+            key = _result_identity(item)
+            metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+            current = merged.get(key)
+            if current is None:
+                merged[key] = {**item, "metadata": {**metadata, "route_hits": 1}}
+                continue
+            current_metadata = current.get("metadata") if isinstance(current.get("metadata"), dict) else {}
+            hits = int(current_metadata.get("route_hits") or 1) + 1
+            current_score = float(current.get("rerank_score") or current.get("score") or 0.0)
+            item_score = float(item.get("rerank_score") or item.get("score") or 0.0)
+            chosen = item if item_score > current_score else current
+            chosen_metadata = chosen.get("metadata") if isinstance(chosen.get("metadata"), dict) else {}
+            merged[key] = {**chosen, "metadata": {**chosen_metadata, "route_hits": hits}}
+    return list(merged.values())
 
 
 def _keyword_query_text(query: PowerSpecQuery) -> str:
@@ -435,7 +720,7 @@ def _merge_results(base: list[dict[str, Any]], extra: list[dict[str, Any]]) -> l
         metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
         merged[key] = {
             **item,
-            "metadata": {**metadata, "keyword_only": True},
+            "metadata": {**metadata, "keyword_only": True, "route_hits": 1},
             "rerank_score": min(float(item.get("rerank_score") or item.get("score") or 0.0), floor),
         }
     return list(merged.values())

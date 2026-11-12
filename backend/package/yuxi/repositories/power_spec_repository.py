@@ -69,21 +69,32 @@ class PowerSpecRepository:
         *,
         kb_id: str,
     ) -> dict[str, dict[str, Any]]:
-        """读取知识库中文件级电力规范派生元数据。"""
+        """读取知识库中文件级电力规范派生元数据与原始文件地址。
+
+        原始文件地址只作为 ``source_url`` 进入返回值，不写回 ``processing_params``。
+        """
 
         result = await db.execute(
-            select(KnowledgeFile.file_id, KnowledgeFile.processing_params).where(
+            select(
+                KnowledgeFile.file_id,
+                KnowledgeFile.processing_params,
+                KnowledgeFile.path,
+                KnowledgeFile.minio_url,
+            ).where(
                 KnowledgeFile.kb_id == kb_id,
                 KnowledgeFile.is_folder.is_(False),
             )
         )
         metadata_by_file_id: dict[str, dict[str, Any]] = {}
-        for file_id, processing_params in result.all():
+        for file_id, processing_params, path, minio_url in result.all():
             if not isinstance(processing_params, dict):
                 continue
             power_spec_metadata = processing_params.get("power_spec")
             if isinstance(power_spec_metadata, dict):
-                metadata_by_file_id[str(file_id)] = dict(power_spec_metadata)
+                metadata = dict(power_spec_metadata)
+                # 卡片末尾的 PDF 标记需要可请求的原始文档地址；minio_url 优先于 path。
+                metadata["source_url"] = minio_url or path
+                metadata_by_file_id[str(file_id)] = metadata
         return metadata_by_file_id
 
     async def list_file_names(

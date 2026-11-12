@@ -54,6 +54,40 @@ def test_adapt_vector_results_preserves_chunk_index_for_source_order():
     assert evidence[0].metadata["chunk_index"] == 7
 
 
+def test_adapt_vector_results_carries_route_hits_for_fusion_weighting():
+    """适配层丢弃 route_hits 时，服务层多路命中加权恒读 1、融合加分静默失效（C1 加权负向）。"""
+
+    evidence = adapt_vector_results(
+        [
+            {
+                "content": "有人值班变电站每日巡视。",
+                "rerank_score": 0.91,
+                "metadata": {"file_id": "file-1", "chunk_id": "chunk-1", "route_hits": 2},
+            }
+        ],
+        {"file-1": DOCUMENT_METADATA},
+    )
+
+    assert evidence[0].metadata["route_hits"] == 2
+
+
+def test_adapt_vector_results_carries_source_url_for_pdf_marker():
+    source_url = "http://minio:9000/knowledgebases/kb-1/upload/DL_T_572.pdf"
+
+    evidence = adapt_vector_results(
+        [
+            {
+                "content": "有人值班变电站每日巡视。",
+                "rerank_score": 0.91,
+                "metadata": {"file_id": "file-1", "chunk_id": "chunk-1"},
+            }
+        ],
+        {"file-1": {**DOCUMENT_METADATA, "source_url": source_url}},
+    )
+
+    assert evidence[0].source_url == source_url
+
+
 def test_adapt_vector_results_ignores_unmapped_files_and_clauses():
     evidence = adapt_vector_results(
         [

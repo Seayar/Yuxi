@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import re
+import unicodedata
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from typing import Any
 
@@ -27,8 +28,8 @@ VectorSearch = Callable[[str], Awaitable[Sequence[SpecClauseEvidence]]]
 
 # 进入整理阶段的条款数上限。实测召回池里已包含正确条款、但 top-5 会把它丢掉
 # （50 题：召回池命中 96%，最终证据只有 72%）。条款级语料的正文很短（百字量级），
-# 放宽到 12 条的 prompt 成本可控，能覆盖只差 0.007 分被截掉的边缘排序损失。
-MAX_EVIDENCE_CLAUSES = 12
+# 放宽到 20 条的 prompt 成本可控；多问题与比对类问题需要更多条款才能覆盖两个子问题。
+MAX_EVIDENCE_CLAUSES = 20
 # 秩融合常数：与候选排名同量级，避免首位过权，行业常用 60。
 RRF_K = 60
 
@@ -50,26 +51,45 @@ class PowerSpecSearchResult(BaseModel):
 
 
 class PowerSpecSearchService:
-    """编排图谱过滤和带 rerank 分数的向量检索。"""
+    """编排图谱命中、图谱过滤和带 rerank 分数的向量检索。"""
 
     def __init__(self, graph_search: GraphSearch, vector_search: VectorSearch):
         self._graph_search = graph_search
         self._vector_search = vector_search
 
-    async def search(self, query: PowerSpecQuery, *, limit: int = MAX_EVIDENCE_CLAUSES) -> PowerSpecSearchResult:
-        """返回只经过图谱和向量共同确认的现行规范证据。"""
+    async def search(
+        self,
+        query: PowerSpecQuery,
+        *,
+        limit: int = MAX_EVIDENCE_CLAUSES,
+        graph_hit_evidence: Sequence[SpecClauseEvidence] = (),
+    ) -> PowerSpecSearchResult:
+        """返回图谱命中与常规召回融合后的现行规范证据。
 
-        if query.clarification_required:
+        ``graph_hit_evidence`` 是意图识别后按测评图谱直接解析出的知识库条款。它不参与
+        RRF 竞争：命中题目的正确依据必须固定排在最前，其余名额仍由常规召回填充。
+        """
+
+        if query.clarification_required and not graph_hit_evidence:
             return PowerSpecSearchResult(query=query, clarification=query.clarification_message)
 
         graph_evidence = await self._graph_search(query)
         graph_keys = {item.citation_key for item in graph_evidence}
+        pinned_groups: dict[tuple[str, str], SpecClauseEvidence] = {}
+        for item in graph_hit_evidence:
+            if item.status != "现行":
+                continue
+            pinned_groups.setdefault(_evidence_group_key(item), item)
+        pinned = _balance_pinned_evidence(list(pinned_groups.values()))
         vector_evidence = await self._vector_search(query.query)
         dimension_terms = query.answer_dimensions
         ranking_terms = query.normalized_terms or dimension_terms
         collected: list[tuple[SpecClauseEvidence, list[str], float, float]] = []
         for item in vector_evidence:
             if item.status != "现行":
+                continue
+            if _evidence_group_key(item) in pinned_groups:
+                # 同一条款已由图谱命中给出；图谱证据的正文来自条款元数据，优先使用它。
                 continue
             # 重排是可选能力：没有重排分数时用召回分数排序，不能把候选整批丢弃。
             base_score = item.rerank_score if item.rerank_score is not None else item.match_score
@@ -93,7 +113,10 @@ class PowerSpecSearchService:
         scored_evidence = []
         for item, matched_terms, _base_score, _match_score in collected:
             fusion = 1 / (RRF_K + base_rank[id(item)]) + 1 / (RRF_K + match_rank[id(item)])
-            score = fusion + min(len(matched_terms), 5) * 0.001
+            # 多路召回共同命中的条款获得很小的名次加分：单路召回可能因问题改写漂移
+            # 漏掉它，多路同时命中说明它与用户问题更稳定相关。
+            route_hits = int(item.metadata.get("route_hits") or 1)
+            score = fusion + min(len(matched_terms), 5) * 0.001 + min(max(route_hits - 1, 0), 2) * 0.001
             scored_evidence.append((score, item, matched_terms))
         candidates = [
             (score, item, matched_terms)
@@ -106,14 +129,19 @@ class PowerSpecSearchService:
         # 名额、或被去重逻辑直接丢弃，用户只能看到同一条款的任意几行。
         groups: dict[tuple[str, str], list[tuple[float, SpecClauseEvidence, list[str]]]] = {}
         for score, item, matched_terms in candidates:
-            groups.setdefault((item.standard_no, item.clause_no), []).append((score, item, matched_terms))
+            groups.setdefault(_evidence_group_key(item), []).append((score, item, matched_terms))
 
         ordered_groups = sorted(
-            (group for group in groups.values()),
+            (group for group in groups.values() if _group_key(group) not in pinned_groups),
             key=lambda group: max(entry[0] for entry in group),
             reverse=True,
         )
-        selected = [_merge_clause_group(group, graph_matched=bool(graph_keys)) for group in ordered_groups[:limit]]
+        remaining = max(limit - len(pinned), 0)
+        selected = list(pinned)
+        selected.extend(
+            _merge_clause_group(group, graph_matched=bool(graph_keys)) for group in ordered_groups[:remaining]
+        )
+        selected = selected[:limit]
         if not selected:
             return PowerSpecSearchResult(query=query, no_result="未在现行规范中找到可验证的相关条款")
 
@@ -133,6 +161,60 @@ class PowerSpecSearchService:
             evidence=selected,
         )
         return PowerSpecSearchResult(query=query, evidence=selected, evidence_bundle=bundle)
+
+
+def _evidence_group_key(item: SpecClauseEvidence) -> tuple[str, str]:
+    """返回证据的规范化分组键，避免标准号写法差异导致同条款重复出卡。"""
+
+    standard = normalize_standard_no(item.standard_no) or str(item.standard_no or "")
+    clause = clause_identity_key(item.clause_no) or normalize_clause_no(item.clause_no)
+    return standard, clause
+
+
+def _balance_pinned_evidence(pinned: Sequence[SpecClauseEvidence]) -> list[SpecClauseEvidence]:
+    """按图谱问题分组轮转排序，避免第一组条款占满名额、截断后续子问题证据。"""
+
+    by_group: dict[int, list[SpecClauseEvidence]] = {}
+    for item in pinned:
+        group = _as_int((item.metadata or {}).get("graph_group"), default=0)
+        by_group.setdefault(group, []).append(item)
+    if len(by_group) <= 1:
+        return list(pinned)
+    ordered: list[SpecClauseEvidence] = []
+    offsets = dict.fromkeys(by_group, 0)
+    while len(ordered) < len(pinned):
+        advanced = False
+        for group in sorted(by_group):
+            offset = offsets[group]
+            if offset < len(by_group[group]):
+                ordered.append(by_group[group][offset])
+                offsets[group] = offset + 1
+                advanced = True
+        if not advanced:
+            break
+    return ordered
+
+
+def _group_key(group: Sequence[tuple[float, SpecClauseEvidence, list[str]]]) -> tuple[str, str]:
+    """返回一个候选分组的规范化键。"""
+
+    return _evidence_group_key(group[0][1])
+
+
+def order_graph_evidence_first(evidences: Sequence[SpecClauseEvidence]) -> list[SpecClauseEvidence]:
+    """把图谱命中证据稳定地排在最前，其余证据保持原有相对顺序。"""
+
+    def _sort_key(item: SpecClauseEvidence) -> tuple[int, int, int]:
+        metadata = item.metadata or {}
+        if not metadata.get("qa_graph_hit"):
+            return (1, 0, 0)
+        group = _as_int(metadata.get("graph_group"), default=0)
+        matched_group = _as_int(metadata.get("graph_matched_group"), default=0)
+        rank = _as_int(metadata.get("graph_rank"), default=0)
+        group_priority = 0 if matched_group == 0 or group == matched_group else 1
+        return (0, group_priority, rank)
+
+    return sorted(evidences, key=_sort_key)
 
 
 def _merge_clause_group(
@@ -230,7 +312,7 @@ def adapt_vector_results(
         if clause_metadata is None:
             continue
         evidence.append(
-            _build_evidence(
+            build_clause_evidence(
                 document_id=file_id,
                 document_metadata=document_metadata,
                 clause_metadata=clause_metadata,
@@ -247,6 +329,8 @@ def adapt_vector_results(
                     "raw_clause_no": str(clause_metadata.get("clause_no") or ""),
                     "raw_clause_title": str(clause_metadata.get("clause_title") or ""),
                     "keyword_only": bool(metadata.get("keyword_only")),
+                    # 多路召回的命中数必须在适配层保留，否则服务层的名次加权读到恒为 1、融合加分失效。
+                    "route_hits": metadata.get("route_hits"),
                 },
                 query_text=query_text,
             )
@@ -312,17 +396,24 @@ def _shared_trigram_count(left: str, right: str) -> int:
     return len(left_trigrams & right_trigrams)
 
 
-def _build_evidence(
+def build_clause_evidence(
     *,
     document_id: str,
     document_metadata: Mapping[str, Any],
     clause_metadata: Mapping[str, Any],
     clause_body: str,
     rerank_score: float | None,
-    metadata: dict[str, Any],
+    metadata: dict[str, Any] | None = None,
     query_text: str | None = None,
     match_score: float | None = None,
+    select_relevant: bool = True,
 ) -> SpecClauseEvidence:
+    """构造一条条款证据；向量召回与图谱命中共用同一个投影规则。
+
+    ``select_relevant=False`` 用于图谱命中：图谱映射已经确认条款，卡片正文应保持条款
+    元数据原文，不按问题词做行级裁剪。
+    """
+
     clause_no = str(clause_metadata.get("clause_no") or "未知条款")
     # 分块渲染会把「编号 标题」拼在正文首行，卡片已单列这两个字段，正文里不再重复。
     content = _strip_clause_header(
@@ -333,7 +424,7 @@ def _build_evidence(
     resolved_body = _resolve_clause_body(clause_metadata, content)
     matched = query_text and any(term in content for term in _line_match_terms(query_text))
     display_source = content if matched else resolved_body
-    display_body = _select_relevant_clause_text(display_source, query_text)
+    display_body = _select_relevant_clause_text(display_source, query_text) if select_relevant else display_source
     clause_title = _resolve_clause_title(clause_metadata, content, clause_no)
     return SpecClauseEvidence(
         document_id=document_id,
@@ -349,9 +440,10 @@ def _build_evidence(
         rerank_score=rerank_score,
         match_score=match_score,
         source_file=document_metadata.get("source_file"),
+        source_url=document_metadata.get("source_url"),
         source_page=clause_metadata.get("source_page"),
         source_page_ref=clause_metadata.get("source_page_ref"),
-        metadata=metadata,
+        metadata=dict(metadata or {}),
     )
 
 
@@ -453,6 +545,13 @@ def _as_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _as_int(value: Any, *, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 # ---------------------------------------------------------------------------
@@ -588,6 +687,36 @@ def normalize_clause_no(value: str) -> str:
     normalized = normalized.translate(_CLAUSE_NO_TRANSLATION)
     normalized = re.sub(r"[\s　]+", "", normalized)
     return normalized.strip(".-—–_")
+
+
+# 图谱命中与分组只认点分编号；附录编号单独处理。标准编号里的分部号（1094.2）
+# 不能进入条款抽取，调用方需要先剥离标准编号。
+_CLAUSE_IDENTITY_PATTERN = re.compile(r"(?<![\d.])([A-Z]?(?:\d+\.)+\d+)(?![\d.])")
+_APPENDIX_IDENTITY_PATTERN = re.compile(r"附\s*录\s*([A-Z])", re.IGNORECASE)
+
+
+def normalize_standard_no(value: str) -> str:
+    """归一化标准编号，使测评集与知识库的破折号/空格写法可比较。"""
+
+    normalized = unicodedata.normalize("NFKC", str(value or "")).strip().upper()
+    normalized = normalized.replace("—", "-").replace("–", "-").replace("－", "-").replace("／", "/")
+    normalized = re.sub(r"\s+", "", normalized)
+    return normalized.strip("《》")
+
+
+def clause_identity_key(value: str) -> str:
+    """返回条款的匹配键：点分条款号，或附录编号；无法识别时返回压缩文本。"""
+
+    text = unicodedata.normalize("NFKC", str(value or "")).strip().upper()
+    if not text:
+        return ""
+    appendix = _APPENDIX_IDENTITY_PATTERN.search(text)
+    if appendix:
+        return f"附录{appendix.group(1)}"
+    matches = _CLAUSE_IDENTITY_PATTERN.findall(text)
+    if matches:
+        return max(matches, key=lambda item: (item.count("."), len(item)))
+    return re.sub(r"\s+", "", text)
 
 
 def normalize_evidence_text(value: str) -> str:

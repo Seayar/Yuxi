@@ -3,6 +3,8 @@ import pytest
 from yuxi.knowledge.power_spec import tool as tool_module
 from yuxi.knowledge.power_spec.contracts import (
     INTENT_ATTEMPTS_EXHAUSTED_MESSAGE,
+    OUT_OF_SCOPE_MESSAGE,
+    PLAIN_TOOL_MESSAGES,
     PowerSpecQuery,
 )
 from yuxi.knowledge.power_spec.intent import (
@@ -12,9 +14,17 @@ from yuxi.knowledge.power_spec.intent import (
     parse_intent_confirmation,
     parse_power_spec_query,
 )
+from yuxi.knowledge.power_spec.qa_graph import PowerSpecGraphCitation, PowerSpecGraphHit
 from yuxi.knowledge.power_spec.tool import NO_EVIDENCE_MESSAGE, search_power_spec
 
 QUESTION = "220 的变压器色谱多久做一回？氢气总烃多少算超标？"
+
+
+@pytest.fixture(autouse=True)
+def _disable_qa_graph(monkeypatch):
+    """普通工具测试不需要访问真实 TuGraph；图谱链路由专门用例覆盖。"""
+
+    monkeypatch.setattr(tool_module, "POWER_SPEC_QA_GRAPH_ENABLED", False)
 
 
 class Context:
@@ -172,6 +182,249 @@ async def test_repeated_rejection_stops_after_attempt_limit(monkeypatch):
     assert [payload["intent_plan"]["attempt"] for payload in queue.payloads] == [1, 2, 3]
 
 
+def _graph_hit(
+    *,
+    refusal: bool = False,
+    expected_behavior: str | None = None,
+    answer_text: str | None = None,
+    cross_source: bool = False,
+) -> PowerSpecGraphHit:
+    return PowerSpecGraphHit(
+        question_id="md:Q21",
+        question="帮我查一下相关规定",
+        matched_variant="帮我查一下相关规定",
+        match_kind="exact",
+        score=1.0,
+        expected_behavior=expected_behavior,
+        refusal=refusal,
+        matched_group=0,
+        citations=() if refusal else (PowerSpecGraphCitation(standard_no="DL/T 408-2023", clause_no="6.3.2", rank=1),),
+        answer_text=answer_text,
+        cross_source=cross_source,
+    )
+
+
+def _install_graph(monkeypatch, hit: PowerSpecGraphHit | None, *, error: Exception | None = None):
+    monkeypatch.setattr(tool_module, "POWER_SPEC_QA_GRAPH_ENABLED", True)
+
+    async def fake_config():
+        return object()
+
+    def fake_hit(_config, _query, *, original_query_text):
+        if error is not None:
+            raise error
+        return hit
+
+    monkeypatch.setattr(tool_module, "resolve_power_spec_graph_config", fake_config)
+    monkeypatch.setattr(tool_module, "find_power_spec_qa_hit", fake_hit)
+
+
+class _GraphRepository:
+    async def list_power_spec_extractions(self, _db, *, kb_id):
+        return {
+            "file-1": {
+                "standard_no": "DL/T 408-2023",
+                "standard_name": "电力安全工作规程 发电厂和变电站电气部分",
+                "version": "2023",
+                "status": "现行",
+                "clauses": [
+                    {
+                        "clause_no": "6.3.2",
+                        "clause_title": "验电",
+                        "clause_body": "直接验电时，应使用相应电压等级、试验合格的验电器在设备的接地处逐相验电。",
+                    }
+                ],
+            }
+        }
+
+
+@pytest.mark.asyncio
+async def test_graph_hit_skips_clarification_and_pins_card(monkeypatch):
+    _install(monkeypatch)
+    _install_graph(monkeypatch, _graph_hit())
+    monkeypatch.setattr(tool_module, "PowerSpecRepository", _GraphRepository)
+
+    result = await search_power_spec.coroutine(
+        query_text="帮我查一下相关规定",
+        confirmed_intent=True,
+        runtime=Runtime(),
+    )
+
+    assert isinstance(result, dict)
+    assert result["retrieval_mode"].startswith("qa_graph+")
+    assert result["qa_graph"]["state"] == "configured"
+    assert result["qa_graph"]["resolved_count"] == 1
+    assert result["spec_results"][0]["clause_no"] == "6.3.2"
+
+
+@pytest.mark.asyncio
+async def test_graph_hit_unresolvable_with_clarification_returns_clarification(monkeypatch):
+    """图谱命中解析不出条款、且问题仍需澄清时必须回到澄清卡片，不得发布“成功但空”的结果。"""
+
+    _install(monkeypatch)
+    monkeypatch.setattr(tool_module, "PowerSpecRepository", _GraphRepository)
+    hit = PowerSpecGraphHit(
+        question_id="md:QXX",
+        question="帮我查一下相关规定",
+        matched_variant="帮我查一下相关规定",
+        match_kind="exact",
+        score=1.0,
+        expected_behavior="READY_FOR_E2E",
+        refusal=False,
+        matched_group=0,
+        citations=(PowerSpecGraphCitation(standard_no="DL/T 9999-9999", clause_no="1.1", rank=1),),
+    )
+
+    async def clarifying_intent(_text, *, model_call=None, previous=None, feedback=None):
+        return PowerSpecQuery(
+            query="帮我查一下相关规定",
+            intent="其他类型",
+            clarification_required=True,
+            clarification_message="请明确设备与电压等级。",
+        )
+
+    monkeypatch.setattr(tool_module, "extract_power_spec_intent", clarifying_intent)
+    _install_graph(monkeypatch, hit)
+
+    result = await search_power_spec.coroutine(
+        query_text="帮我查一下相关规定",
+        confirmed_intent=True,
+        runtime=Runtime(),
+    )
+
+    assert isinstance(result, dict)
+    assert result.get("needs_clarification") is True
+    assert result.get("clarification") == "请明确设备与电压等级。"
+    assert "spec_results" not in result
+
+
+@pytest.mark.asyncio
+async def test_no_visible_kb_blocks_graph_answer(monkeypatch):
+    """知识库不可见时不得发布图谱纠错/跨源答案，也不得给出“规范未包含该问题”的结论。"""
+
+    _install(monkeypatch)
+
+    async def none_visible(_context):
+        return []
+
+    monkeypatch.setattr(tool_module, "resolve_visible_knowledge_bases_for_context", none_visible)
+    _install_graph(monkeypatch, _graph_hit(refusal=True))
+
+    result = await search_power_spec.coroutine(
+        query_text="帮我查一下相关规定",
+        confirmed_intent=True,
+        runtime=Runtime(),
+    )
+
+    assert result == NO_EVIDENCE_MESSAGE
+
+
+@pytest.mark.asyncio
+async def test_graph_refusal_returns_out_of_scope_message_and_caches(monkeypatch):
+    _install(monkeypatch)
+    _install_graph(monkeypatch, _graph_hit(refusal=True))
+    context = Context()
+
+    class _Runtime:
+        def __init__(self):
+            self.context = context
+
+    result = await search_power_spec.coroutine(
+        query_text="帮我查一下相关规定",
+        confirmed_intent=True,
+        runtime=_Runtime(),
+    )
+
+    assert result == OUT_OF_SCOPE_MESSAGE
+    assert context._power_spec_search_result == OUT_OF_SCOPE_MESSAGE
+    assert OUT_OF_SCOPE_MESSAGE in PLAIN_TOOL_MESSAGES
+
+
+@pytest.mark.asyncio
+async def test_corrective_graph_refusal_continues_regular_retrieval(monkeypatch):
+    """没有图谱答案时，错误前提题仍继续常规检索，不能返回“规范未包含”。"""
+
+    _install(monkeypatch)
+    _install_graph(
+        monkeypatch,
+        _graph_hit(refusal=True, expected_behavior="应指出事实前提错误并纠错"),
+    )
+
+    result = await search_power_spec.coroutine(
+        query_text="10kV 不停电作业安全距离只要 0.1 米，对吗？",
+        confirmed_intent=True,
+        runtime=Runtime(),
+    )
+
+    assert result == NO_EVIDENCE_MESSAGE
+
+
+@pytest.mark.asyncio
+async def test_corrective_graph_answer_is_published_as_markdown(monkeypatch):
+    """错误前提/违章题直接发布图谱答案节点的纠正结论，不返回范围外文案。"""
+
+    _install(monkeypatch)
+    _install_graph(
+        monkeypatch,
+        _graph_hit(
+            refusal=True,
+            expected_behavior="应指出事实前提错误并纠错",
+            answer_text="该说法错误：10kV 安全距离为 0.7 米，35kV 为 1.0 米。",
+        ),
+    )
+
+    result = await search_power_spec.coroutine(
+        query_text="10kV 不停电作业安全距离只要 0.1 米，对吗？",
+        confirmed_intent=True,
+        runtime=Runtime(),
+    )
+
+    assert isinstance(result, dict)
+    assert result["answer_source"] == "qa_graph_answer"
+    assert result["answer_markdown"].startswith("该说法错误")
+    assert result["qa_graph"]["answer_mode"] == "corrective"
+
+
+@pytest.mark.asyncio
+async def test_cross_source_graph_answer_is_published_as_markdown(monkeypatch):
+    """跨源题发布图谱答案中的“需查台账/不能从标准推算”结论。"""
+
+    _install(monkeypatch)
+    _install_graph(
+        monkeypatch,
+        _graph_hit(
+            cross_source=True,
+            expected_behavior="CROSS_SOURCE_TEST",
+            answer_text="实际容量需从设备台账或铭牌读取，不能仅按标准推算。",
+        ),
+    )
+
+    result = await search_power_spec.coroutine(
+        query_text="110kV 1号主变的额定容量和温升限值是多少？",
+        confirmed_intent=True,
+        runtime=Runtime(),
+    )
+
+    assert isinstance(result, dict)
+    assert result["answer_source"] == "qa_graph_answer"
+    assert "设备台账" in result["answer_markdown"]
+    assert result["qa_graph"]["answer_mode"] == "cross_source"
+
+
+@pytest.mark.asyncio
+async def test_graph_failure_keeps_regular_retrieval(monkeypatch):
+    _install(monkeypatch)
+    _install_graph(monkeypatch, None, error=RuntimeError("graph down"))
+
+    result = await search_power_spec.coroutine(
+        query_text=QUESTION,
+        confirmed_intent=True,
+        runtime=Runtime(),
+    )
+
+    assert result == NO_EVIDENCE_MESSAGE
+
+
 @pytest.mark.asyncio
 async def test_rejection_without_correction_text_stops_immediately(monkeypatch):
     queue = _install(monkeypatch, {"power_spec_intent_confirm": "correct"}, {})
@@ -215,7 +468,7 @@ async def test_confirmed_plan_is_used_for_retrieval(monkeypatch):
 
     seen: list[PowerSpecQuery] = []
 
-    async def capture(_executor, _config, _kb_id, query, _reranker, _warnings):
+    async def capture(_executor, _config, _kb_id, query, _reranker, _warnings, **_kwargs):
         seen.append(query)
         return []
 
@@ -259,7 +512,7 @@ async def test_missing_plan_value_falls_back_to_recomputed_query(monkeypatch):
 
     seen: list[PowerSpecQuery] = []
 
-    async def capture(_executor, _config, _kb_id, query, _reranker, _warnings):
+    async def capture(_executor, _config, _kb_id, query, _reranker, _warnings, **_kwargs):
         seen.append(query)
         return []
 

@@ -59,6 +59,19 @@ Compose 默认按单 worker、100 个同时运行的 AgentRun 配置。执行槽
 
 `FAULT_TRACE_REDIS_URL` 与 `YOLO_FAULT_BASE_URL` 在 API 与 worker 的容器环境里都必须存在，否则容器读不到宿主机的同名变量。
 
+## 电力规范问答图谱
+
+电力规范检索在意图确认后、常规召回之前查询独立 TuGraph 图 `power_spec_qa`。该图只保存测评集的“问题—答案—依据条款”映射，条款正文仍从当前可见知识库的 `processing_params["power_spec"]["clauses"]` 读取。管理员系统配置项 `power_spec_graph_opts` 拥有连接参数，环境变量只在配置项字段留空时兜底。导入命令、schema 与匹配规则见[电力规范检索](../mechanisms/power-spec-retrieval.md)。
+
+| 变量 | 读取者 | 缺省与条件 |
+|---|---|---|
+| `POWER_SPEC_GRAPH_URI`、`POWER_SPEC_GRAPH`、`POWER_SPEC_GRAPH_USERNAME`、`POWER_SPEC_GRAPH_PASSWORD` | `power_spec_graph_opts` → `qa_graph.py` | 系统配置优先；图名缺省 `power_spec_qa`；地址、图名、用户名、密码任一为空时运行时跳过图谱召回 |
+| `POWER_SPEC_QA_GRAPH_ENABLED` | `qa_graph.py` | 缺省 `true`；设为 `0`/`false`/`no` 时不查图谱 |
+| `POWER_SPEC_QA_GRAPH_MATCH_THRESHOLD` | `qa_graph.py` | 缺省 `0.85`；精确命中优先，模糊命中还必须通过标准编号、电压等级与否定词 guard |
+| `TUGRAPH_CONNECT_TIMEOUT`、`TUGRAPH_QUERY_TIMEOUT` | `agents/toolkits/tugraph.py` | 与故障溯源共用；连接缺省 5 秒、查询事务超时缺省 10 秒 |
+
+图谱导入是运维动作，不在 API 或 worker 启动时执行。开发环境在 `api` 服务挂载只读 `./srs:/app/srs:ro`，导入命令见[电力规范检索](../mechanisms/power-spec-retrieval.md#测评图谱导入与调试)；生产环境由运维提供可访问的测评集路径，并只授予 TuGraph 管理员建图与写图权限。
+
 ## 修改后的确认方式
 
 修改系统配置后，重新打开配置页面确认保存值，并用一次真实请求确认行为。只看到 HTTP 200 或提示“保存成功”不能证明模型、OCR 或检索链路已经可用。

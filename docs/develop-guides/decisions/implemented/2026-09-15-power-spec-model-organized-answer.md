@@ -112,3 +112,7 @@ PY
 ```
 
 未验证：真实页面的端到端运行（登录后主流程、SSE 长连接）、依赖 `backend/test/.env.test` 的 HTTP integration 用例（本机未配置，整批 skip）。
+
+## 相关决策
+
+- [审查子智能体只做忠实性核验](2026-10-29-power-spec-reviewer-faithfulness-only.md)：本记录中审查项包含「遗漏、无关内容」的描述已被收窄；整理、审查、合并各执行一次的结构不变。

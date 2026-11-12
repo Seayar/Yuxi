@@ -10,7 +10,7 @@ Owner：backend/package/yuxi/knowledge/power_spec/answer.py
 
 ## 决策
 
-1. `SRS_CARD_FIELDS` 只保留规范名称、标准编号、条款编号、条款正文四项，顺序与最新需求书一致；`_format_item` 返回的字典只含这四个键，`answer_markdown` 每张卡片只渲染这四个字段。
+1. `SRS_CARD_FIELDS` 只保留规范名称、标准编号、条款编号、条款正文四项，顺序与最新需求书一致；`_format_item` 返回的字典只含这四个键，`answer_markdown` 每张卡片只渲染这四个字段（2026-11-11 起在卡片末尾追加 PDF 源文档标记，见[电力规范卡片的 PDF 源文档标记](2026-11-11-power-spec-card-pdf-marker.md)）。
 2. 卡片不再渲染相关度、引用标记或来源页码。条款标题、适用范围、规范状态、替代关系、页码和引用键仍保留在 `SpecClauseEvidence` 中，继续服务召回排序、整理子智能体的输入和 `verify_evidence_projection`，但不进入卡片载荷。
 3. 整理与最终合并的结构化输出收敛为 `citation_key`、`clause_no`、`body`；标题与适用范围不再要求模型生成，也不再从模型结果回填卡片。
 4. 上游 Web 的规范卡片组件只展示规范名称、标准编号、条款编号和正文，删除标题、适用范围、状态、替代规范、相关度、页码、位置和引用展示。
@@ -55,3 +55,7 @@ Owner：backend/package/yuxi/knowledge/power_spec/answer.py
 
 - Windows 上 `python -m unittest scripts.test_verify_engineering_contracts` 的 62 个用例中 61 个通过，`test_decision_owner_symlink_cannot_escape_repository` 因当前账户无创建符号链接权限而报 `WinError 1314`；api 容器未挂载 `scripts/`，无法在 Linux 容器内重跑。
 - 未启动真实前端页面复核卡片视觉效果；未在真实知识库上重跑完整检索链路。前端构建与组件 lint 只证明代码可编译、格式合法。
+
+## 相关决策
+
+- [电力规范卡片的 PDF 源文档标记](2026-11-11-power-spec-card-pdf-marker.md)：卡片末尾追加 `[[PDF:<url>]]`。该标记不是卡片字段，`spec_results` 仍只有四个键。

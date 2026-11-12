@@ -70,6 +70,8 @@ services:
         target: /app/skill-projections
       - ./backend/test:/app/test
       - ./backend/scripts:/app/scripts
+      # 电力规范测评集导入 CLI 的只读数据目录；不参与运行时检索。
+      - ./srs:/app/srs:ro
       - ./docker/sandbox_provisioner:/app/docker/sandbox_provisioner:ro
     ports:
       - "${YUXI_API_PORT:-5050}:5050"

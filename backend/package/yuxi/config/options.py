@@ -267,6 +267,49 @@ fault_trace_opts = Option(
     },
 )
 
+power_spec_graph_opts = Option(
+    key="power_spec_graph_opts",
+    name="电力规范检索图谱",
+    description="配置电力规范测评图谱（问题—答案—依据条款映射）的 TuGraph 连接；未配置时运行时跳过图谱召回。",
+    params={
+        "fields": [
+            {
+                "key": "server_url",
+                "label": "服务地址",
+                "type": "string",
+                "environment": "POWER_SPEC_GRAPH_URI",
+                "placeholder": "bolt://<tugraph-host>:7688",
+                "help": "TuGraph Bolt 服务地址（bolt://host:port），留空时读取 POWER_SPEC_GRAPH_URI。",
+            },
+            {
+                "key": "graph",
+                "label": "图名称",
+                "type": "string",
+                "environment": "POWER_SPEC_GRAPH",
+                "default": "power_spec_qa",
+                "placeholder": "power_spec_qa",
+                "help": "图谱名称，默认 power_spec_qa；留空时读取 POWER_SPEC_GRAPH。",
+            },
+            {
+                "key": "username",
+                "label": "用户名",
+                "type": "string",
+                "environment": "POWER_SPEC_GRAPH_USERNAME",
+                "placeholder": "admin",
+                "help": "TuGraph 用户名，留空时读取 POWER_SPEC_GRAPH_USERNAME。",
+            },
+            {
+                "key": "password",
+                "label": "密码",
+                "type": "password",
+                "environment": "POWER_SPEC_GRAPH_PASSWORD",
+                "sensitive": True,
+                "help": "TuGraph 密码，留空时读取 POWER_SPEC_GRAPH_PASSWORD；建议优先使用环境变量。",
+            },
+        ]
+    },
+)
+
 speech_recognition_opts = Option(
     key="speech_recognition_opts",
     name="语音识别服务",

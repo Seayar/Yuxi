@@ -48,6 +48,7 @@ dependencies = [
     "openai>=1.109",
     "opencv-python-headless>=4.11.0.86",
     "onnxruntime>=1.20.0",
+    "openpyxl>=3.1",
     "Pillow>=10.5.0",
     "psycopg[binary,pool]>=3.3.3",
     "pylatexenc>=2.10,<3",
