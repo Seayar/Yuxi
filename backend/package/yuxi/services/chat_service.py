@@ -558,6 +558,12 @@ def _is_maintenance_plan_context(context) -> bool:
     return "maintenance-plan" in set(getattr(context, "skills", []) or [])
 
 
+def _is_device_prediction_context(context) -> bool:
+    """判断当前上下文是否属于设备预测维护智能体（按 skill 判定）。"""
+
+    return "device-prediction" in set(getattr(context, "skills", []) or [])
+
+
 def _message_field(message, name: str):
     """读取 checkpoint 消息字段；消息可能是 LangChain 对象或普通字典。"""
 
@@ -678,6 +684,53 @@ def _resolve_maintenance_plan_output(
     return PLAN_VERIFICATION_FAILED_MESSAGE
 
 
+def _resolve_device_prediction_output(
+    messages, fallback_content: str, *, run_tool_call_ids: set[str] | None = None
+) -> str:
+    """从本轮设备预测维护 Tool 的结果里取报告卡片，只发布通过证据校验的报告。
+
+    本轮工具返回的报告载荷必须显式声明 ``answer_source="device_prediction"`` 且
+    ``answer_verified is True`` 才采用其 Markdown；校验未通过（False、缺失或非布尔）
+    一律返回 REPORT_VERIFICATION_FAILED_MESSAGE，不把未校验的报告发出去。固定文案原样透传，
+    其他普通文本与非报告 JSON 不发布；没有可信工具结果时只允许固定澄清或失败文案，
+    防止模型跳过工具后自行编造评分、故障类型或维护建议。只读本轮工具结果。
+    """
+
+    from yuxi.knowledge.device_prediction.contracts import (
+        CLARIFY_DEVICE_MESSAGE,
+        PLAIN_TOOL_MESSAGES,
+        REPORT_VERIFICATION_FAILED_MESSAGE,
+    )
+
+    # 用一个哨兵区分“本轮没有可信结果”与真实的卡片内容，走既有的工具卡片发布逻辑。
+    no_result = object()
+    resolved = _resolve_tool_card_answer(
+        messages,
+        no_result,
+        plain_messages=PLAIN_TOOL_MESSAGES,
+        run_tool_call_ids=run_tool_call_ids,
+        verified_source="device_prediction",
+        failure_message=REPORT_VERIFICATION_FAILED_MESSAGE,
+    )
+    if resolved is not no_result:
+        return resolved
+
+    # 模型可能在信息全缺时直接反问而跳过工具；该分支仍按本轮原文输出固定澄清句。
+    from yuxi.knowledge.device_prediction.intent import apply_input_constraints, rule_extract_prediction
+
+    for message in reversed(messages):
+        if _message_field(message, "type") not in {"human", "user"}:
+            continue
+        content = _message_field(message, "content")
+        if (
+            isinstance(content, str)
+            and apply_input_constraints(rule_extract_prediction(content)).clarification_required
+        ):
+            return CLARIFY_DEVICE_MESSAGE
+        break
+    return REPORT_VERIFICATION_FAILED_MESSAGE
+
+
 def _resolve_tool_card_answer(
     messages,
     fallback_content: str,
@@ -714,7 +767,8 @@ def _resolve_tool_card_answer(
                     return failure_message
             return payload["answer_markdown"]
         if isinstance(payload, str):
-            return payload
+            # JSON 字符串载荷只有命中白名单才当固定文案；否则按未校验结果处理。
+            return payload if payload in plain_messages else (failure_message or fallback_content)
     return fallback_content
 
 
@@ -997,6 +1051,13 @@ async def save_messages_from_langgraph_state(
                 elif _is_maintenance_plan_context(agent_context):
                     msg_dict = dict(msg_dict)
                     msg_dict["content"] = _resolve_maintenance_plan_output(
+                        messages,
+                        msg_dict.get("content", ""),
+                        run_tool_call_ids=current_tool_operation_ids,
+                    )
+                elif _is_device_prediction_context(agent_context):
+                    msg_dict = dict(msg_dict)
+                    msg_dict["content"] = _resolve_device_prediction_output(
                         messages,
                         msg_dict.get("content", ""),
                         run_tool_call_ids=current_tool_operation_ids,

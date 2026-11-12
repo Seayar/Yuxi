@@ -19,6 +19,8 @@ MODULES = (
     "yuxi.knowledge.fault_trace.tool",
     "yuxi.knowledge.maintenance_plan.graph_plan",
     "yuxi.knowledge.maintenance_plan.tool",
+    "yuxi.knowledge.device_prediction.graph",
+    "yuxi.knowledge.device_prediction.tool",
     "yuxi.knowledge.power_spec.tool",
 )
 

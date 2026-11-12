@@ -224,10 +224,38 @@ fault_image_opts = Option(
     },
 )
 
+device_prediction_opts = Option(
+    key="device_prediction_opts",
+    name="设备预测维护服务",
+    description="配置设备预测维护的 LSTM 故障预测与设备健康评估服务地址，供设备预测维护工具调用。",
+    params={
+        "fields": [
+            {
+                "key": "prediction_base_url",
+                "label": "故障预测服务地址",
+                "type": "url",
+                "environment": "DEVICE_PREDICTION_BASE_URL",
+                "placeholder": "http://<prediction-host>:8084",
+                "help": "LSTM 故障预测服务地址（GET /api/prediction/predict/{deviceId}），留空时读取 "
+                "DEVICE_PREDICTION_BASE_URL；两者都为空时工具返回“故障预测服务未配置”。",
+            },
+            {
+                "key": "health_base_url",
+                "label": "健康评估服务地址",
+                "type": "url",
+                "environment": "DEVICE_HEALTH_BASE_URL",
+                "placeholder": "http://<health-host>:8085",
+                "help": "设备健康评估服务地址（GET /api/device-health/{deviceId}），留空时读取 "
+                "DEVICE_HEALTH_BASE_URL；两者都为空时工具返回“设备健康评估服务未配置”。",
+            },
+        ]
+    },
+)
+
 fault_trace_opts = Option(
     key="fault_trace_opts",
     name="知识图谱",
-    description="配置故障溯源与处置方案共用的 TuGraph kg3 图（设备类型、故障模式、现象、原因、触发条件、作业模板等）。",
+    description="配置故障溯源（kg3）、处置方案（kg4）与设备预测维护（kg5）共用的 TuGraph 连接；各智能体使用不同图名。",
     params={
         "fields": [
             {
@@ -390,6 +418,8 @@ OPTION_DEFINITIONS = {
         speech_recognition_opts,
         fault_image_opts,
         fault_trace_opts,
+        device_prediction_opts,
+        power_spec_graph_opts,
         remote_skill_source_policy,
         system_options,
     )

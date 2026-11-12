@@ -13,6 +13,9 @@ from yuxi.knowledge.fault_trace import tool as _fault_trace_tool  # noqa: F401
 # 处置方案工具（导入即注册 generate_maintenance_plan）
 from yuxi.knowledge.maintenance_plan import tool as _maintenance_plan_tool  # noqa: F401
 
+# 设备预测维护工具（导入即注册 predict_device）
+from yuxi.knowledge.device_prediction import tool as _device_prediction_tool  # noqa: F401
+
 # 工具获取函数
 from .registry import (
     ToolExtraMetadata,

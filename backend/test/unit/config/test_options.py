@@ -23,6 +23,18 @@ def test_system_chat_model_preserves_saved_selection(key):
     assert options.system_options.resolve({key: saved_model})[key] == saved_model
 
 
+def test_every_defined_option_is_registered():
+    """模块里定义的每个 Option 都必须进入 OPTION_DEFINITIONS，否则不会落库、读取即失败。"""
+
+    defined = {
+        value.key
+        for value in vars(options).values()
+        if isinstance(value, options.Option)
+    }
+    assert defined <= set(options.OPTION_DEFINITIONS)
+    assert "device_prediction_opts" in options.OPTION_DEFINITIONS
+
+
 class FakeRedis:
     def __init__(self):
         self.values: dict[str, str] = {}

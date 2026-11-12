@@ -221,6 +221,29 @@ test('四步思考存在时隐藏重复的检索工具卡片，普通工具保�
   assert.deepEqual(toolNames(shown), ['search_power_spec', 'read_file'])
 })
 
+test('思考型智能体的工具卡片按清单隐藏', () => {
+  const steps = [{ step_id: 'load_device', step_index: 1, title: '加载设备档案', state: 'completed' }]
+  const conv = {
+    messages: [
+      { id: 'human-1', type: 'human', content: '评估1号主变的健康状态' },
+      { id: 'ai-1', type: 'ai', content: '回答' }
+    ]
+  }
+
+  const items = getConversationDisplayItems(conv, {
+    enrichToolCalls: () => [{ id: 'tool-1', name: 'predict_device', args: { query_text: '评估' } }],
+    thinkingSteps: steps,
+    hideThinkingTools: true
+  })
+
+  const toolNames = items
+    .filter((item) => item.type === 'tool-group')
+    .flatMap((item) => item.entries.filter((entry) => entry.type === 'tool'))
+    .map((entry) => entry.toolCall.name)
+
+  assert.deepEqual(toolNames, [])
+})
+
 test('空白思考步骤数组不会隐式隐藏工具卡片', () => {
   const conv = {
     messages: [

@@ -36,6 +36,7 @@ def test_preset_discovery_includes_shipping_roles():
         "power-spec-reviewer",
         "fault-trace-agent",
         "maintenance-plan-agent",
+        "device-prediction-agent",
     }
     assert found["deep-research"].context["subagents"] == ["research-explorer", "fact-verifier"]
     assert found["general-purpose"].context == {}
@@ -46,6 +47,8 @@ def test_preset_discovery_includes_shipping_roles():
     assert found["fault-trace-agent"].backend_id == "ChatbotAgent"
     assert found["maintenance-plan-agent"].backend_id == "ChatbotAgent"
     assert found["maintenance-plan-agent"].context["preload_skills"] == ["maintenance-plan"]
+    assert found["device-prediction-agent"].backend_id == "ChatbotAgent"
+    assert found["device-prediction-agent"].context["preload_skills"] == ["device-prediction"]
 
 
 def test_new_preset_file_is_discovered_without_registry(tmp_path, monkeypatch):
@@ -190,6 +193,7 @@ def test_shipping_skills_keep_required_dependencies():
         "power-spec",
         "fault-trace",
         "maintenance-plan",
+        "device-prediction",
         "mysql-reporter",
     }
     assert found["knowledge-base"]["tool_dependencies"] == [
@@ -203,6 +207,7 @@ def test_shipping_skills_keep_required_dependencies():
     ]
     assert found["fault-trace"]["tool_dependencies"] == ["trace_fault"]
     assert found["maintenance-plan"]["tool_dependencies"] == ["generate_maintenance_plan"]
+    assert found["device-prediction"]["tool_dependencies"] == ["predict_device"]
     assert found["deep-research"]["skill_dependencies"] == []
     assert found["mysql-reporter"]["mcp_dependencies"] == []
     assert found["html-preview"]["version"] == "2026.07.23"

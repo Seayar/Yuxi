@@ -76,6 +76,19 @@ kg4 的 `设备实例.台账ID列表` 为 `补充数据` 等占位时，`sources
 
 处置方案与故障溯源共用同一 TuGraph 服务与账号，但图名不同；如果部署把两者拆到不同实例，需要先扩展 `fault_trace_opts` 的连接字段，不能只改图名。
 
+## 设备预测维护
+
+设备预测维护的图谱只读 TuGraph `kg5`。设备识别用 `设备实例`（名称、层级路径、电压等级、id、台账ID列表，经 `属于` 关联 `设备类型`）；维护计划建议按预测故障类型匹配到 `设备类型 -[具有现象]-> 故障现象`，从现象取 `所需资源` 与 `注意事项`。设备按名称与位置线索召回；发送给预测服务的设备 ID 先取设备节点的 `台账ID列表`（跳过 `补充数据` 等占位值），节点没有可用 ID 时按**精确名称 + 层级祖先**回查三区台账 `fault-assets/ledger/devices.json`（与故障溯源共用同一对象，只接受精确同名行）。健康评估与故障预测分别调用两个外部 HTTP 服务，服务地址走管理员系统配置 `device_prediction_opts`，环境变量只在配置项字段留空时兜底。
+
+| 变量 | 读取者 | 缺省与条件 |
+|---|---|---|
+| `DEVICE_PREDICTION_GRAPH` | `fault_trace_opts` 的 `device_prediction_graph` 字段 → `device_prediction/tool.py` | 系统配置优先；缺省回退 `kg5`；连接地址、用户名、密码任一为空时工具返回“设备预测维护知识图谱未配置或不可用” |
+| `DEVICE_PREDICTION_BASE_URL` | `device_prediction_opts` 的 `prediction_base_url` → `device_prediction/services.py` | 系统配置优先；系统配置与环境变量都未填时工具返回“故障预测服务未配置”；请求路径 `GET /api/prediction/predict/{deviceId}` |
+| `DEVICE_HEALTH_BASE_URL` | `device_prediction_opts` 的 `health_base_url` → `device_prediction/services.py` | 系统配置优先；系统配置与环境变量都未填时工具返回“设备健康评估服务未配置”；请求路径 `GET /api/device-health/{deviceId}` |
+| `DEVICE_PREDICTION_INTENT_ENABLED` | `device_prediction/intent.py` | 缺省 `true`；设为 `0`/`false`/`no` 时设备语义解析与状态解读都走确定性路径 |
+
+走管理员系统配置时不需要环境变量；环境变量只在对应配置项字段留空时兜底，已保存的配置不会被环境变量覆盖。`kg5` 不可达或未建图时，图连接失败在设备检索阶段返回“设备预测维护知识图谱未配置或不可用”；图可达但没有匹配设备时返回“未在设备台账中找到该设备”；设备节点没有可用 `台账ID列表` 且三区台账里也没有精确同名行时返回“未找到该设备的台账 ID”。设备类型下没有匹配的故障现象时，报告只标注所需资源与注意事项未匹配。三区台账由运维更新到 MinIO，进程内缓存 5 分钟。字段口径、服务响应与未联调范围见[设备预测维护智能体](../develop-guides/decisions/implemented/2026-11-09-device-prediction-agent.md)。
+
 ## 电力规范问答图谱
 
 电力规范检索在意图确认后、常规召回之前查询独立 TuGraph 图 `power_spec_qa`。该图只保存测评集的“问题—答案—依据条款”映射，条款正文仍从当前可见知识库的 `processing_params["power_spec"]["clauses"]` 读取。管理员系统配置项 `power_spec_graph_opts` 拥有连接参数，环境变量只在配置项字段留空时兜底。导入命令、schema 与匹配规则见[电力规范检索](../mechanisms/power-spec-retrieval.md)。

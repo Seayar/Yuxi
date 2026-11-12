@@ -13,8 +13,8 @@ const hasVisibleAssistantBody = (message) => {
 
 const defaultEnrichToolCalls = (message) => enrichTaskToolCalls(message?.tool_calls)
 
-// 这两个工具的过程已经由智能体的四步思考区表达，保留原始工具卡片会重复且容易停留在“正在检索”。
-const THINKING_TOOL_NAMES = new Set(['search_power_spec', 'trace_fault'])
+// 这些工具的过程已经由智能体的思考区表达，保留原始工具卡片会重复且容易停留在“正在检索”。
+const THINKING_TOOL_NAMES = new Set(['search_power_spec', 'trace_fault', 'predict_device'])
 
 const getToolCallName = (toolCall) => toolCall?.name || toolCall?.function?.name || ''
 
