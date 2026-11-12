@@ -50,7 +50,7 @@ Compose 默认按单 worker、100 个同时运行的 AgentRun 配置。执行槽
 
 | 变量 | 读取者 | 缺省与条件 |
 |---|---|---|
-| `FAULT_TRACE_GRAPH_URI`、`FAULT_TRACE_GRAPH`、`FAULT_TRACE_GRAPH_USERNAME`、`FAULT_TRACE_GRAPH_PASSWORD` | `fault_trace_opts` → `TuGraphClient` | 系统配置优先；`FAULT_TRACE_GRAPH` 缺省回退 `kg3`；地址、图名、用户名、密码任一为空时工具返回“故障溯源知识库未配置” |
+| `FAULT_TRACE_GRAPH_URI`、`FAULT_TRACE_GRAPH`、`FAULT_TRACE_GRAPH_USERNAME`、`FAULT_TRACE_GRAPH_PASSWORD` | `fault_trace_opts` → `TuGraphClient` | 系统配置优先；`FAULT_TRACE_GRAPH` 只用于故障溯源，缺省回退 `kg3`；地址、图名、用户名、密码任一为空时工具返回“故障溯源知识库未配置” |
 | `FAULT_TRACE_REDIS_URL` | `fault_trace/realtime.py` | 为空时回退应用 `REDIS_URL`；两者都为空时属性状态为 `not_configured` |
 | `FAULT_TRACE_REDIS_DB` | `fault_trace/realtime.py` | 缺省 `0`；非整数按 `0` 处理 |
 | `FAULT_TRACE_REDIS_PREFIX` | `fault_trace/realtime.py` | 缺省空串；key 形如 `{prefix}{台账ID}:{属性}` |
@@ -58,6 +58,23 @@ Compose 默认按单 worker、100 个同时运行的 AgentRun 配置。执行槽
 | `TUGRAPH_CONNECT_TIMEOUT`、`TUGRAPH_QUERY_TIMEOUT` | `agents/toolkits/tugraph.py` | 连接缺省 5 秒、查询事务超时缺省 10 秒；查询超时以 bolt 事务配置下发，是否执行取决于 TuGraph 对 bolt 事务配置的支持 |
 
 `FAULT_TRACE_REDIS_URL` 与 `YOLO_FAULT_BASE_URL` 在 API 与 worker 的容器环境里都必须存在，否则容器读不到宿主机的同名变量。
+
+## 处置方案生成
+
+处置方案读 TuGraph `kg4` 的 `设备实例 / 设备类型 / 检修作业场景 / 检修步骤 / 安全措施 / 资源需求 / 人员需求`，连接参数与故障溯源共用 `fault_trace_opts` 的地址与凭据，图名单独配置。分支优先读故障溯源 Redis 的 `{台账ID}:{分支判定维度}`；Redis 未配置、无 key 或值非法时工具降级为让用户确认分支。工器具与人员 JSON 从 MinIO 读取，读取失败只在方案“数据说明”中标注，不阻断图谱内容。
+
+| 变量 | 读取者 | 缺省与条件 |
+|---|---|---|
+| `MAINTENANCE_PLAN_GRAPH` | `fault_trace_opts` 的 `maintenance_plan_graph` 字段 → `maintenance_plan/tool.py` | 系统配置优先；缺省回退 `kg4`；地址、用户名、密码任一为空时工具返回“处置方案知识库未配置” |
+| `FAULT_TRACE_REDIS_URL`、`FAULT_TRACE_REDIS_DB`、`FAULT_TRACE_REDIS_PREFIX` | `maintenance_plan/branch.py` 复用 `fault_trace/realtime.py` | key 形如 `{prefix}{台账ID}:{分支判定维度}`；value 必须精确等于场景的 `分支1条件` 或 `分支2条件`；未配置/缺失/值非法时降级为用户确认，不默认分支 |
+| `MAINTENANCE_PLAN_TOOLS_BUCKET`、`MAINTENANCE_PLAN_TOOLS_OBJECT` | `maintenance_plan/sources.py` | 缺省 `maintenance-plan` / `tools.json`（与 `fault-assets` 平级的 bucket）；结构为 `{"items":[{"name":...,"quantity":...}]}`，`quantity>0` 判在库；读取失败时资源清单不标注库存 |
+| `MAINTENANCE_PLAN_PERSONNEL_BUCKET`、`MAINTENANCE_PLAN_PERSONNEL_OBJECT` | `maintenance_plan/sources.py` | 缺省 `maintenance-plan` / `personnel.json`；结构为 `{"班组":[{"班组名称":...,"人员":[...]}]}`；读取失败时只输出岗位与人数；人员池不足时返回固定“人员数据不足”文案 |
+
+kg4 的 `设备实例.台账ID列表` 为 `补充数据` 等占位时，`sources.resolve_ledger_ids` 会按设备名称与层级回查 `fault-assets/ledger/devices.json` 补全台账 ID；设备缺少 `属于` 边时，只对台账分类精确命中的线路/间隔/PT 做有限类型回退。两类回退都只补检索键，不改变图谱节点或 Redis 数据。
+
+工器具与人员数据由数据团队维护在 `maintenance-plan` bucket；它与故障溯源的 `fault-assets` 平级，代码上也分别由 `maintenance_plan` / `fault_trace` 两个平级包拥有。当前 `tools.json` 为 304 条工器具库存、`personnel.json` 为 8 个班组 106 人。读取按进程内 300 秒缓存，更新对象后无需重启，最多 5 分钟后生效。
+
+处置方案与故障溯源共用同一 TuGraph 服务与账号，但图名不同；如果部署把两者拆到不同实例，需要先扩展 `fault_trace_opts` 的连接字段，不能只改图名。
 
 ## 电力规范问答图谱
 

@@ -303,3 +303,11 @@ def test_run_tool_call_ids_limits_to_current_run(gate: dict) -> None:
         _message("tool", _tool_payload(answer_source="maintenance_plan", answer_verified=True, answer_markdown="# 新卡片"), tool_call_id="new-1"),
     ]
     assert gate["_resolve_maintenance_plan_output"](messages, "模型内容", run_tool_call_ids={"new-1"}) == "# 新卡片"
+
+
+def test_no_permission_message_passes_through(gate: dict) -> None:
+    """上下文缺少用户权限时的固定文案必须原样透传，不能被替换成校验未通过文案。"""
+
+    messages = [_message("human", "3k18 开关柜整柜更换"), _message("tool", contracts.NO_PERMISSION_MESSAGE)]
+
+    assert gate["_resolve_maintenance_plan_output"](messages, "模型内容") == contracts.NO_PERMISSION_MESSAGE

@@ -24,21 +24,22 @@ from typing import Any
 
 from neo4j import GraphDatabase
 
-from yuxi.knowledge.maintenance_plan.contracts import (
-    LABEL_CLAUSE,
-    LABEL_DEVICE,
-    LABEL_DEVICE_TYPE,
-    LABEL_SAFETY_DISTANCE,
-    LABEL_SPARE,
-    LABEL_TEAM,
-    LABEL_TEMPLATE,
-    REL_HAS_TEMPLATE,
-    REL_MANAGES,
-    REL_SPARE,
-    REL_TEMPLATE_CLAUSE,
-)
 from yuxi.knowledge.maintenance_plan.preflight import PreflightError, preflight_seed
 from yuxi.utils import logger
+
+# kg3 seed 仍是独立的历史资产（数据团队可继续用）；标签/关系名由本模块自己拥有，
+# 运行时处置方案链路只拥有 kg4 的标签/关系（见 contracts）。
+LABEL_DEVICE = "设备实例"
+LABEL_DEVICE_TYPE = "设备类型"
+LABEL_CLAUSE = "标准条款"
+LABEL_TEMPLATE = "作业模板"
+LABEL_TEAM = "班组"
+LABEL_SPARE = "备品备件"
+LABEL_SAFETY_DISTANCE = "安全距离"
+REL_HAS_TEMPLATE = "适用模板"
+REL_TEMPLATE_CLAUSE = "依据条款"
+REL_MANAGES = "管辖"
+REL_SPARE = "配备备件"
 
 # 密码只从该环境变量读取
 PASSWORD_ENV = "KG_PASSWORD"

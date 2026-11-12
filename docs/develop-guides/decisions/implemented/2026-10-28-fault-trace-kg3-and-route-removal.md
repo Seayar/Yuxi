@@ -4,6 +4,8 @@
 类型：architecture
 Owner：backend/package/yuxi/knowledge/fault_trace/graph_kg3.py
 
+> 现状：处置方案运行时已于 2026-11-05 切换到 TuGraph `kg4`，见[处置方案切换到 kg4 检修作业场景](./2026-11-05-maintenance-plan-kg4-scenario.md)；故障溯源仍使用 kg3，本文的 kg3 预检与 seed 口径只约束故障溯源。
+
 图谱读取在 `graph_kg3.py`，设备图片与台账在 `fault_trace/images.py`、`fault_trace/ledger.py`，实时值语义在 `fault_trace/realtime.py`，编排在 `workflow.py`，路由注册在 `server/routers/__init__.py`。本记录取代 [故障溯源智能体](./2026-10-12-fault-trace-agent.md) 中关于旧 `kg` 图谱与 `POST /api/fault/images`、`GET /api/fault/health` 的路由描述，并与 [处置方案智能体](./2026-10-16-maintenance-plan-agent.md) 共用 kg3 的预检与写入口径。
 
 ## 问题

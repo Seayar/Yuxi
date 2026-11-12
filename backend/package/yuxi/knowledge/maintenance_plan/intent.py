@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 PlanIntentModelCall = Callable[[str], Awaitable[str]]
 
-# kg3 图中的设备类型名称清单由 contracts 统一拥有（归一结果必须落在其中）
+# kg4 图中的设备类型名称清单由 contracts 统一拥有（归一结果必须落在其中）
 KG_DEVICE_TYPES = DEVICE_TYPES
 
 # ---------------------------------------------------------------------------
@@ -56,6 +56,7 @@ _TASK_TYPE_KEYWORDS: tuple[tuple[str, str], ...] = (
 )
 
 _VOLTAGE_PATTERN = re.compile(r"(?P<value>\d+(?:\.\d+)?)\s*(?:[kKＫｋ][vVＶｖ]|千伏)")
+_MAINTENANCE_LEVEL_PATTERN = re.compile(r"(?<![A-Za-z])(?P<level>[ABCD])\s*级", re.IGNORECASE)
 
 # 位置线索，按“越具体越先匹配”排序
 _LOCATION_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -83,10 +84,18 @@ _DEVICE_NAME_PATTERNS: tuple[re.Pattern[str], ...] = (
     ),
     re.compile(r"[A-Za-z]{1,4}\s*\d+\s*杆塔"),
     re.compile(r"\d+\s*#\s*杆塔"),
+    re.compile(r"#\s*\d+\s*(?:箱变|低压柜|高压柜|PT柜|开关柜)"),
+    re.compile(r"隔离_\d+"),
+    re.compile(r"\d+\s*[kKＫｋ][vV]\s*_\s*[ⅠⅡⅢⅣIV]+\s*母\s*PT\s*_\s*\d+", re.IGNORECASE),
     re.compile(r"(?<![0-9])\d+\s*[kKＫｋ]\s*\d+"),
+    re.compile(r"(?<![0-9])\d+\s*[kKＫｋ][vV]\s*[ⅠⅡⅢⅣIV]+\s*段?\s*母线"),
+    re.compile(r"主变\s*\d+"),
+    re.compile(r"#?\s*\d+\s*主变"),
+    re.compile(r"馈线[一二三四五六七八九十百零\d]+\s*_\s*\d+"),
+    re.compile(r"(?<![0-9])\d+(?![kK][vV])[A-Za-z]{1,2}\s*-\s*[A-Za-z]?\d+[A-Za-z]?(?![A-Za-z0-9])"),
 )
 
-# 设备类型关键词 → kg3 设备类型名称；顺序即优先级（“开关柜”优先于“断路器”，“杆塔”优先于“绝缘子”）
+# 设备类型关键词 → kg4 设备类型名称；顺序即优先级（“开关柜”优先于“断路器”，“杆塔”优先于“绝缘子”）
 _DEVICE_TYPE_KEYWORDS: tuple[tuple[str, str], ...] = (
     ("开关柜", "开关柜"),
     ("断路器柜", "开关柜"),
@@ -117,6 +126,10 @@ _DEVICE_TYPE_KEYWORDS: tuple[tuple[str, str], ...] = (
     ("电压互感器", "电压互感器"),
     ("电流互感器", "电流互感器"),
     ("避雷器", "避雷器"),
+    ("熔断器", "熔断器"),
+    ("电容器", "电容器"),
+    ("电抗器", "电抗器"),
+    ("接地装置", "接地装置"),
     ("母线", "母线"),
     ("电缆", "电缆"),
     ("绝缘子", "绝缘子"),
@@ -184,6 +197,7 @@ def rule_extract(text: str) -> PlanQuery:
         voltage_level=_match_voltage(normalized),
         work_object=_match_work_object(normalized),
         location_hint=_match_location(normalized),
+        maintenance_level=_match_maintenance_level(normalized),
     )
 
 
@@ -221,6 +235,13 @@ def _match_location(text: str) -> str | None:
     return None
 
 
+def _match_maintenance_level(text: str) -> str | None:
+    """抽取 A/B/C/D 级检修；没有则返回 None。"""
+
+    match = _MAINTENANCE_LEVEL_PATTERN.search(text or "")
+    return match.group("level").upper() if match else None
+
+
 def _match_device_name(text: str) -> str | None:
     """抽取用户原话中的设备指称（如 3k18、991SVG开关、#62箱变13馈出柜）。"""
 
@@ -232,7 +253,7 @@ def _match_device_name(text: str) -> str | None:
 
 
 def _match_device_type(text: str) -> str | None:
-    """按关键词把口语设备类型归一到 kg3 设备类型名称。"""
+    """按关键词把口语设备类型归一到 kg4 设备类型名称。"""
 
     if not text:
         return None
@@ -264,7 +285,7 @@ def _squeeze(text: str) -> str:
 
 
 def normalize_device_type(raw: str | None) -> str | None:
-    """把口语设备类型归一到 kg3 的设备类型名称。
+    """把口语设备类型归一到 kg4 的设备类型名称。
 
     例：主变/站用变/接地变→变压器；箱变→箱式变电站；开关/断路器→断路器（但“开关柜”→开关柜）；
     刀闸→隔离开关；PT→电压互感器；CT→电流互感器；集电线路/配电线路/输电线路/线路→架空线路。
@@ -285,24 +306,22 @@ def normalize_device_type(raw: str | None) -> str | None:
 # 输入约束（方案二/方案三）
 # ---------------------------------------------------------------------------
 def missing_fields(query: PlanQuery) -> list[str]:
-    """返回缺失项，取值只能是 "task_type"、"device"。
+    """返回缺失项，取值只能是 "device"。
 
-    ``device`` 指既没有设备名称、也没有“位置线索 + 设备类型”的组合。
+    有设备名称、或只有设备类型（可按类型召回候选）都算具备检索条件；位置线索单独存在
+    无法定位设备类型，仍按缺失处理。任务类型不再必填。
     """
 
-    missing: list[str] = []
-    if query.task_type not in TASK_TYPES:
-        missing.append("task_type")
-    if not query.device_name and not (query.location_hint and query.device_type):
-        missing.append("device")
-    return missing
+    if query.device_name or query.device_type:
+        return []
+    return ["device"]
 
 
 def apply_input_constraints(query: PlanQuery) -> PlanQuery:
     """按输入约束标注澄清：
 
-    - 任务类型与目标设备都缺 → ``clarification_required=True`` 并给固定文案（方案三）；
-    - 只缺一项时不设置澄清（由工具弹出候选或任务类型选项，即“方案二”），但要保证字段已归一化。
+    - 既没有设备名称也没有设备类型 → ``clarification_required=True`` 并给固定文案；
+    - 只有设备类型时由工具按类型召回候选并让用户选择（方案二）。
     """
 
     query.task_type = query.task_type if query.task_type in TASK_TYPES else None
@@ -315,9 +334,11 @@ def apply_input_constraints(query: PlanQuery) -> PlanQuery:
         query.device_name = None
     query.location_hint = _clean_optional(query.location_hint)
     query.work_object = _clean_optional(query.work_object)
+    query.maintenance_level = _normalize_level(query.maintenance_level)
+    query.scene_hint = _clean_optional(query.scene_hint)
     query.raw_text = (query.raw_text or "").strip()
 
-    if missing_fields(query) == ["task_type", "device"]:
+    if missing_fields(query) == ["device"]:
         query.clarification_required = True
         query.clarification_message = CLARIFY_ALL_MESSAGE
     else:
@@ -379,6 +400,8 @@ def build_intent_prompt(
                     "voltage_level": previous.voltage_level,
                     "work_object": previous.work_object,
                     "location_hint": previous.location_hint,
+                    "maintenance_level": previous.maintenance_level,
+                    "scene_hint": previous.scene_hint,
                 },
                 ensure_ascii=False,
             )
@@ -409,6 +432,8 @@ def _merge_model_result(rule: PlanQuery, payload: dict[str, Any]) -> PlanQuery:
         voltage_level=_normalize_voltage(_clean_optional(payload.get("voltage_level"))) or rule.voltage_level,
         work_object=_clean_optional(payload.get("work_object")) or rule.work_object,
         location_hint=_clean_optional(payload.get("location_hint")) or rule.location_hint,
+        maintenance_level=_normalize_level(payload.get("maintenance_level")) or rule.maintenance_level,
+        scene_hint=_clean_optional(payload.get("scene_hint")) or rule.scene_hint,
     )
 
 
@@ -423,6 +448,8 @@ def _merge_previous(query: PlanQuery, previous: PlanQuery) -> PlanQuery:
         voltage_level=query.voltage_level or previous.voltage_level,
         work_object=query.work_object or previous.work_object,
         location_hint=query.location_hint or previous.location_hint,
+        maintenance_level=query.maintenance_level or previous.maintenance_level,
+        scene_hint=query.scene_hint or previous.scene_hint,
     )
 
 
@@ -454,6 +481,19 @@ def _normalize_voltage(raw: str | None) -> str | None:
     if text is None:
         return None
     return _match_voltage(text)
+
+
+def _normalize_level(raw: Any) -> str | None:
+    """把 A/B/C/D 级检修写法收敛为大写单字母。"""
+
+    text = _clean_optional(raw)
+    if text is None:
+        return None
+    value = text.upper()
+    if value in {"A", "B", "C", "D"}:
+        return value
+    match = _MAINTENANCE_LEVEL_PATTERN.search(text)
+    return match.group("level").upper() if match else None
 
 
 def _clean_optional(value: Any) -> str | None:
@@ -524,12 +564,14 @@ def _repair_json_text(text: str) -> str:
 INTENT_PROMPT = """你是配电网运维任务处置方案生成系统的意图识别器。
 请从用户的运维任务描述中提取以下 JSON 字段（整段必须且只是一个 JSON 对象，以 { 开头）：
 {
-  "task_type": "任务类型，只能是 更换/检修/试验/巡视 之一；没有则 null",
+  "task_type": "任务类型，只能是 更换/检修/试验/巡视 之一；没有则 null（选填，不要求用户必须说）",
   "device_name": "用户原话中的具体设备指称，如 3k18、991SVG开关、1号主变；只说设备类型时填 null",
   "device_type": "设备类型，如 开关柜、断路器、变压器、箱式变电站、杆塔、架空线路；没有则 null",
   "voltage_level": "电压等级，如 10kV、35kV；没有则 null",
   "work_object": "具体作业对象/部件，如 断路器、有载分接开关、冷却系统、手车机构；没有则 null",
-  "location_hint": "位置线索，如 #3开闭所、35kV#1变电站、#62箱变、1B-1K-1；没有则 null"
+  "location_hint": "位置线索，如 #3开闭所、35kV#1变电站、#62箱变、1B-1K-1；没有则 null",
+  "maintenance_level": "适用检修等级，只能是 A/B/C/D 之一；没有则 null",
+  "scene_hint": "用户描述的检修场景/缺陷关键词，如 油色谱乙炔超标、整柜更换、触头过热、漏气率超标；没有则 null"
 }
 要求：
 - 设备名称必须是用户原话里的具体设备指称，不要改写成台账名称，也不要把设备类型当作设备名称。

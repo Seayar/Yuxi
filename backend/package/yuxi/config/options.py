@@ -240,12 +240,31 @@ fault_trace_opts = Option(
             },
             {
                 "key": "graph",
-                "label": "图名称",
+                "label": "故障溯源图名称",
                 "type": "string",
                 "environment": "FAULT_TRACE_GRAPH",
                 "default": "kg3",
                 "placeholder": "kg3",
-                "help": "图谱名称，留空时读取 FAULT_TRACE_GRAPH，再回退 kg3。",
+                "help": "故障溯源使用的图谱名称，留空时读取 FAULT_TRACE_GRAPH，再回退 kg3。",
+            },
+            {
+                "key": "maintenance_plan_graph",
+                "label": "处置方案图名称",
+                "type": "string",
+                "environment": "MAINTENANCE_PLAN_GRAPH",
+                "default": "kg4",
+                "placeholder": "kg4",
+                "help": "处置方案生成使用的图谱名称，留空时读取 MAINTENANCE_PLAN_GRAPH，再回退 kg4。",
+            },
+            {
+                "key": "device_prediction_graph",
+                "label": "设备预测维护图名称",
+                "type": "string",
+                "environment": "DEVICE_PREDICTION_GRAPH",
+                "default": "kg5",
+                "placeholder": "kg5",
+                "help": "设备预测维护使用的图谱名称（设备台账与运维规程），"
+                "留空时读取 DEVICE_PREDICTION_GRAPH，再回退 kg5。",
             },
             {
                 "key": "username",

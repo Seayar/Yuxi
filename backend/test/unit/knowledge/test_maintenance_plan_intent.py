@@ -310,43 +310,43 @@ def test_device_name_is_not_the_location_hint():
 # ---------------------------------------------------------------------------
 # missing_fields 与输入约束（方案二/方案三）
 # ---------------------------------------------------------------------------
-def test_missing_fields_reports_both():
-    assert missing_fields(PlanQuery()) == ["task_type", "device"]
-
-
-def test_missing_fields_reports_task_type_only():
-    assert missing_fields(PlanQuery(device_name="3k18")) == ["task_type"]
-
-
 def test_missing_fields_reports_device_only():
-    assert missing_fields(PlanQuery(task_type="更换")) == ["device"]
+    assert missing_fields(PlanQuery()) == ["device"]
+
+
+def test_missing_fields_not_require_task_type():
+    assert missing_fields(PlanQuery(device_name="3k18")) == []
 
 
 def test_missing_fields_device_satisfied_by_location_and_type():
-    query = PlanQuery(task_type="更换", location_hint="#3开闭所", device_type="开关柜")
+    query = PlanQuery(location_hint="#3开闭所", device_type="开关柜")
 
     assert missing_fields(query) == []
 
 
-def test_missing_fields_device_type_alone_is_not_enough():
-    assert missing_fields(PlanQuery(task_type="更换", device_type="开关柜")) == ["device"]
+def test_missing_fields_device_type_alone_is_enough_for_candidate_search():
+    assert missing_fields(PlanQuery(device_type="开关柜")) == []
 
 
-def test_apply_input_constraints_sets_clarification_when_both_missing():
+def test_missing_fields_location_alone_is_not_enough():
+    assert missing_fields(PlanQuery(location_hint="#3开闭所")) == ["device"]
+
+
+def test_apply_input_constraints_sets_clarification_when_device_missing():
     query = apply_input_constraints(PlanQuery(raw_text="帮我出个方案"))
 
     assert query.clarification_required is True
     assert query.clarification_message == CLARIFY_ALL_MESSAGE
 
 
-def test_apply_input_constraints_no_clarification_when_single_missing():
-    only_device = apply_input_constraints(PlanQuery(task_type="更换"))
-    only_task = apply_input_constraints(PlanQuery(device_name="3k18"))
+def test_apply_input_constraints_no_clarification_when_device_present():
+    only_device = apply_input_constraints(PlanQuery(device_name="3k18"))
+    only_type = apply_input_constraints(PlanQuery(device_type="开关柜"))
 
     assert only_device.clarification_required is False
     assert only_device.clarification_message == ""
-    assert only_task.clarification_required is False
-    assert only_task.clarification_message == ""
+    assert only_type.clarification_required is False
+    assert only_type.clarification_message == ""
 
 
 def test_apply_input_constraints_normalizes_fields():
@@ -364,7 +364,13 @@ def test_apply_input_constraints_clamps_unknown_task_type():
 
     assert query.task_type is None
     assert query.clarification_required is False
-    assert missing_fields(query) == ["task_type"]
+    assert missing_fields(query) == []
+
+
+def test_apply_input_constraints_normalizes_maintenance_level():
+    query = apply_input_constraints(PlanQuery(device_name="3k18", maintenance_level="a级"))
+
+    assert query.maintenance_level == "A"
 
 
 def test_apply_input_constraints_clears_stale_clarification():
@@ -575,19 +581,32 @@ def test_extract_returns_clarification_for_unrelated_text():
 def test_extract_returns_clarification_for_empty_text():
     query = _run(extract_plan_intent("", model_call=None))
 
-    assert missing_fields(query) == ["task_type", "device"]
+    assert missing_fields(query) == ["device"]
     assert query.clarification_required is True
 
 
-def test_extract_single_missing_does_not_clarify():
-    """只缺任务类型时由工具弹候选（方案二），不反问。"""
+def test_extract_device_only_does_not_clarify():
+    """有设备名称即可进入检索；任务类型不再是必填项。"""
 
     query = _run(extract_plan_intent("3k18", model_call=None))
 
     assert query.clarification_required is False
-    assert missing_fields(query) == ["task_type"]
+    assert missing_fields(query) == []
 
 
 def test_intent_module_exposes_required_api():
     for name in ("extract_plan_intent", "rule_extract", "missing_fields", "apply_input_constraints", "normalize_device_type"):
         assert callable(getattr(intent, name))
+
+
+def test_rule_extract_matches_real_ledger_device_names():
+    """真实 Redis 命中链路依赖的设备名正则（隔离_300、馈线八_922、10kVⅠ段母线、主变1）必须有单测锁定。"""
+
+    cases = [
+        ("对隔离_300做A5分支隔离开关操作", "隔离_300"),
+        ("馈线八_922 柜体锈蚀五防失效整柜更换", "馈线八_922"),
+        ("10kVⅠ段母线A4同室并列检修方案", "10kVⅠ段母线"),
+        ("处理主变1温度异常", "主变1"),
+    ]
+    for text, expected in cases:
+        assert rule_extract(text).device_name == expected, text
