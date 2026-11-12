@@ -21,7 +21,7 @@ Owner：backend/package/yuxi/knowledge/fault_trace/tool.py
 3. **图谱溯源链路**：故障图谱数据由人工录入到**独立 TuGraph `kg` 图**（`bolt://<tugraph-host>:7688`，图名 `kg`，独立于 Yuxi 自管的 `default` 图；管理员可经 `fault_trace_opts` 配置连接）。新增专用适配器（当时位于 `fault_trace/graph_kg.py`，现为 `yuxi/agents/toolkits/tugraph.py`）直连该图：设备实例按 名称/显示名/name 匹配，沿中文关系 `存在故障模式`/`表现为`/`起因`/`处理`/`诱发条件` 取因果链、沿 `电连接` 取电气拓扑，映射为内部英文类型（`has_fault_mode`/`has_phenomenon`/`has_cause`/`has_measure`/`has_trigger_condition`/`electrically_connected_to`）的 `FaultGraphEvidence`；装配逻辑只消费内部类型。`fault_trace/seed.py` 提供中文 schema 的幂等导入（节点按主键 MERGE、边按两端主键 MERGE，重复导入不产生重复记录），已用 1号主变冷却系统示例在真实 `kg` 图验证（13 节点/12 边，导入两次不变）。
 4. **发布链路**：工具返回五段式报告契约（含 `answer_markdown`）；`chat_service` 新增 `_is_fault_trace_context`/`_resolve_fault_trace_output` 发布门，用工具产出的卡片覆盖模型最终消息（与 `search_power_spec` 同款，避免模型改写报告结构）；报告装配用单模型 + 代码前置校验门（实测值、设备名、原因、措施必须来自图谱证据，不允许模型自造编号/数值）。
 
-前端范围：团队自研 `new-web` 负责故障溯源页面与图片上传 UI，本变更只负责后端接口与 SSE/卡片数据契约，不改 Yuxi `web/` 前端。
+前端范围：故障溯源页面与图片上传 UI 不在本变更范围内，本变更只负责后端接口与 SSE/卡片数据契约，不改 Yuxi `web/` 前端。
 
 ## 替代方案
 
