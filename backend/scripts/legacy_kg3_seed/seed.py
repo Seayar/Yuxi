@@ -1,4 +1,9 @@
-"""把处置方案知识（作业模板 / 安全距离 / 班组 / 备品备件）幂等写入 TuGraph ``kg3`` 图。
+"""把处置方案 kg3 历史知识（作业模板 / 安全距离 / 班组 / 备品备件）幂等写入 TuGraph ``kg3`` 图。
+
+本模块是离线导入工具，不在运行时处置方案链路里；运行时的读图与方案装配在
+``yuxi.knowledge.maintenance_plan``。运行方式（仓库 ``backend/`` 目录，容器内为 ``/app``）::
+
+    python -m scripts.legacy_kg3_seed.seed --uri bolt://host:7688 --kg-ref <kg_ref.json>
 
 照搬 ``ref/fault_trace_参考实现/seed.py`` 的结构：``_ensure_kg_schema`` 先注册中文点/边标签、
 再用 Cypher ``MERGE`` 按单属性主键 ``id`` 幂等写入、``argparse`` CLI、返回计数。
@@ -24,11 +29,11 @@ from typing import Any
 
 from neo4j import GraphDatabase
 
-from yuxi.knowledge.maintenance_plan.preflight import PreflightError, preflight_seed
+from scripts.legacy_kg3_seed.preflight import PreflightError, preflight_seed
 from yuxi.utils import logger
 
 # kg3 seed 仍是独立的历史资产（数据团队可继续用）；标签/关系名由本模块自己拥有，
-# 运行时处置方案链路只拥有 kg4 的标签/关系（见 contracts）。
+# 运行时处置方案链路读取配置的处置方案图（与历史 kg4 schema 相同，见 contracts）。
 LABEL_DEVICE = "设备实例"
 LABEL_DEVICE_TYPE = "设备类型"
 LABEL_CLAUSE = "标准条款"
@@ -701,9 +706,11 @@ def seed_plan_graph_kg(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="导入处置方案知识数据到 TuGraph kg3 图")
+    parser = argparse.ArgumentParser(
+        description="导入历史处置方案知识数据到 TuGraph kg3 图（运行态读取配置图，本命令仅用于历史迁移）"
+    )
     parser.add_argument("--uri", required=True, help="TuGraph Bolt 地址，如 bolt://192.168.138.10:7688")
-    parser.add_argument("--graph", default="kg3", help="图名称，默认 kg3")
+    parser.add_argument("--graph", default="kg3", help="历史导入目标图名称，默认 kg3；运行态图不使用本命令")
     parser.add_argument("--username", default="admin", help="用户名，默认 admin")
     parser.add_argument("--data-dir", default=str(DEFAULT_DATA_DIR), help="seed 数据目录，默认包内 data/")
     parser.add_argument(

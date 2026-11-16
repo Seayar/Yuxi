@@ -250,6 +250,7 @@ def test_plain_message_set_matches_contract() -> None:
     assert contracts.PLAN_VERIFICATION_FAILED_MESSAGE in contracts.PLAIN_TOOL_MESSAGES
     assert contracts.CHOICE_ABORTED_MESSAGE in contracts.PLAIN_TOOL_MESSAGES
     assert contracts.PLAN_GRAPH_NOT_CONFIGURED_MESSAGE in contracts.PLAIN_TOOL_MESSAGES
+    assert contracts.BRANCH_UNRESOLVED_MESSAGE in contracts.PLAIN_TOOL_MESSAGES
     assert len(contracts.PLAIN_TOOL_MESSAGES) == len(set(contracts.PLAIN_TOOL_MESSAGES))
 
 

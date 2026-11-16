@@ -1,7 +1,7 @@
 """故障设备台账（MinIO JSON）读取与设备 ID 解析。
 
 台账由数据团队导出到 MinIO（默认 ``fault-assets/ledger/devices.json``），运行时只读。
-kg3 设备名称与台账层级共同确定台账设备 ID，再用该 ID 作为 Redis 实时值 key 前缀。
+故障图设备名称与台账层级共同确定台账设备 ID，再用该 ID 作为 Redis 实时值 key 前缀。
 """
 
 from __future__ import annotations

@@ -87,8 +87,8 @@ class DevicePredictionInput(BaseModel):
 async def predict_device(query_text: str, runtime: ToolRuntime = None) -> dict[str, Any] | str:
     """按设备名称定位设备，调用健康评估与故障预测服务，并按预测故障类型匹配维护知识生成报告。
 
-    图谱数据来自设备预测维护自己的 TuGraph ``kg5`` 图（管理员配置
-    ``fault_trace_opts`` 的 ``device_prediction_graph``，默认 kg5）；健康评估与故障预测两个
+    图谱数据来自管理员配置的 TuGraph 设备预测维护图（``fault_trace_opts`` 的
+    ``device_prediction_graph``，默认图名由配置默认值决定）；健康评估与故障预测两个
     服务地址由管理员配置 ``device_prediction_opts``，任一未配置时返回对应固定文案。
     """
 
@@ -446,7 +446,7 @@ def _normalize_text(value: str | None) -> str:
 # 配置与缓存
 # ---------------------------------------------------------------------------
 async def _resolve_kg_config() -> TuGraphConfig | None:
-    """读取管理员配置的 TuGraph 连接；预测维护图默认 kg5，关键字段缺失时返回 None。"""
+    """读取管理员配置的 TuGraph 连接；预测维护图默认图名由配置决定，关键字段缺失时返回 None。"""
 
     try:
         resolved = await fault_trace_opts.get()

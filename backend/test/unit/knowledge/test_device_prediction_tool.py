@@ -205,12 +205,12 @@ def test_full_flow_returns_verified_report(monkeypatch):
     # 两次图连接（设备检索 + 维护知识匹配）都在用完后关闭
     assert len(_FakeClient.instances) == 2
     assert all(client.closed for client in _FakeClient.instances)
-    # 只读 kg5：连接图名取 device_prediction_graph，绝不能误用故障溯源的 graph（kg3）字段。
+    # 只读配置的设备预测维护图：连接图名取 device_prediction_graph，绝不能误用其他图名字段。
     assert [client.config.graph for client in _FakeClient.instances] == ["kg5", "kg5"]
 
 
-def test_graph_name_falls_back_to_kg5_when_option_key_missing(monkeypatch):
-    """系统配置没存 device_prediction_graph 时回退 kg5，而不是回退 graph 字段的 kg3。"""
+def test_graph_name_falls_back_to_default_when_option_key_missing(monkeypatch):
+    """系统配置没存 device_prediction_graph 时回退默认图名，而不是回退 graph 字段。"""
 
     option = dict(KG_OPTION)
     option.pop("device_prediction_graph")
@@ -287,7 +287,7 @@ def test_unknown_device_returns_fixed_message(monkeypatch):
 
 
 def test_graph_query_failure_returns_fixed_message_and_closes_client(monkeypatch):
-    """kg5 不可用（图不存在/连接失败）时返回固定文案，连接必须关闭。"""
+    """设备预测维护图不可用（图不存在/连接失败）时返回固定文案，连接必须关闭。"""
 
     _install(monkeypatch)
 

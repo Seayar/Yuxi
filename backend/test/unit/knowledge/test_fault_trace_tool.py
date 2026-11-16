@@ -1,4 +1,4 @@
-"""故障溯源工具单元测试：kg3 四步编排、设备校验、实时判据与失败分支。"""
+"""故障溯源工具单元测试：故障图四步编排、设备校验、实时判据、多现象归属与失败分支。"""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from yuxi.knowledge.fault_trace.contracts import (
     FAULT_GRAPH_UNAVAILABLE_MESSAGE,
     FAULT_TRACE_AGENT_SLUG,
     IMAGE_NOT_FOUND_MESSAGE,
+    INTENT_CANCELLED_MESSAGE,
     NO_FAULT_GRAPH_MESSAGE,
     FaultTraceQuery,
     RealtimeValue,
@@ -44,7 +45,7 @@ class _FakeOption:
 def _kg_option() -> dict:
     return {
         "server_url": "bolt://tugraph:7688",
-        "graph": "kg3",
+        "graph": "kg5",
         "username": "kg-user",
         "password": "test-password",
     }
@@ -71,12 +72,6 @@ STATION = {
     "labels": ["设备实例"],
     "properties": {"名称": "35kV#3变电站", "电压等级": "35kV", "设备分类": "变电站"},
 }
-MODE = {
-    "id": "FM-WR-01",
-    "name": "异物搭挂",
-    "type": "fault_mode",
-    "properties": {"名称": "异物搭挂"},
-}
 PHENOMENON = {
     "id": "PH-04",
     "name": "树木倒伏枝干压覆导线",
@@ -94,12 +89,6 @@ TRIGGER = {
     "name": "泄漏电流超1mA",
     "type": "trigger",
     "properties": {"名称": "泄漏电流超1mA", "表达式": "leakage_current > 1"},
-}
-CONSEQUENCE = {
-    "id": "FC-01",
-    "name": "相间短路",
-    "type": "consequence",
-    "properties": {"名称": "相间短路"},
 }
 MEASURE = {
     "id": "MM-03",
@@ -125,19 +114,16 @@ def _evidence(*, with_chain: bool = True) -> FaultGraphEvidence:
         _edge(STATION["id"], DEVICE["id"], "electrically_connected_to"),
     ]
     if not with_chain:
-        return FaultGraphEvidence(nodes=[DEVICE, TYPE], edges=edges, cause_links="fault_mode")
+        return FaultGraphEvidence(nodes=[DEVICE, TYPE], edges=edges)
     edges += [
-        _edge(TYPE["id"], MODE["id"], "has_fault_mode"),
-        _edge(MODE["id"], PHENOMENON["id"], "has_phenomenon"),
-        _edge(MODE["id"], CAUSE["id"], "has_cause"),
+        _edge(TYPE["id"], PHENOMENON["id"], "has_phenomenon"),
+        _edge(PHENOMENON["id"], CAUSE["id"], "has_cause"),
         _edge(CAUSE["id"], TRIGGER["id"], "has_trigger_condition"),
         _edge(CAUSE["id"], MEASURE["id"], "has_measure"),
-        _edge(CAUSE["id"], CONSEQUENCE["id"], "may_lead_to_consequence"),
     ]
     return FaultGraphEvidence(
-        nodes=[DEVICE, TYPE, STATION, MODE, PHENOMENON, CAUSE, TRIGGER, MEASURE, CONSEQUENCE],
+        nodes=[DEVICE, TYPE, STATION, PHENOMENON, CAUSE, TRIGGER, MEASURE],
         edges=edges,
-        cause_links="fault_mode",
     )
 
 
@@ -198,7 +184,7 @@ async def test_resolve_kg_config_reads_all_fields(monkeypatch):
 
     assert config == TuGraphConfig(
         uri="bolt://tugraph:7688",
-        graph="kg3",
+        graph="kg5",
         username="kg-user",
         password="test-password",
     )
@@ -233,7 +219,7 @@ async def test_trace_fault_returns_not_configured_when_kg_missing(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_trace_fault_emits_four_steps_with_kg3_data(monkeypatch):
+async def test_trace_fault_emits_four_steps_with_fault_graph_data(monkeypatch):
     _patch_success(monkeypatch)
 
     result = await FAULT_FN(
@@ -266,7 +252,7 @@ async def test_trace_fault_emits_four_steps_with_kg3_data(monkeypatch):
 
     causal = steps[1]["data"]
     assert causal["device_type"] == "架空线路"
-    assert causal["fault_modes"] == [{"mode_id": "FM-WR-01", "name": "异物搭挂"}]
+    assert "fault_modes" not in causal
     assert causal["causes"][0]["status"] == "established"
     assert causal["causes"][0]["true_count"] == 1
     assert causal["triggers"][0]["result"] == "true"
@@ -274,11 +260,13 @@ async def test_trace_fault_emits_four_steps_with_kg3_data(monkeypatch):
 
     topology = steps[2]["data"]
     assert [device["name"] for device in topology["upstream"]] == ["35kV#3变电站"]
-    assert topology["consequences"] == [{"consequence_id": "FC-01", "name": "相间短路"}]
+    assert topology["consequences"] == []
 
     final = steps[3]["data"]
     assert final["verdict"] == "established"
     assert final["located_cause"] == {"cause_id": "CA-04", "name": CAUSE["name"]}
+    assert final["report"]["location"]["phenomena"] == ["树木倒伏枝干压覆导线"]
+    assert final["report"]["meta"]["warnings"] == []
     assert final["report"]["schema_version"] == "fault-trace-report/v1"
     assert final["report"]["suggestions"] == [
         {"cause_id": "CA-04", "cause_name": CAUSE["name"], "measures": ["1. 修剪树木\n2. 清理现场"]}
@@ -314,7 +302,7 @@ async def test_trace_fault_prefers_ledger_device_id(monkeypatch):
 
 
 def _evidence_type_level() -> FaultGraphEvidence:
-    """没有故障模式层：设备类型直接挂现象，现象挂原因。"""
+    """设备类型直接挂现象，现象挂原因；没有故障模式层。"""
 
     edges = [
         _edge(DEVICE["id"], TYPE["id"], "belongs_to_device_type"),
@@ -330,6 +318,389 @@ def _evidence_type_level() -> FaultGraphEvidence:
     )
 
 
+def _evidence_multi_phenomenon() -> FaultGraphEvidence:
+    """同一设备类型挂两个现象；两个原因都成立，只有命中的“燃烧起火”进入定位与推理表。"""
+
+    smoke = {
+        "id": "PH-SMOKE",
+        "name": "冒烟异常",
+        "type": "phenomenon",
+        "labels": ["故障现象"],
+        "properties": {"名称": "冒烟异常"},
+    }
+    fire = {
+        "id": "PH-FIRE",
+        "name": "燃烧起火",
+        "type": "phenomenon",
+        "labels": ["故障现象"],
+        "properties": {"名称": "燃烧起火"},
+    }
+    smoke_cause = {
+        "id": "CAUSE-SMOKE",
+        "name": "绕组匝间短路与局部放电",
+        "type": "cause",
+        "labels": ["故障原因"],
+        "properties": {"名称": "绕组匝间短路与局部放电"},
+    }
+    fire_cause = {
+        "id": "CAUSE-FIRE",
+        "name": "冷却（散热）系统失效",
+        "type": "cause",
+        "labels": ["故障原因"],
+        "properties": {"名称": "冷却（散热）系统失效"},
+    }
+    smoke_trigger = {
+        "id": "TC-SMOKE",
+        "name": "绕组局部温度超过145℃",
+        "type": "trigger",
+        "labels": ["触发条件"],
+        "properties": {"名称": "绕组局部温度超过145℃", "表达式": "winding_local_temp > 145"},
+    }
+    fire_trigger = {
+        "id": "TC-FIRE",
+        "name": "风机电流为0A",
+        "type": "trigger",
+        "labels": ["触发条件"],
+        "properties": {"名称": "风机电流为0A", "表达式": "cooling_fan_current == 0"},
+    }
+    edges = [
+        _edge(DEVICE["id"], TYPE["id"], "belongs_to_device_type"),
+        _edge(TYPE["id"], smoke["id"], "has_phenomenon"),
+        _edge(TYPE["id"], fire["id"], "has_phenomenon"),
+        _edge(smoke["id"], smoke_cause["id"], "has_cause"),
+        _edge(fire["id"], fire_cause["id"], "has_cause"),
+        _edge(smoke_cause["id"], smoke_trigger["id"], "has_trigger_condition"),
+        _edge(fire_cause["id"], fire_trigger["id"], "has_trigger_condition"),
+        _edge(STATION["id"], DEVICE["id"], "electrically_connected_to"),
+    ]
+    return FaultGraphEvidence(
+        nodes=[DEVICE, TYPE, STATION, smoke, fire, smoke_cause, fire_cause, smoke_trigger, fire_trigger],
+        edges=edges,
+        cause_links="fault_phenomenon",
+    )
+
+
+@pytest.mark.asyncio
+async def test_trace_fault_scopes_location_to_matched_phenomenon(monkeypatch):
+    """多现象设备类型只把命中现象的原因写入定位，推理表也只保留命中现象。"""
+
+    _patch_success(monkeypatch)
+    evidence = _evidence_multi_phenomenon()
+    monkeypatch.setattr(workflow_module, "collect_kg3_evidence", lambda *_args, **_kwargs: evidence)
+
+    async def fake_extract(*_args, **_kwargs):
+        return FaultTraceQuery(device_name="3B-7Y", voltage_level="10kV", phenomena=["燃烧起火"])
+
+    async def fake_values(_device_id, _attributes):
+        return {
+            "winding_local_temp": RealtimeValue("winding_local_temp", "ok", 180.0, raw="180"),
+            "cooling_fan_current": RealtimeValue("cooling_fan_current", "ok", 0.0, raw="0"),
+        }
+
+    monkeypatch.setattr(workflow_module, "extract_fault_trace_intent", fake_extract)
+    monkeypatch.setattr(workflow_module, "read_realtime_values", fake_values)
+
+    result = await FAULT_FN(query_text="3B-7Y 燃烧起火", confirmed_intent=True, runtime=_runtime())
+
+    report = result["report"]
+    assert report["summary"]["phenomenon"] == "燃烧起火"
+    assert report["location"]["phenomena"] == ["燃烧起火"]
+    assert report["location"]["cause_name"] == "冷却（散热）系统失效"
+    assert [cause["name"] for cause in report["location"]["causes"]] == ["冷却（散热）系统失效"]
+    assert [row["phenomenon"] for row in report["reasoning"]] == ["燃烧起火"]
+    location_markdown = result["answer_markdown"].split("**③ 原因定位**")[1].split("**④ 影响范围**")[0]
+    assert "燃烧起火" in location_markdown
+    assert "冒烟异常" not in location_markdown
+    reasoning_markdown = result["answer_markdown"].split("**② 推理过程**")[1].split("**③ 原因定位**")[0]
+    assert "冒烟异常" not in reasoning_markdown
+
+
+@pytest.mark.asyncio
+async def test_trace_fault_reasoning_keeps_only_yolo_phenomenon(monkeypatch):
+    """图片类别命中其中一个现象时，推理表不再列出该设备类型的其它现象。"""
+
+    _patch_success(monkeypatch)
+    monkeypatch.setattr(
+        workflow_module,
+        "collect_kg3_evidence",
+        lambda *_args, **_kwargs: _evidence_multi_phenomenon(),
+    )
+
+    async def fake_extract(*_args, **_kwargs):
+        return FaultTraceQuery(device_name="3B-7Y", voltage_level="10kV", phenomena=[])
+
+    async def fake_image(_name):
+        return DeviceImage(
+            bucket="fault-assets",
+            object_key="device-images/3B-7Y.jpg",
+            content_type="image/jpeg",
+            data=b"jpeg",
+        )
+
+    async def fake_detect(**_kwargs):
+        return YoloDetectResult(fault=True, fault_type="fire", fault_name="燃烧起火")
+
+    async def fake_values(_device_id, _attributes):
+        return {"cooling_fan_current": RealtimeValue("cooling_fan_current", "ok", 0.0, raw="0")}
+
+    monkeypatch.setattr(workflow_module, "extract_fault_trace_intent", fake_extract)
+    monkeypatch.setattr(workflow_module, "resolve_device_image", fake_image)
+    monkeypatch.setattr(workflow_module, "detect_fault_image", fake_detect)
+    monkeypatch.setattr(workflow_module, "read_realtime_values", fake_values)
+
+    result = await FAULT_FN(query_text="3B-7Y 通道异常", confirmed_intent=True, runtime=_runtime())
+
+    report = result["report"]
+    assert [row["phenomenon"] for row in report["reasoning"]] == ["燃烧起火"]
+    assert report["location"]["phenomena"] == ["燃烧起火"]
+    reasoning_markdown = result["answer_markdown"].split("**② 推理过程**")[1].split("**③ 原因定位**")[0]
+    assert "燃烧起火" in reasoning_markdown
+    assert "冒烟异常" not in reasoning_markdown
+
+
+@pytest.mark.asyncio
+async def test_trace_fault_reasoning_prefers_yolo_over_text(monkeypatch):
+    """文字现象与图片类别不一致时，推理表只跟随图片类别。"""
+
+    _patch_success(monkeypatch)
+    monkeypatch.setattr(
+        workflow_module,
+        "collect_kg3_evidence",
+        lambda *_args, **_kwargs: _evidence_multi_phenomenon(),
+    )
+
+    async def fake_extract(*_args, **_kwargs):
+        return FaultTraceQuery(device_name="3B-7Y", voltage_level="10kV", phenomena=["冒烟异常"])
+
+    async def fake_image(_name):
+        return DeviceImage(
+            bucket="fault-assets",
+            object_key="device-images/3B-7Y.jpg",
+            content_type="image/jpeg",
+            data=b"jpeg",
+        )
+
+    async def fake_detect(**_kwargs):
+        return YoloDetectResult(fault=True, fault_type="fire", fault_name="燃烧起火")
+
+    async def fake_values(_device_id, _attributes):
+        return {"cooling_fan_current": RealtimeValue("cooling_fan_current", "ok", 0.0, raw="0")}
+
+    monkeypatch.setattr(workflow_module, "extract_fault_trace_intent", fake_extract)
+    monkeypatch.setattr(workflow_module, "resolve_device_image", fake_image)
+    monkeypatch.setattr(workflow_module, "detect_fault_image", fake_detect)
+    monkeypatch.setattr(workflow_module, "read_realtime_values", fake_values)
+
+    result = await FAULT_FN(query_text="3B-7Y 冒烟异常", confirmed_intent=True, runtime=_runtime())
+
+    report = result["report"]
+    assert [row["phenomenon"] for row in report["reasoning"]] == ["燃烧起火"]
+    assert report["location"]["phenomena"] == ["燃烧起火"]
+    assert report["location"]["cause_name"] == "冷却（散热）系统失效"
+
+
+def _evidence_matched_unknown_other_established() -> FaultGraphEvidence:
+    """命中的“燃烧起火”原因缺少实时值（unknown），未命中的“冒烟异常”原因成立。"""
+
+    smoke = {
+        "id": "PH-SMOKE",
+        "name": "冒烟异常",
+        "type": "phenomenon",
+        "labels": ["故障现象"],
+        "properties": {"名称": "冒烟异常"},
+    }
+    fire = {
+        "id": "PH-FIRE",
+        "name": "燃烧起火",
+        "type": "phenomenon",
+        "labels": ["故障现象"],
+        "properties": {"名称": "燃烧起火"},
+    }
+    smoke_cause = {
+        "id": "CAUSE-SMOKE",
+        "name": "冒烟原因",
+        "type": "cause",
+        "labels": ["故障原因"],
+        "properties": {"名称": "冒烟原因"},
+    }
+    fire_cause = {
+        "id": "CAUSE-FIRE",
+        "name": "火因待确认",
+        "type": "cause",
+        "labels": ["故障原因"],
+        "properties": {"名称": "火因待确认"},
+    }
+    smoke_trigger = {
+        "id": "TC-SMOKE",
+        "name": "风机电流为0A",
+        "type": "trigger",
+        "labels": ["触发条件"],
+        "properties": {"名称": "风机电流为0A", "表达式": "cooling_fan_current == 0"},
+    }
+    fire_trigger = {
+        "id": "TC-FIRE",
+        "name": "绕组局部温度超过145℃",
+        "type": "trigger",
+        "labels": ["触发条件"],
+        "properties": {"名称": "绕组局部温度超过145℃", "表达式": "winding_local_temp > 145"},
+    }
+    edges = [
+        _edge(DEVICE["id"], TYPE["id"], "belongs_to_device_type"),
+        _edge(TYPE["id"], smoke["id"], "has_phenomenon"),
+        _edge(TYPE["id"], fire["id"], "has_phenomenon"),
+        _edge(smoke["id"], smoke_cause["id"], "has_cause"),
+        _edge(fire["id"], fire_cause["id"], "has_cause"),
+        _edge(smoke_cause["id"], smoke_trigger["id"], "has_trigger_condition"),
+        _edge(fire_cause["id"], fire_trigger["id"], "has_trigger_condition"),
+        _edge(STATION["id"], DEVICE["id"], "electrically_connected_to"),
+    ]
+    return FaultGraphEvidence(
+        nodes=[DEVICE, TYPE, STATION, smoke, fire, smoke_cause, fire_cause, smoke_trigger, fire_trigger],
+        edges=edges,
+        cause_links="fault_phenomenon",
+    )
+
+
+@pytest.mark.asyncio
+async def test_trace_fault_scopes_verdict_and_evidence_to_matched_phenomenon(monkeypatch):
+    """命中现象无成立原因时，③ 的 verdict/证据/文案不能混入未命中现象的成立原因。"""
+
+    _patch_success(monkeypatch)
+    monkeypatch.setattr(
+        workflow_module,
+        "collect_kg3_evidence",
+        lambda *_args, **_kwargs: _evidence_matched_unknown_other_established(),
+    )
+
+    async def fake_extract(*_args, **_kwargs):
+        return FaultTraceQuery(device_name="3B-7Y", voltage_level="10kV", phenomena=["燃烧起火"])
+
+    async def fake_values(_device_id, _attributes):
+        return {"cooling_fan_current": RealtimeValue("cooling_fan_current", "ok", 0.0, raw="0")}
+
+    monkeypatch.setattr(workflow_module, "extract_fault_trace_intent", fake_extract)
+    monkeypatch.setattr(workflow_module, "read_realtime_values", fake_values)
+
+    result = await FAULT_FN(query_text="3B-7Y 燃烧起火", confirmed_intent=True, runtime=_runtime())
+
+    report = result["report"]
+    assert report["summary"]["phenomenon"] == "燃烧起火"
+    assert report["location"]["causes"] == []
+    assert report["location"]["verdict"] == "unknown"
+    assert report["location"]["phenomena"] == []
+    assert [item["trigger_id"] for item in report["location"]["evidence"]] == ["TC-FIRE"]
+    location_markdown = result["answer_markdown"].split("**③ 原因定位**")[1].split("**④ 影响范围**")[0]
+    assert "冒烟原因" not in location_markdown
+    assert "全部候选原因的实时判据均不成立" not in location_markdown
+
+
+def _evidence_matched_without_causes() -> FaultGraphEvidence:
+    """命中的“燃烧起火”没有 has_cause 边；未命中的“冒烟异常”原因成立。"""
+
+    smoke = {
+        "id": "PH-SMOKE",
+        "name": "冒烟异常",
+        "type": "phenomenon",
+        "labels": ["故障现象"],
+        "properties": {"名称": "冒烟异常"},
+    }
+    fire = {
+        "id": "PH-FIRE",
+        "name": "燃烧起火",
+        "type": "phenomenon",
+        "labels": ["故障现象"],
+        "properties": {"名称": "燃烧起火"},
+    }
+    smoke_cause = {
+        "id": "CAUSE-SMOKE",
+        "name": "冒烟原因",
+        "type": "cause",
+        "labels": ["故障原因"],
+        "properties": {"名称": "冒烟原因"},
+    }
+    smoke_trigger = {
+        "id": "TC-SMOKE",
+        "name": "风机电流为0A",
+        "type": "trigger",
+        "labels": ["触发条件"],
+        "properties": {"名称": "风机电流为0A", "表达式": "cooling_fan_current == 0"},
+    }
+    edges = [
+        _edge(DEVICE["id"], TYPE["id"], "belongs_to_device_type"),
+        _edge(TYPE["id"], smoke["id"], "has_phenomenon"),
+        _edge(TYPE["id"], fire["id"], "has_phenomenon"),
+        _edge(smoke["id"], smoke_cause["id"], "has_cause"),
+        _edge(smoke_cause["id"], smoke_trigger["id"], "has_trigger_condition"),
+        _edge(STATION["id"], DEVICE["id"], "electrically_connected_to"),
+    ]
+    return FaultGraphEvidence(
+        nodes=[DEVICE, TYPE, STATION, smoke, fire, smoke_cause, smoke_trigger],
+        edges=edges,
+        cause_links="fault_phenomenon",
+    )
+
+
+@pytest.mark.asyncio
+async def test_trace_fault_matched_phenomenon_without_causes_keeps_empty_scope(monkeypatch):
+    """命中现象没有原因边时范围保持为空，不能回退到全部原因或其它现象的证据。"""
+
+    _patch_success(monkeypatch)
+    monkeypatch.setattr(
+        workflow_module,
+        "collect_kg3_evidence",
+        lambda *_args, **_kwargs: _evidence_matched_without_causes(),
+    )
+
+    async def fake_extract(*_args, **_kwargs):
+        return FaultTraceQuery(device_name="3B-7Y", voltage_level="10kV", phenomena=["燃烧起火"])
+
+    async def fake_values(_device_id, _attributes):
+        return {"cooling_fan_current": RealtimeValue("cooling_fan_current", "ok", 0.0, raw="0")}
+
+    monkeypatch.setattr(workflow_module, "extract_fault_trace_intent", fake_extract)
+    monkeypatch.setattr(workflow_module, "read_realtime_values", fake_values)
+
+    result = await FAULT_FN(query_text="3B-7Y 燃烧起火", confirmed_intent=True, runtime=_runtime())
+
+    location = result["report"]["location"]
+    assert location["verdict"] == "none"
+    assert location["causes"] == []
+    assert location["phenomena"] == []
+    assert location["evidence"] == []
+    location_markdown = result["answer_markdown"].split("**③ 原因定位**")[1].split("**④ 影响范围**")[0]
+    assert "命中的故障现象下没有可判定的原因" in location_markdown
+    assert "图谱未返回可判定的故障原因" not in location_markdown
+
+
+@pytest.mark.asyncio
+async def test_trace_fault_falls_back_to_phenomena_of_located_causes_when_no_match(monkeypatch):
+    """没有现象命中时按成立原因反推现象，不把没有成立原因的现象写进定位。"""
+
+    _patch_success(monkeypatch)
+    monkeypatch.setattr(
+        workflow_module,
+        "collect_kg3_evidence",
+        lambda *_args, **_kwargs: _evidence_multi_phenomenon(),
+    )
+
+    async def fake_extract(*_args, **_kwargs):
+        return FaultTraceQuery(device_name="3B-7Y", voltage_level="10kV", phenomena=["异物搭挂"])
+
+    async def fake_values(_device_id, _attributes):
+        return {"winding_local_temp": RealtimeValue("winding_local_temp", "ok", 180.0, raw="180")}
+
+    monkeypatch.setattr(workflow_module, "extract_fault_trace_intent", fake_extract)
+    monkeypatch.setattr(workflow_module, "read_realtime_values", fake_values)
+
+    result = await FAULT_FN(query_text="3B-7Y 异物搭挂", confirmed_intent=True, runtime=_runtime())
+
+    causal = next(step for step in result["thinking_steps"] if step["step_id"] == "match_causal_chain")
+    assert any("未匹配到用户描述中的故障现象" in warning for warning in causal["data"]["warnings"])
+    assert result["report"]["location"]["phenomena"] == ["冒烟异常"]
+    # 没有命中现象时没有可收敛的依据，推理表保留该设备类型的全部现象。
+    assert [row["phenomenon"] for row in result["report"]["reasoning"]] == ["冒烟异常", "燃烧起火"]
+
+
 @pytest.mark.asyncio
 async def test_trace_fault_supports_type_level_phenomena_without_mode(monkeypatch):
     _patch_success(monkeypatch)
@@ -338,7 +709,7 @@ async def test_trace_fault_supports_type_level_phenomena_without_mode(monkeypatc
     result = await FAULT_FN(query_text="3B-7Y 故障", confirmed_intent=True, runtime=_runtime())
 
     steps = {step["step_id"]: step for step in result["thinking_steps"]}
-    assert steps["match_causal_chain"]["data"]["fault_modes"] == []
+    assert "fault_modes" not in steps["match_causal_chain"]["data"]
     assert steps["match_causal_chain"]["data"]["causes"][0]["status"] == "established"
     assert steps["generate_report"]["data"]["verdict"] == "established"
 
@@ -685,6 +1056,70 @@ async def test_trace_fault_continues_when_replay_reidentifies_differently(monkey
 
     assert "report" in second
     assert second["report"]["location"]["verdict"] in {"established", "rejected", "unknown"}
+
+
+@pytest.mark.asyncio
+async def test_trace_fault_confirmation_shows_identified_type_with_graph_classification(monkeypatch):
+    """模型识别设备类型与图谱归类不同时并列展示，溯源证据仍按图谱归类读取。"""
+
+    _patch_success(monkeypatch)
+    asked: list[dict] = []
+
+    async def fake_extract(*_args, **_kwargs):
+        return FaultTraceQuery(
+            device_name="3B-7Y",
+            device_type="输电线路",
+            voltage_level="10kV",
+            phenomena=["树木倒伏枝干压覆导线"],
+        )
+
+    def confirming(payload):
+        asked.append(payload)
+        return {payload["questions"][0]["question_id"]: payload["questions"][0]["options"][0]["value"]}
+
+    monkeypatch.setattr(workflow_module, "extract_fault_trace_intent", fake_extract)
+    monkeypatch.setattr(workflow_module, "interrupt", confirming)
+
+    result = await FAULT_FN(query_text="3B-7Y 通道内树木倒伏压覆导线", runtime=_runtime())
+
+    question = asked[0]["questions"][0]["question"]
+    assert "设备类型=输电线路（图谱归类：架空线路）" in question
+    # 证据按图谱归类取：报告元数据使用图谱解析出的设备类型，而不是模型文本。
+    assert result["report"]["meta"]["device_type"] == "架空线路"
+
+
+@pytest.mark.asyncio
+async def test_trace_fault_cancel_on_correction_card_stops(monkeypatch):
+    """关闭“补充修正”卡片按取消结束，不能把取消哨兵当成用户补充重新识别。"""
+
+    _patch_success(monkeypatch)
+    payloads: list[dict] = []
+    intent_calls: list[int] = []
+    events: list[dict] = []
+
+    def answering(payload):
+        payloads.append(payload)
+        return "correct" if len(payloads) == 1 else "reject"
+
+    async def counting_extract(*_args, **_kwargs):
+        intent_calls.append(1)
+        return FaultTraceQuery(device_name="3B-7Y", voltage_level="10kV", phenomena=["树木倒伏枝干压覆导线"])
+
+    monkeypatch.setattr(thinking_module, "get_stream_writer", lambda: events.append)
+    monkeypatch.setattr(workflow_module, "extract_fault_trace_intent", counting_extract)
+    monkeypatch.setattr(workflow_module, "interrupt", answering)
+
+    result = await FAULT_FN(query_text="3B-7Y 通道内树木倒伏枝干压覆导线", runtime=_runtime())
+
+    assert result == INTENT_CANCELLED_MESSAGE
+    assert [payload["source"] for payload in payloads] == [
+        "fault_trace_intent_confirmation",
+        "fault_trace_intent_correction",
+    ]
+    assert len(intent_calls) == 1
+    # 取消要给解析步骤一个终态，历史回显不能一直停在 waiting。
+    parse_states = [event["thinking"]["state"] for event in events if event["thinking"]["step_id"] == "parse_fault"]
+    assert parse_states[-1] == "failed"
 
 
 @pytest.mark.asyncio

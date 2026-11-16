@@ -1,4 +1,4 @@
-"""kg4 处置方案装配与校验单元测试（不连接图谱/数据库/大模型）。"""
+"""处置方案装配与校验单元测试（不连接图谱/数据库/大模型）。"""
 
 from __future__ import annotations
 
@@ -15,7 +15,6 @@ from yuxi.knowledge.maintenance_plan.answer import (
     verify_report,
 )
 from yuxi.knowledge.maintenance_plan.contracts import (
-    BRANCH_USER_CONFIRMED_NOTE,
     BranchSelection,
     DeviceCandidate,
     PersonnelAssignment,
@@ -25,7 +24,6 @@ from yuxi.knowledge.maintenance_plan.contracts import (
     Scenario,
     ScenarioEvidence,
     Step,
-    TeamInfo,
 )
 
 
@@ -77,19 +75,11 @@ def make_evidence(*, branch_source: str = "redis") -> ScenarioEvidence:
             PersonnelRequirement("PER2", "检修工", 3, common=True),
             PersonnelRequirement("PER3", "专责监护人", 2, common=False, applicable_branch="分支1"),
         ],
-        team=TeamInfo("1号站电力巡护班组", "#3开闭所"),
     )
 
 
 def make_assignment() -> PersonnelAssignment:
-    return PersonnelAssignment(
-        roles={
-            "工作负责人": ("张三",),
-            "检修工": ("李四", "王五", "赵六"),
-            "专责监护人": ("钱七", "孙八"),
-        },
-        total=6,
-    )
+    return PersonnelAssignment(team="1号站监控调度班组", leader="王伟", total=6)
 
 
 def test_format_helpers_cover_quantity_and_branch_fields():
@@ -114,6 +104,10 @@ def test_assemble_report_and_markdown_include_branch_and_sections():
     assert "## 二、安全措施" in markdown
     assert "## 三、所需工器具及材料" in markdown
     assert "## 四、责任班组与人员安排" in markdown
+    assert "- 责任班组：1号站监控调度班组" in markdown
+    assert "- 所需人数：6 人" in markdown
+    assert "- 工作负责人：王伟" in markdown
+    assert "## 五、数据说明" not in markdown
     assert "吊车 2 台【在库】" in markdown
 
 
@@ -189,11 +183,23 @@ def test_verify_report_rejects_personnel_roster_mismatch(caplog):
     assignment = make_assignment()
     report = assemble_report(evidence, assignment, data_notes=[], elapsed_seconds=1.0)
 
-    tampered = replace(report, personnel=report.personnel[:-1])
+    tampered = replace(report, personnel=["工作负责人：伪造"])
     with caplog.at_level(logging.WARNING, logger="yuxi.knowledge.maintenance_plan.answer"):
         assert verify_report(tampered, evidence, assignment) is False
 
     assert "人员安排与证据不一致" in caplog.text
+
+
+def test_verify_report_rejects_tampered_team(caplog):
+    evidence = make_evidence()
+    assignment = make_assignment()
+    report = assemble_report(evidence, assignment, data_notes=[], elapsed_seconds=1.0)
+
+    tampered = replace(report, team="伪造班组")
+    with caplog.at_level(logging.WARNING, logger="yuxi.knowledge.maintenance_plan.answer"):
+        assert verify_report(tampered, evidence, assignment) is False
+
+    assert "责任班组与证据不一致" in caplog.text
 
 
 def test_verify_report_rejects_personnel_total_mismatch(caplog):
@@ -234,24 +240,27 @@ def test_verify_report_rejects_removed_resource_line(caplog):
     assert "资源清单与证据不一致" in caplog.text
 
 
-def test_verify_report_rejects_roster_count_mismatch(caplog):
-    """抽样结果内部名单数量与合计人数不一致（named≠total）单独成案拒绝。"""
+def test_verify_report_accepts_single_leader_for_total_headcount(caplog):
+    """所需人数来自人员需求合计；只点名工作负责人不再要求名单数量等于人数。"""
 
     evidence = make_evidence()
-    thinned = replace(make_assignment(), roles={**make_assignment().roles, "检修工": ("李四", "王五")})
-    report = assemble_report(evidence, thinned, data_notes=[], elapsed_seconds=1.0)
+    assignment = make_assignment()
+    report = assemble_report(evidence, assignment, data_notes=[], elapsed_seconds=1.0)
 
     with caplog.at_level(logging.WARNING, logger="yuxi.knowledge.maintenance_plan.answer"):
-        assert verify_report(report, evidence, thinned) is False
+        assert verify_report(report, evidence, assignment) is True
 
-    assert "人员名单数量与需求人数不一致" in caplog.text
+    assert "人员名单数量与需求人数不一致" not in caplog.text
 
 
-def test_assemble_report_notes_user_confirmed_branch():
-    """Redis 缺失、用户确认分支时，方案数据说明必须标注该口径。"""
+def test_assemble_report_marks_missing_leader():
+    """人员 JSON 不可用时只保留责任班组与所需人数，工作负责人显示占位。"""
 
-    evidence = make_evidence(branch_source="user")
+    assignment = PersonnelAssignment(team="电力巡护班组", leader="", total=6, note="人员数据未接入 MinIO")
 
-    markdown = build_plan_markdown(assemble_report(evidence, make_assignment(), data_notes=[], elapsed_seconds=1.0))
+    markdown = build_plan_markdown(
+        assemble_report(make_evidence(), assignment, data_notes=[], elapsed_seconds=1.0)
+    )
 
-    assert BRANCH_USER_CONFIRMED_NOTE in markdown
+    assert "- 责任班组：电力巡护班组" in markdown
+    assert "- 工作负责人：未接入" in markdown

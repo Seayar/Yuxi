@@ -4,7 +4,7 @@
 类型：feature
 Owner：backend/package/yuxi/knowledge/maintenance_plan/tool.py
 
-> 现状：2026-11-05 起处置方案运行时切换到 TuGraph `kg4` 的检修作业场景，见[处置方案切换到 kg4 检修作业场景](./2026-11-05-maintenance-plan-kg4-scenario.md)。本文描述的是首次交付的 kg3 六段式链路，`seed.py`/`data/` 仍作为 kg3 历史导入资产保留。
+> 现状：2026-11-05 起处置方案运行时切换到 TuGraph `kg4` 的检修作业场景，见[处置方案切换到 kg4 检修作业场景](./2026-11-05-maintenance-plan-kg4-scenario.md)。本文描述的是首次交付的 kg3 六段式链路，`seed.py`/`data/` 仍作为 kg3 历史导入资产保留，2026-11-13 起位于 `backend/scripts/legacy_kg3_seed/`，见[处置方案 kg3 导入资产移出运行时包](./2026-11-13-move-kg3-import-out-of-runtime-package.md)。
 >
 > 历史说明：2026-10-28 起处置方案与故障溯源共用 TuGraph `kg3`，seed 默认写入 kg3 且要求提供 `kg_ref.json`；图谱迁移与公开路由移除见[故障图谱迁移到 kg3 并移除公开故障路由](./2026-10-28-fault-trace-kg3-and-route-removal.md)。本文中的 `kg` 指首次交付时的旧图。
 

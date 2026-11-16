@@ -1,6 +1,6 @@
 """故障图谱证据模型与拓扑追溯。
 
-``FaultGraphEvidence`` 是 kg3 适配器（``graph_kg3``）与报告装配（``answer``）共享的
+``FaultGraphEvidence`` 是故障图谱适配器（``graph_kg3``）与报告装配（``answer``）共享的
 证据形状；因果链与拓扑的方向/类型重组在这里完成，本模块不依赖具体图数据库。
 """
 
@@ -10,9 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from yuxi.knowledge.fault_trace.contracts import (
-    ENTITY_CONSEQUENCE,
     ENTITY_DEVICE_TYPE,
-    REL_CONSEQUENCE_TYPE,
     REL_DEVICE_TYPE,
     REL_ELECTRICAL_TYPE,
 )
@@ -20,11 +18,11 @@ from yuxi.knowledge.fault_trace.contracts import (
 
 @dataclass
 class FaultGraphEvidence:
-    """一次故障溯源从 kg3 检索到的证据集合（已去重）。"""
+    """一次故障溯源从故障图谱检索到的证据集合（已去重）。"""
 
     nodes: list[dict[str, Any]] = field(default_factory=list)
     edges: list[dict[str, Any]] = field(default_factory=list)
-    # 原因挂载层级：fault_phenomenon（现象→原因）或 fault_mode（模式→原因，数据缺口）
+    # 历史字段：原因只支持 phenomenon→cause；保留字段让报告契约不因旧数据形状变化。
     cause_links: str = "fault_phenomenon"
 
     def node_by_id(self, node_id: str) -> dict[str, Any] | None:
@@ -51,6 +49,7 @@ class FaultTopology:
     upstream: list[dict[str, Any]] = field(default_factory=list)
     downstream: list[dict[str, Any]] = field(default_factory=list)
     paths: list[str] = field(default_factory=list)
+    # 故障图谱已移除故障后果；保留字段供报告契约使用，运行时固定为空。
     consequences: list[dict[str, Any]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
@@ -88,23 +87,6 @@ def _device_type_name(evidence: FaultGraphEvidence, device_id: str) -> str | Non
             if name:
                 return name
     return None
-
-
-def collect_consequences(evidence: FaultGraphEvidence) -> list[dict[str, Any]]:
-    """取故障原因可能的后果（故障原因 -[可能导致]-> 故障后果），按 id 去重。"""
-
-    consequences: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for edge in evidence.edges_with_type(REL_CONSEQUENCE_TYPE):
-        node = evidence.node_by_id(str(edge.get("target_id") or ""))
-        if node is None or _entity_label(node) != ENTITY_CONSEQUENCE:
-            continue
-        node_id = str(node.get("id"))
-        if node_id in seen:
-            continue
-        seen.add(node_id)
-        consequences.append({"consequence_id": node_id, "name": str(node.get("name") or "")})
-    return consequences
 
 
 def trace_topology_evidence(evidence: FaultGraphEvidence, device_node_ids: list[str]) -> FaultTopology:
@@ -147,7 +129,7 @@ def trace_topology_evidence(evidence: FaultGraphEvidence, device_node_ids: list[
         upstream=upstream,
         downstream=downstream,
         paths=paths,
-        consequences=collect_consequences(evidence),
+        consequences=[],
         warnings=warnings,
     )
 

@@ -10,6 +10,7 @@ from yuxi.knowledge.fault_trace.contracts import DEVICE_NOT_FOUND_MESSAGE, Fault
 from yuxi.knowledge.fault_trace.intent import (
     apply_input_constraints,
     build_confirmation_payload,
+    extract_correction_text,
     extract_fault_trace_intent,
     parse_fault_trace_query,
     parse_intent_confirmation,
@@ -136,6 +137,46 @@ def test_confirmation_payload_and_parse():
         "reject",
         "设备是2号主变",
     )
+
+
+def test_confirmation_payload_shows_applied_correction():
+    """重新识别后的卡片必须显示上一轮补充，否则用户无法判断输入是否被采用。"""
+
+    plan = intent_module.build_intent_plan(FaultTraceQuery(device_name="1号主变", phenomena=["过热"]))
+    plan["correction"] = "设备是2号主变"
+    payload = build_confirmation_payload(plan)
+
+    assert "已按您的补充「设备是2号主变」重新识别" in payload["questions"][0]["question"]
+
+
+def test_confirmation_payload_shows_identified_type_and_graph_classification():
+    """设备类型以识别结果为主体；图谱归类不同时并列展示，不静默覆盖用户补充。"""
+
+    plan = intent_module.build_intent_plan(FaultTraceQuery(device_name="银开线", phenomena=["故障"]))
+    plan["device_type"] = "输电线路"
+    plan["graph_device_type"] = "架空线路"
+    question = build_confirmation_payload(plan)["questions"][0]["question"]
+    assert "设备类型=输电线路（图谱归类：架空线路）" in question
+
+    # 识别结果缺失时才用图谱归类补位；两者一致时不重复展示。
+    missing = intent_module.build_intent_plan(FaultTraceQuery(device_name="银开线"))
+    missing["graph_device_type"] = "架空线路"
+    assert "设备类型=架空线路" in build_confirmation_payload(missing)["questions"][0]["question"]
+
+    same = intent_module.build_intent_plan(FaultTraceQuery(device_name="3B-7Y"))
+    same["device_type"] = "架空线路"
+    same["graph_device_type"] = "架空线路"
+    assert build_confirmation_payload(same)["questions"][0]["question"].count("设备类型=架空线路") == 1
+
+
+def test_cancel_values_are_never_correction_text():
+    """关闭卡片的取消值必须按取消处理，不能被当成用户补充的设备或现象。"""
+
+    for value in ("reject", {"fault_trace_intent_correction": "reject"}):
+        assert parse_intent_confirmation(value) == ("cancel", None)
+        assert extract_correction_text(value) is None
+    assert extract_correction_text({"fault_trace_intent_correction": "设备是2号主变"}) == "设备是2号主变"
+    assert extract_correction_text("设备是2号主变") == "设备是2号主变"
 
 
 @pytest.mark.asyncio

@@ -1,6 +1,6 @@
-"""preflight.py 单元测试：离线预检逻辑（不连接图谱 / 数据库 / 大模型）。
+"""kg3 历史资产 preflight 单元测试：离线预检逻辑（不连接图谱 / 数据库 / 大模型）。
 
-含一条对包内真实数据的结构预检；管辖区域检查使用明确的台账名称夹具，
+含一条对真实 seed 数据的结构预检；管辖区域检查使用明确的台账名称夹具，
 以及各单项检查在坏数据上必须报错的用例。
 """
 
@@ -10,8 +10,8 @@ from pathlib import Path
 
 import pytest
 
-from yuxi.knowledge.maintenance_plan.preflight import preflight_seed, run_preflight
-from yuxi.knowledge.maintenance_plan import preflight as preflight_module
+from scripts.legacy_kg3_seed import preflight as preflight_module
+from scripts.legacy_kg3_seed.preflight import preflight_seed, run_preflight
 
 pytestmark = pytest.mark.unit
 

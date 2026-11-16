@@ -25,7 +25,7 @@ MAX_EXPRESSION_LENGTH = 500
 _TRUE = "true"
 _FALSE = "false"
 _UNKNOWN = "unknown"
-# kg3 的表达式使用 JSON 风格小写字面量，Python AST 会解析成 Name。
+# 故障图的表达式使用 JSON 风格小写字面量，Python AST 会解析成 Name。
 _LITERAL_NAMES = {"true": True, "false": False}
 _ALLOWED_NODE_TYPES = (
     ast.Expression,

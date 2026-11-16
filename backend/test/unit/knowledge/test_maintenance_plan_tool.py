@@ -1,4 +1,4 @@
-"""kg4 处置方案工具编排单元测试（假图、假 Redis、假 MinIO）。"""
+"""处置方案工具编排单元测试（假图、假 Redis、假 MinIO）。"""
 
 from __future__ import annotations
 
@@ -12,11 +12,10 @@ from yuxi.knowledge.maintenance_plan import graph_plan as graph_plan_module
 from yuxi.knowledge.maintenance_plan import tool as tool_module
 from yuxi.knowledge.maintenance_plan.branch import BranchLookup
 from yuxi.knowledge.maintenance_plan.contracts import (
-    BRANCH_CHOICE_SOURCE,
+    BRANCH_UNRESOLVED_MESSAGE,
     CHOICE_ABORTED_MESSAGE,
     NO_DEVICE_MESSAGE,
     NO_SCENE_MESSAGE,
-    PERSONNEL_SHORTAGE_MESSAGE,
     PLAN_GRAPH_NOT_CONFIGURED_MESSAGE,
     PLAN_VERIFICATION_FAILED_MESSAGE,
     SCENE_CHOICE_SOURCE,
@@ -29,9 +28,8 @@ from yuxi.knowledge.maintenance_plan.contracts import (
     Scenario,
     ScenarioEvidence,
     Step,
-    TeamInfo,
 )
-from yuxi.knowledge.maintenance_plan.sources import PersonRecord, ToolRecord
+from yuxi.knowledge.maintenance_plan.sources import TeamRecord, ToolRecord
 
 pytestmark = pytest.mark.unit
 
@@ -40,7 +38,7 @@ GENERATE = getattr(tool_module.generate_maintenance_plan, "coroutine", None) or 
 KG_OPTION = {
     "server_url": "bolt://fake:7688",
     "graph": "kg3",
-    "maintenance_plan_graph": "kg4",
+    "maintenance_plan_graph": "kg5",
     "username": "u",
     "password": "p",
 }
@@ -99,7 +97,7 @@ class _FakeRepository:
     async def load_tools(self):
         return self._tools
 
-    async def load_personnel(self):
+    async def load_teams(self):
         return self._personnel
 
 
@@ -120,7 +118,6 @@ EVIDENCE = ScenarioEvidence(
     safety=[SafetyMeasure("SAFE1", "个人防护", "安全帽", common=True)],
     resources=[ResourceRequirement("RES1", "吊车", 1, unit="台", common=True)],
     personnel=[PersonnelRequirement("PER1", "工作负责人", 1, common=True)],
-    team=TeamInfo("1号班组", "#3开闭所"),
 )
 
 
@@ -145,6 +142,14 @@ def _install(monkeypatch, *, branch=None, evidence=None, tools=None, personnel=N
         lambda client, query, device, scene, branch: evidence if evidence is not None else EVIDENCE,
     )
 
+    def confirm_first_option(payload):
+        """设备卡片每次都会弹；测试里默认选第一个候选，等价于用户点了首项。"""
+
+        question = payload["questions"][0]
+        return {question["question_id"]: question["options"][0]["value"]}
+
+    monkeypatch.setattr(tool_module, "interrupt", confirm_first_option)
+
     async def fake_lookup(device, scene):
         return branch if branch is not None else BranchLookup("ok", value="站内开关室", ledger_id="L1", branch="分支1")
 
@@ -152,7 +157,10 @@ def _install(monkeypatch, *, branch=None, evidence=None, tools=None, personnel=N
     monkeypatch.setattr(
         tool_module,
         "MaintenanceDataRepository",
-        lambda: _FakeRepository(tools if tools is not None else [ToolRecord("吊车", True)], personnel if personnel is not None else [PersonRecord("张三", "1号班组", "工作负责人")]),
+        lambda: _FakeRepository(
+            tools if tools is not None else [ToolRecord("吊车", True)],
+            personnel if personnel is not None else [TeamRecord("电力巡护班组", (), ("张三",))],
+        ),
     )
 
 
@@ -170,6 +178,24 @@ def test_returns_fixed_message_without_graph_config(monkeypatch):
     assert result == PLAN_GRAPH_NOT_CONFIGURED_MESSAGE
 
 
+def test_graph_name_falls_back_to_default_when_missing(monkeypatch):
+    """系统配置没存 maintenance_plan_graph 时回退默认图名，而不是回退 graph 字段。"""
+
+    option = {
+        "server_url": "bolt://fake:7688",
+        "graph": "kg3",
+        "username": "u",
+        "password": "p",
+    }
+    monkeypatch.setattr(tool_module, "fault_trace_opts", _FakeOption(option))
+    monkeypatch.delenv("MAINTENANCE_PLAN_GRAPH", raising=False)
+
+    config = asyncio.run(tool_module._resolve_kg_config())
+
+    assert config is not None
+    assert config.graph == "kg5"
+
+
 def test_full_flow_returns_verified_plan(monkeypatch):
     _install(monkeypatch)
 
@@ -179,11 +205,15 @@ def test_full_flow_returns_verified_plan(monkeypatch):
     assert result["answer_verified"] is True
     assert "执行分支：布置位置 = 站内开关室（分支1）" in result["answer_markdown"]
     assert "吊车 1 台【在库】" in result["answer_markdown"]
+    assert "- 责任班组：电力巡护班组" in result["answer_markdown"]
+    assert "- 所需人数：1 人" in result["answer_markdown"]
+    assert "- 工作负责人：张三" in result["answer_markdown"]
+    assert "## 五、数据说明" not in result["answer_markdown"]
     titles = [step["title"] for step in result["thinking_steps"]]
     assert titles == ["解析任务需求", "检索知识图谱", "组装方案模板", "生成标准化方案"]
     assert all(step["state"] == "completed" for step in result["thinking_steps"])
-    # 处置方案必须连 kg4（maintenance_plan_graph），不能误用故障溯源的 kg3 图名。
-    assert _FakeClient.instances[-1].config.graph == "kg4"
+    # 处置方案必须连 maintenance_plan_graph 指定的图，不能误用故障溯源的 graph 图名。
+    assert _FakeClient.instances[-1].config.graph == "kg5"
 
 
 def test_device_not_found_returns_fixed_message(monkeypatch):
@@ -202,7 +232,9 @@ def test_scene_not_found_returns_fixed_message(monkeypatch):
     assert result == NO_SCENE_MESSAGE
 
 
-def test_personnel_shortage_returns_fixed_message(monkeypatch):
+def test_small_team_still_generates_plan(monkeypatch):
+    """班组人数小于所需人数不再阻断方案；所需人数仍取人员需求合计。"""
+
     evidence = ScenarioEvidence(
         device=DEVICE,
         scenario=SCENE,
@@ -211,34 +243,31 @@ def test_personnel_shortage_returns_fixed_message(monkeypatch):
         safety=[],
         resources=[],
         personnel=[PersonnelRequirement("PER1", "检修工", 5, common=True)],
-        team=TeamInfo("1号班组", "#3开闭所"),
     )
-    _install(monkeypatch, evidence=evidence, personnel=[PersonRecord("张三", "1号班组", "检修工")])
+    _install(monkeypatch, evidence=evidence, personnel=[TeamRecord("电力巡护班组", (), ("张三",))])
 
     result = asyncio.run(GENERATE("3k18 开关柜整柜更换", runtime=_context()))
 
-    assert result == PERSONNEL_SHORTAGE_MESSAGE
+    assert result["answer_verified"] is True
+    assert "- 所需人数：5 人" in result["answer_markdown"]
+    assert "- 工作负责人：张三" in result["answer_markdown"]
 
 
-def test_branch_falls_back_to_user_choice(monkeypatch):
-    recorder = _InterruptRecorder([{"maintenance_plan_branch": {"value": "分支1"}}])
+def test_branch_missing_returns_fixed_message_without_interrupt(monkeypatch):
+    """Redis 无分支值时不再让人工选择，直接返回固定失败文案。"""
+
+    recorder = _InterruptRecorder()
     monkeypatch.setattr(tool_module, "interrupt", recorder)
 
     async def missing(device, scene):
         return BranchLookup("missing", reason="没有可用 key")
 
     monkeypatch.setattr(tool_module, "lookup_branch", missing)
-    emitter = _Emitter()
 
-    result = asyncio.run(tool_module._resolve_branch(DEVICE, SCENE, [0], emitter=emitter))
+    result = asyncio.run(tool_module._resolve_branch(DEVICE, SCENE))
 
-    assert isinstance(result, BranchSelection)
-    assert result.branch == "分支1"
-    assert result.source == "user"
-    assert recorder.payloads[0]["source"] == BRANCH_CHOICE_SOURCE
-    assert len(recorder.payloads[0]["questions"][0]["options"]) == 2
-    # 等待用户选择期间思考步骤必须是 waiting，而不是伪造 completed。
-    assert any(args[:2] == ("retrieve_graph", "waiting") for args, kwargs in emitter.events)
+    assert result == BRANCH_UNRESOLVED_MESSAGE
+    assert recorder.payloads == []
 
 
 def test_verification_failure_returns_fixed_message_and_failed_thinking(monkeypatch):
@@ -292,6 +321,85 @@ def test_tie_of_top_scores_asks_user(monkeypatch):
 
     assert result.scene_id == "SCENE_B4"
     assert recorder.payloads[0]["source"] == SCENE_CHOICE_SOURCE
+
+
+def test_pick_device_always_asks_even_when_one_candidate(monkeypatch):
+    """处置方案必须每次让用户确认设备：唯一候选也要弹卡片。"""
+
+    kiosk = DeviceCandidate(
+        device_id="LGR#kbs1",
+        name="#1开闭所",
+        device_type="开闭所",
+        voltage_level="10kV",
+        path="变电设施 > 110kV变电站 > 10kV电压等级区域 > #1开闭所",
+        score=130.0,
+    )
+    recorder = _InterruptRecorder([{"maintenance_plan_device": "LGR#kbs1"}])
+    monkeypatch.setattr(tool_module, "interrupt", recorder)
+
+    picked = tool_module._pick_device(
+        [kiosk],
+        PlanQuery(raw_text="#1开闭所检修", device_type="开闭所", location_hint="#1开闭所"),
+        [0],
+        emitter=_Emitter(),
+    )
+
+    assert picked is kiosk
+    assert len(recorder.payloads) == 1
+    option = recorder.payloads[0]["questions"][0]["options"][0]
+    assert option["label"] == "#1开闭所（开闭所，10kV）"
+    assert option["value"] == "LGR#kbs1"
+
+
+def test_pick_device_asks_with_all_candidates_and_returns_selected(monkeypatch):
+    """多候选同样弹卡片；用户改选哪个候选就返回哪个。"""
+
+    kiosk = DeviceCandidate(
+        device_id="LGR#kbs1",
+        name="#1开闭所",
+        device_type="开闭所",
+        voltage_level="10kV",
+        path="变电设施 > 110kV变电站 > 10kV电压等级区域 > #1开闭所",
+        score=130.0,
+    )
+    cabinet = DeviceCandidate(
+        device_id="LGR#cab1",
+        name="#1开闭所PLC柜",
+        device_type="开关柜",
+        voltage_level="10kV",
+        path="变电设施 > 110kV变电站 > 10kV电压等级区域 > #1开闭所 > #1开闭所PLC柜",
+        score=31.0,
+    )
+    recorder = _InterruptRecorder([{"maintenance_plan_device": "LGR#cab1"}])
+    monkeypatch.setattr(tool_module, "interrupt", recorder)
+
+    picked = tool_module._pick_device(
+        [kiosk, cabinet],
+        PlanQuery(raw_text="#1开闭所检修", device_type="开闭所", location_hint="#1开闭所"),
+        [0],
+        emitter=_Emitter(),
+    )
+
+    assert picked is cabinet
+    options = recorder.payloads[0]["questions"][0]["options"]
+    assert [item["value"] for item in options] == ["LGR#kbs1", "LGR#cab1"]
+
+
+def test_device_payload_puts_path_in_description():
+    """卡片选项标题只放设备名/类型/电压，层级路径作为次要说明。"""
+
+    candidate = DeviceCandidate(
+        device_id="LGR#kbs1",
+        name="#1开闭所",
+        device_type="开闭所",
+        voltage_level="10kV",
+        path="变电设施 > 110kV变电站 > 10kV电压等级区域 > #1开闭所",
+    )
+
+    option = tool_module._device_payload(PlanQuery(raw_text="#1开闭所检修"), [candidate])["questions"][0]["options"][0]
+
+    assert option["label"] == "#1开闭所（开闭所，10kV）"
+    assert option["description"] == "变电设施 > 110kV变电站 > 10kV电压等级区域 > #1开闭所"
 
 
 def test_cache_is_scoped_per_query_text(monkeypatch):

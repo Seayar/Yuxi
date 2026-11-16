@@ -15,6 +15,7 @@ from yuxi.knowledge.power_spec.contracts import (
     PowerSpecQuery,
 )
 from yuxi.utils import logger
+from yuxi.utils.question_utils import is_question_cancel
 
 
 # ---------------------------------------------------------------------------
@@ -417,8 +418,10 @@ def query_from_confirmed_plan(plan: dict[str, Any], *, fallback: PowerSpecQuery)
 def build_confirmation_payload(intent_plan: dict[str, Any]) -> dict[str, Any]:
     """构造意图确认卡片，展示模型对问题的重述与识别结果。"""
 
+    correction = str(intent_plan.get("correction") or "").strip()
+    applied = f"已按您的补充「{correction}」重新识别。" if correction else ""
     question_text = (
-        "我对您问题的理解是："
+        f"{applied}我对您问题的理解是："
         f"{intent_plan['normalized_query']}。"
         f"查询类型={intent_plan['intent']}；"
         f"设备={intent_plan['device_type'] or '未识别'}；"
@@ -465,8 +468,10 @@ def build_correction_payload(intent_plan: dict[str, Any]) -> dict[str, Any]:
 
 
 def parse_intent_confirmation(value: Any) -> tuple[str, str | None]:
-    """解析确认结果，返回 (决定, 用户修正文本)。决定取值 confirm、reject 或 invalid。"""
+    """解析确认结果，返回 (决定, 用户修正文本)。决定取值 confirm、reject、cancel 或 invalid。"""
 
+    if is_question_cancel(value):
+        return "cancel", None
     if isinstance(value, dict):
         if INTENT_QUESTION_ID in value or CORRECTION_QUESTION_ID in value:
             for key in (INTENT_QUESTION_ID, CORRECTION_QUESTION_ID):
@@ -491,15 +496,17 @@ def parse_intent_confirmation(value: Any) -> tuple[str, str | None]:
             return "confirm", None
         if text.lower() in {"confirm", "confirmed"} or text in {"正确，继续检索", "正确"}:
             return "confirm", None
-        if text.lower() in {"correct", "reject"} or text in {"不正确，我要补充/修改", "不正确"}:
+        if text.lower() in {"correct"} or text in {"不正确，我要补充/修改", "不正确"}:
             return "reject", None
         return ("reject", text) if text else ("invalid", None)
     return "invalid", None
 
 
 def extract_correction_text(value: Any) -> str | None:
-    """从修正追问的返回结果中取出用户文本。"""
+    """从修正追问的返回结果中取出用户文本；取消卡片返回 None。"""
 
+    if is_question_cancel(value):
+        return None
     if isinstance(value, dict):
         if CORRECTION_QUESTION_ID in value:
             return extract_correction_text(value[CORRECTION_QUESTION_ID])

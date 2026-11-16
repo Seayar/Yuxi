@@ -1,11 +1,11 @@
 """设备预测维护的数据契约。
 
 ``contracts`` 拥有设备预测维护在设备识别、外部服务调用、维护知识匹配、报告装配与发布
-链路上流动的统一数据结构，以及用户可见固定文案、思考过程注册和 ``kg5`` 图 schema 常量。
+链路上流动的统一数据结构，以及用户可见固定文案、思考过程注册和配置的设备预测维护图 schema 常量。
 其他模块只消费这里的形状，不要在别处重复定义字段名、文案或图谱属性名。
 
-图谱数据只来自设备预测维护自己的 ``kg5``：设备检索与维护知识匹配都连这一张图，
-不读故障溯源 ``kg3`` 与处置方案 ``kg4``。
+图谱数据只来自设备预测维护自己配置的图：设备检索与维护知识匹配都连这一张图，
+不读历史图。
 
 报告字段与 ``srs`` 模块五需求一一对应：
 
@@ -94,7 +94,7 @@ MAX_CHOICE_ROUNDS = 4
 OTHER_VALUES = frozenset({"__other__", "other", "其他"})
 
 # ---------------------------------------------------------------------------
-# ``kg5`` 图 schema（设备预测维护独占的新图）
+# 设备预测维护图 schema
 #
 #   设备识别与处置方案生成同一套设备口径：``设备实例`` 节点的 名称/层级路径/电压等级/id/
 #   台账ID列表，经 ``属于`` 边关联 ``设备类型``。
@@ -150,7 +150,7 @@ class PredictionQuery:
 
 @dataclass(frozen=True)
 class DeviceCandidate:
-    """kg5 中匹配到的一个设备实例。"""
+    """设备预测维护图中匹配到的一个设备实例。"""
 
     device_id: str  # 设备实例节点 id
     name: str
@@ -231,7 +231,7 @@ class PredictionEvidence:
     device_type: str
     voltage_level: str
     device_id: str  # 发送给预测服务的台账 ID
-    device_id_source: str  # 设备 ID 的来源（当前只有 kg5 节点的台账ID列表）
+    device_id_source: str  # 设备 ID 的来源（设备预测维护图节点的台账ID列表）
     health: HealthAssessment
     prediction: FaultPrediction
     guidance: MaintenanceGuidance

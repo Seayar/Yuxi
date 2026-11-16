@@ -24,12 +24,15 @@ PowerSpecIntent = Literal["设备参数查询", "检修标准查询", "安全规
 NO_EVIDENCE_MESSAGE = "未检索到资料"
 KNOWLEDGE_BASE_NOT_READY_MESSAGE = "电力规范知识库尚未完成条款级重建"
 INTENT_ATTEMPTS_EXHAUSTED_MESSAGE = "多次未确认问题意图，请重新描述您的电力规范问题"
+# 用户关闭意图卡片即取消本次检索：不重新识别、不再次弹窗。
+INTENT_CANCELLED_MESSAGE = "已取消本次意图确认，请重新描述您的电力规范问题"
 OUT_OF_SCOPE_MESSAGE = "已上传的电力规范未包含该问题的规定"
 PLAIN_TOOL_MESSAGES = frozenset(
     {
         NO_EVIDENCE_MESSAGE,
         KNOWLEDGE_BASE_NOT_READY_MESSAGE,
         INTENT_ATTEMPTS_EXHAUSTED_MESSAGE,
+        INTENT_CANCELLED_MESSAGE,
         OUT_OF_SCOPE_MESSAGE,
     }
 )

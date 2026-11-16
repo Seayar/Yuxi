@@ -3,6 +3,7 @@ import pytest
 from yuxi.knowledge.power_spec import tool as tool_module
 from yuxi.knowledge.power_spec.contracts import (
     INTENT_ATTEMPTS_EXHAUSTED_MESSAGE,
+    INTENT_CANCELLED_MESSAGE,
     OUT_OF_SCOPE_MESSAGE,
     PLAIN_TOOL_MESSAGES,
     PowerSpecQuery,
@@ -144,6 +145,8 @@ async def test_rejecting_intent_with_correction_asks_for_confirmation_again(monk
     assert queue.payloads[0]["source"] == "power_spec_intent_confirmation"
     assert queue.payloads[1]["source"] == "power_spec_intent_confirmation"
     assert queue.payloads[1]["intent_plan"]["attempt"] == 2
+    # 重新识别的卡片显示上一轮补充，用户能看到输入被采用。
+    assert "已按您的补充「电压等级是 110kV」重新识别" in queue.payloads[1]["questions"][0]["question"]
     assert intent_calls[1]["feedback"] == "电压等级是 110kV"
     assert intent_calls[1]["previous"] is not None
 
@@ -168,6 +171,41 @@ async def test_rejecting_intent_without_correction_asks_for_details(monkeypatch)
         "power_spec_intent_confirmation",
     ]
     assert intent_calls[1]["feedback"] == "我要问 110kV 开关柜"
+
+
+@pytest.mark.asyncio
+async def test_cancel_on_correction_card_stops_without_new_attempt(monkeypatch):
+    """关闭修正追问按取消结束；旧前端提交的裸 ``reject`` 也不能当成补充文本。"""
+
+    intent_calls = []
+    queue = _install(
+        monkeypatch,
+        {"power_spec_intent_confirm": "correct"},
+        "reject",
+        intent_calls=intent_calls,
+    )
+
+    result = await search_power_spec.coroutine(query_text=QUESTION, confirmed_intent=False, runtime=Runtime())
+
+    assert result == INTENT_CANCELLED_MESSAGE
+    assert INTENT_CANCELLED_MESSAGE in PLAIN_TOOL_MESSAGES
+    assert [payload["source"] for payload in queue.payloads] == [
+        "power_spec_intent_confirmation",
+        "power_spec_intent_correction",
+    ]
+    assert len(intent_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_cancel_on_confirmation_card_stops_immediately(monkeypatch):
+    intent_calls = []
+    queue = _install(monkeypatch, "reject", intent_calls=intent_calls)
+
+    result = await search_power_spec.coroutine(query_text=QUESTION, confirmed_intent=False, runtime=Runtime())
+
+    assert result == INTENT_CANCELLED_MESSAGE
+    assert [payload["source"] for payload in queue.payloads] == ["power_spec_intent_confirmation"]
+    assert len(intent_calls) == 1
 
 
 @pytest.mark.asyncio
@@ -562,3 +600,14 @@ def test_extract_correction_text_ignores_empty_other_selection():
     assert extract_correction_text("__other__") is None
     assert extract_correction_text({"power_spec_intent_correction": {"selected": []}}) is None
     assert extract_correction_text(None) is None
+
+
+def test_cancel_values_are_never_correction_text():
+    """关闭卡片的取消值必须按取消处理，不能进入重新识别反馈。"""
+
+    for value in ("reject", {"power_spec_intent_correction": "reject"}):
+        assert parse_intent_confirmation(value) == ("cancel", None)
+        assert extract_correction_text(value) is None
+    # 正常修正文本不受影响。
+    assert extract_correction_text("reject 不是设备") == "reject 不是设备"
+    assert extract_correction_text("电压是 110kV") == "电压是 110kV"

@@ -25,7 +25,9 @@
             <span class="rc-badge">条款 {{ card.clause_no }}</span>
           </div>
 
-          <div class="rc-body" v-html="card.clause_body"></div>
+          <div class="rc-body">
+            <MarkdownPreview :content="card.clause_body" compact />
+          </div>
         </article>
       </div>
     </template>
@@ -35,6 +37,7 @@
 <script setup>
 import { computed } from 'vue'
 import BaseToolCall from '../BaseToolCall.vue'
+import MarkdownPreview from '@/components/common/MarkdownPreview.vue'
 
 const props = defineProps({
   toolCall: {
@@ -207,7 +210,6 @@ const summary = computed(() => ({
       font-size: 13.5px;
       line-height: 1.9;
       color: var(--text-primary);
-      white-space: pre-wrap;
       word-break: break-word;
 
       :deep(mark) {

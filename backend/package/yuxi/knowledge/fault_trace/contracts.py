@@ -14,13 +14,14 @@ from yuxi.thinking import ThinkingStepSpec, register_thinking_steps
 
 FAULT_TRACE_THINKING_STEPS = (
     ThinkingStepSpec("parse_fault", "解析故障描述", "识别设备、故障现象与图片结果，生成故障摘要。"),
-    ThinkingStepSpec("match_causal_chain", "匹配因果链", "沿知识图谱匹配故障模式、现象、原因并求值触发条件。"),
-    ThinkingStepSpec("trace_topology", "拓扑关系追溯", "沿电气连接关系追溯直接上下游设备及故障后果。"),
+    ThinkingStepSpec("match_causal_chain", "匹配因果链", "沿知识图谱匹配故障现象、原因并求值触发条件。"),
+    ThinkingStepSpec("trace_topology", "拓扑关系追溯", "沿电气连接关系追溯直接上下游设备。"),
     ThinkingStepSpec("generate_report", "生成溯源报告", "定位原因并生成溯源报告。"),
 )
 register_thinking_steps("fault-trace-agent", FAULT_TRACE_THINKING_STEPS)
 
 REPORT_SCHEMA_VERSION = "fault-trace-report/v1"
+# 报告数据形状版本，不是图实例名；当前故障图谱已移除故障模式与后果，保留现象/原因/触发条件部分。
 GRAPH_SCHEMA_VERSION = "kg3/v1"
 FAULT_TRACE_AGENT_SLUG = "fault-trace-agent"
 
@@ -40,6 +41,9 @@ CLARIFY_INFO_MISSING_MESSAGE = "未能识别完整的故障信息，请明确故
 CLARIFY_PHENOMENON_MISSING_MESSAGE = (
     "已收到您的描述，但缺少故障现象，请补充具体故障现象（例如：冷却器风扇停转、触头烧蚀）。"
 )
+# 意图确认的终止文案：用户关闭卡片按取消处理，超过确认轮次按提示重问。
+INTENT_CANCELLED_MESSAGE = "已取消本次意图确认，请重新描述故障设备与故障现象"
+INTENT_ATTEMPTS_EXHAUSTED_MESSAGE = "意图确认交互过多，未完成故障溯源"
 PLAIN_TOOL_MESSAGES = frozenset(
     {
         FAULT_GRAPH_NOT_CONFIGURED_MESSAGE,
@@ -54,6 +58,8 @@ PLAIN_TOOL_MESSAGES = frozenset(
         REPORT_VERIFICATION_FAILED_MESSAGE,
         CLARIFY_INFO_MISSING_MESSAGE,
         CLARIFY_PHENOMENON_MISSING_MESSAGE,
+        INTENT_CANCELLED_MESSAGE,
+        INTENT_ATTEMPTS_EXHAUSTED_MESSAGE,
     }
 )
 
@@ -63,44 +69,36 @@ PLAIN_TOOL_MESSAGES = frozenset(
 
 ENTITY_DEVICE = "device"
 ENTITY_DEVICE_TYPE = "device_type"
-ENTITY_FAULT_MODE = "fault_mode"
 ENTITY_PHENOMENON = "phenomenon"
 ENTITY_CAUSE = "cause"
 ENTITY_TRIGGER = "trigger"
 ENTITY_MEASURE = "measure"
-ENTITY_CONSEQUENCE = "consequence"
 
-REL_FAULT_MODE_TYPE = "has_fault_mode"
 REL_PHENOMENON_TYPE = "has_phenomenon"
 REL_CAUSE_TYPE = "has_cause"
 REL_TRIGGER_TYPE = "has_trigger_condition"
 REL_MEASURE_TYPE = "has_measure"
-REL_CONSEQUENCE_TYPE = "may_lead_to_consequence"
 REL_DEVICE_TYPE = "belongs_to_device_type"
 # 拓扑只读 ``电气连接``：出边为下游、入边为上游，一跳为限。
 REL_ELECTRICAL_TYPE = "electrically_connected_to"
 
 # ---------------------------------------------------------------------------
-# 独立 TuGraph ``kg3`` 图的中文标签/关系 schema（人工录入）
+# 独立 TuGraph 故障图谱（默认图名由配置决定）的中文标签/关系 schema（人工录入）
 #
-# 历史 ``kg`` 图的同义关系名只保留映射用于旧数据读取；``kg``/``kg2`` 已废弃，运行时只读 kg3。
+# 历史 ``kg`` 图的同义关系名只保留映射用于旧数据读取；``kg``/``kg2`` 已废弃，运行时读取配置的故障图。
 # ---------------------------------------------------------------------------
 
 KG_ENTITY_LABELS = {
     "设备实例": ENTITY_DEVICE,
     "设备类型": ENTITY_DEVICE_TYPE,
-    "故障模式": ENTITY_FAULT_MODE,
     "故障现象": ENTITY_PHENOMENON,
     "故障原因": ENTITY_CAUSE,
     "触发条件": ENTITY_TRIGGER,
     "诱发因素": ENTITY_TRIGGER,
     "处置措施": ENTITY_MEASURE,
-    "故障后果": ENTITY_CONSEQUENCE,
 }
 
 KG_RELATION_TYPES = {
-    "具有故障模式": REL_FAULT_MODE_TYPE,
-    "存在故障模式": REL_FAULT_MODE_TYPE,
     "具有现象": REL_PHENOMENON_TYPE,
     "表现为": REL_PHENOMENON_TYPE,
     "具有原因": REL_CAUSE_TYPE,
@@ -109,7 +107,6 @@ KG_RELATION_TYPES = {
     "诱发条件": REL_TRIGGER_TYPE,
     "具有措施": REL_MEASURE_TYPE,
     "处理": REL_MEASURE_TYPE,
-    "可能导致": REL_CONSEQUENCE_TYPE,
     "属于": REL_DEVICE_TYPE,
     "电气连接": REL_ELECTRICAL_TYPE,
     "电连接": REL_ELECTRICAL_TYPE,

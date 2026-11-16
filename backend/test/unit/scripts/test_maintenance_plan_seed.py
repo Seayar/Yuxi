@@ -1,4 +1,4 @@
-"""seed.py 单元测试：全部使用假 driver，不连接图谱 / 数据库 / 大模型。
+"""kg3 历史导入 seed 单元测试：全部使用假 driver，不连接图谱 / 数据库 / 大模型。
 
 覆盖任务卡要求的离线证据：标签注册只在未注册时执行、模板 JSON 字段被序列化为字符串、
 null 距离不 SET、条款号后缀归一匹配、未匹配条款/区域被收集、重复运行语句完全相同、
@@ -12,8 +12,8 @@ from pathlib import Path
 
 import pytest
 
-from yuxi.knowledge.maintenance_plan import seed as seed_module
-from yuxi.knowledge.maintenance_plan.seed import load_plan_seed, seed_plan_graph_kg
+from scripts.legacy_kg3_seed import seed as seed_module
+from scripts.legacy_kg3_seed.seed import load_plan_seed, seed_plan_graph_kg
 
 from maintenance_plan_fake_driver import FakeDriver
 

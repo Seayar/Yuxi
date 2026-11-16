@@ -1,4 +1,4 @@
-"""kg4 图检索单元测试：全部使用假客户端，不连接图谱/数据库/大模型。"""
+"""处置方案图检索单元测试：全部使用假客户端，不连接图谱/数据库/大模型。"""
 
 from __future__ import annotations
 
@@ -67,8 +67,6 @@ class FakeClient:
             return [{"b": SCENE_SWITCHGEAR}]
         if rel == "位于":
             return [{"b": {"名称": "#3开闭所", "电压等级": "10kV"}}]
-        if rel == "管辖":
-            return [{"a": {"名称": "1号站电力巡护班组", "组织类型": "班组", "来源": "达梦"}, "b": {"名称": "#3开闭所"}}]
         if rel == "包含步骤":
             return [
                 {"b": {"id": "S2", "步骤序号": 2, "名称": "第二步", "操作内容": "拆柜"}},
@@ -136,6 +134,62 @@ def test_search_devices_falls_back_to_line_class_when_type_edge_missing():
     assert candidates[0].device_type == "架空线路"
 
 
+def test_search_devices_keeps_the_device_named_by_location_hint():
+    """“#1开闭所”既是位置线索也是设备：路径关键词会命中其下所有设备，必须按名称精确取回它本身。"""
+
+    kiosk = {
+        "id": "LGR#kbs1",
+        "名称": "#1开闭所",
+        "台账ID列表": "补充数据",
+        "层级路径": "变电设施 > 110kV变电站 > 10kV电压等级区域 > #1开闭所",
+        "电压等级": "10kV",
+        "设备分类": "开闭所",
+    }
+    cabinet = {
+        "id": "LGR#cab1",
+        "名称": "#1开闭所PLC柜",
+        "层级路径": "变电设施 > 110kV变电站 > 10kV电压等级区域 > #1开闭所 > #1开闭所PLC柜",
+        "电压等级": "10kV",
+    }
+
+    class LocationClient:
+        def run(self, cypher, **params):
+            if "= $name" in cypher:
+                return [{"n": kiosk}] if params.get("name") == "#1开闭所" else []
+            if "CONTAINS $kw" in cypher:
+                return [{"n": kiosk}, {"n": cabinet}]
+            if params.get("rel") == "属于" and "IN $device_ids" in cypher:
+                return [{"a": {"id": "LGR#kbs1"}, "b": {"名称": "开闭所"}}]
+            return []
+
+    candidates = search_devices(
+        LocationClient(),
+        PlanQuery(
+            raw_text="#1开闭所检修，需确定监护与人员配置的方案。",
+            device_type="开闭所",
+            location_hint="#1开闭所",
+        ),
+    )
+
+    assert [item.name for item in candidates] == ["#1开闭所"]
+    assert candidates[0].device_type == "开闭所"
+
+
+def test_device_candidate_label_hides_the_path():
+    """卡片标题只放设备名/类型/电压，长路径放到次要说明里。"""
+
+    candidate = DeviceCandidate(
+        device_id="LGR#kbs1",
+        name="#1开闭所",
+        device_type="开闭所",
+        voltage_level="10kV",
+        path="变电设施 > 110kV变电站 > 10kV电压等级区域 > #1开闭所",
+    )
+
+    assert candidate.label() == "#1开闭所（开闭所，10kV）"
+    assert candidate.location() == "变电设施 > 110kV变电站 > 10kV电压等级区域 > #1开闭所"
+
+
 def test_find_scenes_reads_has_scene_relation():
     device = DeviceCandidate("LGR#3k18", "3k18", "开关柜", "10kV", "#3开闭所 > 3k18", ledger_ids=("L1",))
     scenes = find_scenes(FakeClient(), device)
@@ -187,8 +241,6 @@ def test_collect_scene_evidence_filters_branch_and_sorts_steps():
     assert evidence.resources[1].quantity_requirement == "4 块／1 套"
     assert sum(item.count for item in evidence.personnel) == 6
     assert [item.node_id for item in evidence.personnel] == ["PER1", "PER2", "PER3"]
-    assert evidence.team is not None
-    assert evidence.team.name == "1号站电力巡护班组"
     assert evidence.device.voltage_level == "10kV"
 
 
@@ -201,6 +253,60 @@ def test_collect_scene_evidence_without_branch_keeps_only_common_items():
     assert [item.node_id for item in evidence.safety] == ["SAFE1"]
     assert [item.node_id for item in evidence.resources] == ["RES1"]
     assert sum(item.count for item in evidence.personnel) == 4
+
+
+def test_collect_scene_evidence_does_not_query_team_nodes():
+    """责任班组改由人员 JSON 匹配，证据收集不得再发运维组织/管辖查询。"""
+
+    device = DeviceCandidate("LGR#3k18", "3k18", "开关柜", "10kV", "#3开闭所 > 3k18", ledger_ids=("L1",))
+    scenario = Scenario("SCENE_A2", "开关柜整柜更换", level="A级", branch_dimension="布置位置")
+    client = FakeClient()
+
+    collect_scene_evidence(client, PlanQuery(), device, scenario, None)
+
+    cyphers = [cypher for cypher, _ in client.queries]
+    assert not any("运维组织" in cypher or "管辖" in cypher for cypher in cyphers)
+
+
+def test_search_devices_prefers_full_name_present_in_raw_text():
+    """原文含完整设备名时，完整名称候选必须排在短名候选之前。"""
+
+    class TextClient:
+        def run(self, cypher, **params):
+            if "CONTAINS $kw" in cypher:
+                return [
+                    {
+                        "n": {
+                            "id": "LGR#line",
+                            "名称": "3B-6K",
+                            "台账ID列表": "L1",
+                            "层级路径": "变电设施 > 35kV#3变电站 > 3B-6K",
+                            "台账分类": "中压线路",
+                        }
+                    },
+                    {
+                        "n": {
+                            "id": "LGR#arrester",
+                            "名称": "3B-6K线99#杆避雷器",
+                            "台账ID列表": "L2",
+                            "层级路径": "变电设施 > 35kV#3变电站 > 3B-6K > 99# > 避雷器",
+                            "台账分类": "避雷器",
+                        }
+                    },
+                ]
+            if params.get("rel") == "属于":
+                return [
+                    {"a": {"id": "LGR#line"}, "b": {"名称": "架空线路"}},
+                    {"a": {"id": "LGR#arrester"}, "b": {"名称": "避雷器"}},
+                ]
+            return []
+
+    candidates = search_devices(
+        TextClient(),
+        PlanQuery(raw_text="3B-6K线99#杆避雷器更换", device_name="3B-6K"),
+    )
+
+    assert candidates[0].name == "3B-6K线99#杆避雷器"
 
 
 def test_plan_graph_ready_returns_false_on_query_error():

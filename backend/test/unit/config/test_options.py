@@ -35,6 +35,31 @@ def test_every_defined_option_is_registered():
     assert "device_prediction_opts" in options.OPTION_DEFINITIONS
 
 
+def test_fault_trace_graphs_default_to_configured_graph(monkeypatch):
+    """故障溯源、处置方案与设备预测维护默认读取同一张配置图。"""
+
+    for env_name in ("FAULT_TRACE_GRAPH", "MAINTENANCE_PLAN_GRAPH", "DEVICE_PREDICTION_GRAPH"):
+        monkeypatch.delenv(env_name, raising=False)
+
+    resolved = options.fault_trace_opts.resolve({})
+
+    assert resolved["graph"] == "kg5"
+    assert resolved["maintenance_plan_graph"] == "kg5"
+    assert resolved["device_prediction_graph"] == "kg5"
+
+
+def test_fault_trace_graphs_keep_saved_values(monkeypatch):
+    """管理员显式保存的图名优先于环境变量与默认值，保证回滚路径可用。"""
+
+    for env_name in ("FAULT_TRACE_GRAPH", "MAINTENANCE_PLAN_GRAPH"):
+        monkeypatch.setenv(env_name, "kg5")
+
+    resolved = options.fault_trace_opts.resolve({"graph": "kg3", "maintenance_plan_graph": "kg4"})
+
+    assert resolved["graph"] == "kg3"
+    assert resolved["maintenance_plan_graph"] == "kg4"
+
+
 class FakeRedis:
     def __init__(self):
         self.values: dict[str, str] = {}

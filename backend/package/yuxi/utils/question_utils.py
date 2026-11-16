@@ -62,6 +62,26 @@ def _parse_bool(val: Any, default: bool = False) -> bool:
     return default
 
 
+# 用户关闭问题卡片时提交的恢复值：前端关闭弹窗复用审批拒绝的裸 ``reject``。
+# 业务必须把它当取消而不是用户补充的文本，否则取消会被当成修正反馈，重新识别后再弹同一张卡片。
+_QUESTION_CANCEL_SENTINELS = frozenset({"reject", "rejected", "cancel", "cancelled", "取消", "关闭"})
+
+
+def is_question_cancel(value: Any) -> bool:
+    """判断恢复值是否表示用户关闭或取消问题卡片。
+
+    只匹配整个取值，用户长文本（如“取消 110kV 这一项”）仍是修正内容。
+    """
+
+    if isinstance(value, dict):
+        return any(is_question_cancel(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(is_question_cancel(item) for item in value)
+    if isinstance(value, str):
+        return value.strip().lower() in _QUESTION_CANCEL_SENTINELS
+    return False
+
+
 def normalize_options(raw_options: Any) -> list[dict[str, Any]]:
     """规范化选项列表，支持列表、包装对象或字符串输入。"""
     raw_options = _normalize_collection(

@@ -1,8 +1,8 @@
-"""kg4 处置方案的确定性装配、Markdown 渲染与内容校验。
+"""处置方案的确定性装配、Markdown 渲染与内容校验。
 
-本模块只消费 ``ScenarioEvidence`` 与人员抽样结果：步骤/安全措施/资源/人员的格式化、
+本模块只消费 ``ScenarioEvidence`` 与人员安排结果：步骤/安全措施/资源/人员的格式化、
 方案 Markdown 与“思考过程”全部由代码确定，不调用大模型、不连接图谱。
-``verify_report`` 是最后一道门——分支值必须与 Redis/用户确认值一致、条目必须来自检索证据、
+``verify_report`` 是最后一道门——分支值必须与 Redis 读取值一致、条目必须来自检索证据、
 报告中的数字必须能在证据中找到，不通过则 ``answer_verified`` 为 False。
 """
 
@@ -13,7 +13,6 @@ import re
 from typing import Any
 
 from yuxi.knowledge.maintenance_plan.contracts import (
-    BRANCH_USER_CONFIRMED_NOTE,
     ScenarioEvidence,
     ScenarioPlanReport,
     PersonnelAssignment,
@@ -60,12 +59,6 @@ def format_resource(item) -> str:
     return text
 
 
-def format_personnel_requirement(item) -> str:
-    """没有人员名单时，至少给出岗位与人数。"""
-
-    return f"{item.role}：{item.count} 人" if item.role else f"{item.count} 人"
-
-
 def assemble_report(
     evidence: ScenarioEvidence,
     assignment: PersonnelAssignment,
@@ -77,12 +70,8 @@ def assemble_report(
 
     branch = evidence.branch
     personnel_lines = format_personnel(assignment)
-    if not personnel_lines:
-        personnel_lines = [format_personnel_requirement(item) for item in evidence.personnel]
 
     notes = list(data_notes)
-    if branch is not None and branch.source == "user" and BRANCH_USER_CONFIRMED_NOTE not in notes:
-        notes.append(BRANCH_USER_CONFIRMED_NOTE)
     if assignment.note and assignment.note not in notes:
         notes.append(assignment.note)
     for warning in evidence.warnings:
@@ -103,7 +92,7 @@ def assemble_report(
         safety=[format_safety(item) for item in evidence.safety],
         resources=[format_resource(item) for item in evidence.resources],
         personnel=personnel_lines,
-        team=evidence.team.name if evidence.team is not None else "未检索到管辖班组",
+        team=assignment.team,
         personnel_total=sum(item.count for item in evidence.personnel),
         data_notes=notes,
         thinking=build_thinking(evidence, elapsed_seconds=elapsed_seconds),
@@ -138,14 +127,8 @@ def build_plan_markdown(report: ScenarioPlanReport) -> str:
         "",
         f"- 责任班组：{report.team}",
         f"- 所需人数：{report.personnel_total} 人",
-        "",
     ]
     lines += _list_block(report.personnel, ordered=False)
-
-    if report.data_notes:
-        lines += ["## 五、数据说明", ""]
-        lines += [f"- {note}" for note in report.data_notes]
-        lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"
 
@@ -214,18 +197,14 @@ def verify_report(
         if report.resources != [format_resource(item) for item in evidence.resources]:
             logger.warning("处置方案校验未通过：资源清单与证据不一致")
             return False
-        expected_personnel = format_personnel(assignment) or [
-            format_personnel_requirement(item) for item in evidence.personnel
-        ]
-        if report.personnel != expected_personnel:
+        if report.team != assignment.team:
+            logger.warning("处置方案校验未通过：责任班组与证据不一致")
+            return False
+        if report.personnel != format_personnel(assignment):
             logger.warning("处置方案校验未通过：人员安排与证据不一致")
             return False
         if report.personnel_total != sum(item.count for item in evidence.personnel):
             logger.warning("处置方案校验未通过：人员合计与证据不一致")
-            return False
-        named = sum(len(names) for names in assignment.roles.values())
-        if named and named != assignment.total:
-            logger.warning("处置方案校验未通过：人员名单数量与需求人数不一致")
             return False
         corpus = _evidence_corpus(evidence, assignment, report)
         for number in _NUMBER_PATTERN.findall(_report_text(report)):
@@ -307,13 +286,9 @@ def _evidence_corpus(
         )
     for item in evidence.personnel:
         parts.extend([item.role, str(item.count), item.applicable_branch])
-    if evidence.team is not None:
-        parts.extend([evidence.team.name, evidence.team.managed_area])
     if evidence.branch is not None:
         parts.extend([evidence.branch.dimension, evidence.branch.condition, evidence.branch.branch])
-    for names in assignment.roles.values():
-        parts.extend(names)
-    parts.extend([str(assignment.total), str(report.personnel_total)])
+    parts.extend([assignment.team, assignment.leader, str(assignment.total), str(report.personnel_total)])
     parts.extend([str(index) for index in range(1, len(evidence.steps) + 1)])
     return set(_NUMBER_PATTERN.findall(" ".join(parts)))
 

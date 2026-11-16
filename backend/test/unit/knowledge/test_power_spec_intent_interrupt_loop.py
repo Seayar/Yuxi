@@ -7,13 +7,14 @@ from types import SimpleNamespace
 from typing import TypedDict
 
 import pytest
+from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
 
 from yuxi.knowledge.power_spec import tool as tool_module
 from yuxi.knowledge.power_spec.contracts import PowerSpecQuery
-from yuxi.knowledge.power_spec.contracts import INTENT_ATTEMPTS_EXHAUSTED_MESSAGE
+from yuxi.knowledge.power_spec.contracts import INTENT_ATTEMPTS_EXHAUSTED_MESSAGE, INTENT_CANCELLED_MESSAGE
 from yuxi.knowledge.power_spec.tool import _confirm_intent_with_user
 
 QUESTION = "220 的变压器色谱多久做一回？"
@@ -109,6 +110,112 @@ async def test_langgraph_interrupt_asks_for_details_then_reidentifies(monkeypatc
 
     final = await app.ainvoke(Command(resume=_confirm(confirm_payload)), config=config)
     assert final["result"] == "110kV 变压器色谱试验周期"
+
+
+@pytest.mark.asyncio
+async def test_langgraph_interrupt_cancel_on_correction_card_stops(monkeypatch):
+    """用户关闭“补充修正”卡片时必须结束确认，而不是把取消值当成修正文本重新识别。
+
+    线上缺陷：关闭动作的恢复值 ``reject`` 被 ``extract_correction_text`` 当成用户补充文本，
+    于是带着无意义反馈重新识别、再弹确认卡片，用户看到同一张卡片反复出现。
+    """
+
+    model_calls: list[str] = []
+    app, config = _build_graph(monkeypatch, model_calls=model_calls)
+
+    await app.ainvoke({}, config=config)
+    ask = await app.ainvoke(Command(resume={"power_spec_intent_confirm": "correct"}), config=config)
+    assert ask["__interrupt__"][0].value["source"] == "power_spec_intent_correction"
+
+    final = await app.ainvoke(Command(resume="reject"), config=config)
+
+    assert "__interrupt__" not in final
+    assert final["result"] == INTENT_CANCELLED_MESSAGE
+    # 取消不进入第二次识别：三次节点重放各调用一次 attempt 1 的模型，没有 attempt 2 的调用。
+    assert len(model_calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_langgraph_interrupt_cancel_on_confirmation_card_skips_correction(monkeypatch):
+    """关闭确认卡片直接取消，不再追问修正内容。"""
+
+    model_calls: list[str] = []
+    app, config = _build_graph(monkeypatch, model_calls=model_calls)
+
+    await app.ainvoke({}, config=config)
+    final = await app.ainvoke(Command(resume="reject"), config=config)
+
+    assert "__interrupt__" not in final
+    assert final["result"] == INTENT_CANCELLED_MESSAGE
+
+
+def _build_tool_graph(monkeypatch, *, model_calls: list[str]) -> tuple[object, dict]:
+    """用真实 ``create_agent`` + ToolNode 装配同一次交互：确认发生在工具调用内部。"""
+
+    from langchain.agents import create_agent
+    from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
+    from langchain_core.messages import AIMessage
+    from langchain_core.tools import tool
+
+    async def fake_model_call(prompt: str) -> str:
+        model_calls.append(prompt)
+        return json.dumps(
+            {
+                "question": "220kV 变压器色谱试验周期",
+                "intent": "检修标准查询",
+                "device_type": "变压器",
+                "voltage_level": "220kV",
+                "answer_dimensions": ["周期"],
+                "keywords": ["220kV", "变压器", "色谱"],
+            },
+            ensure_ascii=False,
+        )
+
+    monkeypatch.setattr(tool_module, "_build_intent_model_call", lambda _context: fake_model_call)
+
+    @tool
+    async def search_power_spec(query_text: str) -> str:
+        """检索电力规范。"""
+
+        query = await _confirm_intent_with_user(query_text, context=SimpleNamespace(model="fake:model"))
+        return query.query if isinstance(query, PowerSpecQuery) else query
+
+    class _ToolCallingModel(FakeMessagesListChatModel):
+        def bind_tools(self, tools, **kwargs):
+            return self
+
+    model = _ToolCallingModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[{"name": "search_power_spec", "args": {"query_text": QUESTION}, "id": "call-1"}],
+            ),
+            AIMessage(content="已结束"),
+        ]
+    )
+    graph = create_agent(model=model, tools=[search_power_spec], checkpointer=InMemorySaver())
+    return graph, {"configurable": {"thread_id": "intent-loop-tool"}}
+
+
+@pytest.mark.asyncio
+async def test_tool_node_cancel_on_correction_card_stops(monkeypatch):
+    """真实 ToolNode 装配下同样按顺序重放：关闭补充卡片后不得再弹确认卡片。"""
+
+    model_calls: list[str] = []
+    graph, config = _build_tool_graph(monkeypatch, model_calls=model_calls)
+
+    first = await graph.ainvoke({"messages": [HumanMessage(QUESTION)]}, config=config)
+    assert first["__interrupt__"][0].value["source"] == "power_spec_intent_confirmation"
+
+    second = await graph.ainvoke(Command(resume={"power_spec_intent_confirm": "correct"}), config=config)
+    assert second["__interrupt__"][0].value["source"] == "power_spec_intent_correction"
+
+    final = await graph.ainvoke(Command(resume="reject"), config=config)
+
+    assert "__interrupt__" not in final
+    tool_messages = [message for message in final["messages"] if message.type == "tool"]
+    assert tool_messages[-1].content == INTENT_CANCELLED_MESSAGE
+    assert final["messages"][-1].content == "已结束"
 
 
 @pytest.mark.asyncio

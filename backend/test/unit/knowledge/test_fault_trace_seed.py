@@ -97,26 +97,26 @@ def test_node_id_is_deterministic():
 
 
 def test_label_constants_match_adapter_schema():
-    """历史 kg 迁移写入的标签必须与迁移目标一致（运行时读取 kg3，见 graph_kg3.py）。"""
+    """当前运行时 schema 不含故障模式；历史 seed 的模式标签只用于迁移，不对齐运行时契约。"""
 
     from yuxi.knowledge.fault_trace.contracts import KG_ENTITY_LABELS, KG_RELATION_TYPES
 
     assert {
         LABEL_DEVICE,
-        LABEL_FAULT_MODE,
         LABEL_PHENOMENON,
         LABEL_CAUSE,
         LABEL_MEASURE,
         LABEL_TRIGGER,
     } <= set(KG_ENTITY_LABELS)
+    assert LABEL_FAULT_MODE not in KG_ENTITY_LABELS
     assert {
-        seed_module.REL_HAS_FAULT_MODE,
         seed_module.REL_PHENOMENON,
         seed_module.REL_CAUSE,
         seed_module.REL_MEASURE,
         seed_module.REL_TRIGGER,
         seed_module.REL_TOPOLOGY,
     } <= set(KG_RELATION_TYPES)
+    assert seed_module.REL_HAS_FAULT_MODE not in KG_RELATION_TYPES
 
 
 class _FakeResult:

@@ -1,6 +1,8 @@
-"""处置方案 seed 数据的离线预检（不连接图谱 / 数据库 / 大模型）。
+"""kg3 历史处置方案 seed 数据的离线预检（不连接图谱 / 数据库 / 大模型）。
 
-预检在把 ``data/`` 下的六份 JSON 写入 TuGraph ``kg3`` 图之前运行，只做纯离线校验：
+本模块与 ``seed.py`` 同属离线导入资产，位于 ``backend/scripts/legacy_kg3_seed/``，不在运行时
+处置方案链路里；``python -m scripts.legacy_kg3_seed.preflight`` 可单独出报告。
+预检在把 ``data/`` 下的六份 JSON 写入历史 TuGraph ``kg3`` 图之前运行，只做纯离线校验：
 键名齐全、id 唯一、模板/备件的设备类型都在契约 ``DEVICE_TYPES`` 内、班组管辖区域都在
 ``ref/kg_ref.json`` 的台账名称中、模板占位符只用四个合法占位符、每个模板至少 1 条依据条款。
 
@@ -16,6 +18,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+# 设备类型白名单由运行时契约拥有，本包只读它；运行时不会反过来导入本包。
 from yuxi.knowledge.maintenance_plan.contracts import DEVICE_TYPES
 
 # 六份 seed 数据文件（三份作业模板合并为 templates）
@@ -194,7 +197,7 @@ def run_preflight(data_dir: str | Path, *, kg_ref_path: str | Path | None = None
     """
 
     # 延迟导入，避免 seed ↔ preflight 的模块级循环依赖
-    from yuxi.knowledge.maintenance_plan.seed import load_plan_seed
+    from scripts.legacy_kg3_seed.seed import load_plan_seed
 
     seed = load_plan_seed(data_dir)
     kg_ref: dict[str, Any] | None = None

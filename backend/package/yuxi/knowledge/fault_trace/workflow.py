@@ -32,13 +32,14 @@ from yuxi.knowledge.fault_trace.contracts import (
     DEVICE_NOT_FOUND_MESSAGE,
     DEVICE_TYPE_MISSING_MESSAGE,
     ENTITY_CAUSE,
-    ENTITY_FAULT_MODE,
     ENTITY_PHENOMENON,
     ENTITY_TRIGGER,
     FAULT_GRAPH_UNAVAILABLE_MESSAGE,
     IMAGE_NOT_FOUND_MESSAGE,
     IMAGE_NO_FAULT_MESSAGE,
     IMAGE_SERVICE_UNAVAILABLE_MESSAGE,
+    INTENT_ATTEMPTS_EXHAUSTED_MESSAGE,
+    INTENT_CANCELLED_MESSAGE,
     NO_FAULT_GRAPH_MESSAGE,
     REALTIME_UNAVAILABLE_STATUSES,
     REL_CAUSE_TYPE,
@@ -73,6 +74,7 @@ from yuxi.knowledge.fault_trace.intent import (
 from yuxi.knowledge.fault_trace.ledger import LedgerDevice, ledger_repository
 from yuxi.knowledge.fault_trace.realtime import read_realtime_values
 from yuxi.knowledge.fault_trace.report_text import compose_location_reasoning, compose_summary_text
+from yuxi.utils.question_utils import is_question_cancel
 from yuxi.knowledge.fault_trace.rules import (
     evaluate_causes,
     located_causes,
@@ -136,6 +138,7 @@ class FaultTraceState:
     evidence: Any = None
     values: dict[str, Any] = field(default_factory=dict)
     cause_evaluations: list[Any] = field(default_factory=list)
+    scoped_causes: list[Any] | None = None
     matched_phenomena: list[dict[str, Any]] = field(default_factory=list)
     reasoning_rows: list[dict[str, Any]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -190,6 +193,17 @@ async def _parse_fault(state: FaultTraceState, client: TuGraphClient) -> None:
         confirmed_intent=state.confirmed_intent,
     )
     if isinstance(prepared, str):
+        if prepared in {INTENT_CANCELLED_MESSAGE, INTENT_ATTEMPTS_EXHAUSTED_MESSAGE}:
+            # 用户取消或确认轮次用尽：给解析步骤一个终态，避免历史回显一直停在 waiting。
+            state.emitter.emit(
+                "parse_fault",
+                "failed",
+                content=prepared,
+                error={
+                    "code": "intent_cancelled" if prepared == INTENT_CANCELLED_MESSAGE else "intent_attempts_exhausted",
+                    "message": prepared,
+                },
+            )
         raise _WorkflowExit(prepared)
     if isinstance(prepared, dict):
         raise _WorkflowExit(prepared)
@@ -283,7 +297,6 @@ async def _match_causal_chain(state: FaultTraceState, client: TuGraphClient) -> 
         raise _WorkflowExit(FAULT_GRAPH_UNAVAILABLE_MESSAGE) from exc
 
     evidence = state.evidence
-    modes = evidence.nodes_with_label(ENTITY_FAULT_MODE)
     phenomena = evidence.nodes_with_label(ENTITY_PHENOMENON)
     trigger_nodes = evidence.nodes_with_label(ENTITY_TRIGGER)
     causes = evidence.nodes_with_label(ENTITY_CAUSE)
@@ -304,21 +317,31 @@ async def _match_causal_chain(state: FaultTraceState, client: TuGraphClient) -> 
     )
     state.cause_evaluations = evaluate_causes(evidence, state.values)
     state.matched_phenomena = _match_phenomena(phenomena, state.query, state.image_payload)
-    state.reasoning_rows = _reasoning_rows(evidence, phenomena, state.cause_evaluations)
-    state.warnings = _step_warnings(evidence, state.matched_phenomena, state.values)
+    # 推理过程只保留命中现象（图片类别优先）；一个都没命中时才列出该设备类型的全部现象并告警。
+    state.reasoning_rows = _reasoning_rows(
+        evidence,
+        state.matched_phenomena or phenomena,
+        state.cause_evaluations,
+    )
+    state.warnings = _step_warnings(state.matched_phenomena, state.values)
     if state.image_warning in _IMAGE_WARNING_TEXTS:
         state.warnings.append(_IMAGE_WARNING_TEXTS[state.image_warning])
-    state.located_all = located_causes(state.cause_evaluations)
+    state.located_all = _located_for_matched_phenomena(evidence, state.matched_phenomena, state.cause_evaluations)
+    state.scoped_causes = _scoped_causes(evidence, state.matched_phenomena, state.cause_evaluations)
     state.located = state.located_all[0] if state.located_all else None
-    state.supporting = supporting_phenomena(state.reasoning_rows, state.located_all)
+    state.supporting = _supporting_matched_phenomena(evidence, state.matched_phenomena, state.located_all)
+    if not state.supporting:
+        # 没有命中现象时按成立原因反推现象列表；报告会带未匹配 warning。
+        state.supporting = supporting_phenomena(state.reasoning_rows, state.located_all)
+    if state.matched_phenomena and not state.located_all:
+        state.warnings.append("命中故障现象下没有成立原因，未将其它现象的成立原因写入定位")
     state.cause_measures = _cause_measures(evidence)
     state.emitter.emit(
         "match_causal_chain",
         "completed",
-        content=_causal_chain_summary(modes, phenomena, state.cause_evaluations),
+        content=_causal_chain_summary(phenomena, state.cause_evaluations),
         data={
             "device_type": state.device_type_name,
-            "fault_modes": [{"mode_id": str(node["id"]), "name": str(node.get("name") or "")} for node in modes],
             "phenomena": [
                 {
                     "phenomenon_id": str(node["id"]),
@@ -367,20 +390,24 @@ def _trace_topology(state: FaultTraceState) -> None:
 
 async def _generate_report(state: FaultTraceState) -> dict[str, Any]:
     state.emitter.emit("generate_report", "started", content="正在生成故障溯源报告。")
+    report_causes = state.scoped_causes if state.scoped_causes is not None else state.cause_evaluations
     location_reasoning = await compose_location_reasoning(
         query_text=state.query_text,
         device_name=str(state.device.get("name") or ""),
         located_causes=state.located_all,
-        causes=state.cause_evaluations,
+        causes=report_causes,
         phenomena=state.supporting,
         model_call=state.model_call,
     )
+    matched_names = [str(node.get("name") or "").strip() for node in state.matched_phenomena]
+    matched_names = [name for name in matched_names if name]
+    summary_phenomenon = state.supporting[0] if state.supporting else (matched_names[0] if matched_names else None)
     payload = build_fault_trace_payload(
         query=state.query,
         device=state.device_data,
         device_type=state.device_type_name,
         reasoning_rows=state.reasoning_rows,
-        causes=state.cause_evaluations,
+        causes=report_causes,
         topology=state.topology,
         cause_links=state.evidence.cause_links,
         image_used=bool(state.image_payload and state.image_payload.get("fault_name")),
@@ -390,6 +417,9 @@ async def _generate_report(state: FaultTraceState) -> dict[str, Any]:
         location_reasoning=location_reasoning,
         cause_measures=state.cause_measures,
         graph=state.config.graph,
+        location_phenomena=state.supporting if state.matched_phenomena else None,
+        phenomenon_name=summary_phenomenon,
+        located_override=state.located_all if state.matched_phenomena else None,
     )
     state.emitter.emit(
         "generate_report",
@@ -479,7 +509,7 @@ def _ledger_ids(device: dict[str, Any]) -> list[str]:
 
 
 def _ledger_id(device: dict[str, Any]) -> str:
-    """Redis key 使用台账 ID；kg3 设备节点把它放在 ``台账ID列表``。"""
+    """Redis key 使用台账 ID；故障图设备节点把它放在 ``台账ID列表``。"""
 
     ids = _ledger_ids(device)
     return ids[0] if ids else ""
@@ -629,10 +659,20 @@ def _match_phenomena(
     query: FaultTraceQuery,
     image_payload: dict[str, Any] | None,
 ) -> list[dict[str, Any]]:
-    texts = [item.strip() for item in query.phenomena if item.strip()]
+    """按图片识别类别优先匹配图谱现象；图片类别没有对应现象时才退回文字现象。"""
+
     image_name = str((image_payload or {}).get("fault_name") or "").strip()
     if image_name:
-        texts.append(image_name)
+        by_image = _phenomena_containing(phenomena, [image_name])
+        if by_image:
+            return by_image
+    text_phenomena = [item.strip() for item in query.phenomena if item.strip()]
+    return _phenomena_containing(phenomena, text_phenomena)
+
+
+def _phenomena_containing(phenomena: list[dict[str, Any]], texts: list[str]) -> list[dict[str, Any]]:
+    """现象名与任一文本双向包含即视为命中。"""
+
     matched: list[dict[str, Any]] = []
     for node in phenomena:
         name = str(node.get("name") or "")
@@ -641,39 +681,93 @@ def _match_phenomena(
     return matched
 
 
+def _matched_cause_ids(evidence: Any, matched_phenomena: list[dict[str, Any]]) -> set[str] | None:
+    """命中现象可达的原因 id；未命中现象时返回 None（表示不做范围收口）。"""
+
+    if not matched_phenomena:
+        return None
+    matched_ids = {str(node.get("id") or "") for node in matched_phenomena}
+    return {
+        str(edge.get("target_id") or "")
+        for edge in evidence.edges_with_type(REL_CAUSE_TYPE)
+        if str(edge.get("source_id") or "") in matched_ids
+    }
+
+
+def _located_for_matched_phenomena(
+    evidence: Any,
+    matched_phenomena: list[dict[str, Any]],
+    evaluations: list[Any],
+) -> list[Any]:
+    """有现象命中时只保留这些现象可达的成立原因；未命中时保留全部。"""
+
+    allowed = _matched_cause_ids(evidence, matched_phenomena)
+    located = located_causes(evaluations)
+    if allowed is None:
+        return located
+    return [cause for cause in located if cause.cause_id in allowed]
+
+
+def _scoped_causes(
+    evidence: Any,
+    matched_phenomena: list[dict[str, Any]],
+    evaluations: list[Any],
+) -> list[Any] | None:
+    """命中现象可达的全部原因（含 rejected/unknown），供 verdict、证据与推理文案使用。"""
+
+    allowed = _matched_cause_ids(evidence, matched_phenomena)
+    if allowed is None:
+        return None
+    return [cause for cause in evaluations if cause.cause_id in allowed]
+
+
+def _supporting_matched_phenomena(
+    evidence: Any,
+    matched_phenomena: list[dict[str, Any]],
+    located: list[Any],
+) -> list[str]:
+    """命中现象中已有成立原因的显示名；未命中现象时返回空列表走旧回退。"""
+
+    if not matched_phenomena:
+        return []
+    located_ids = {cause.cause_id for cause in located}
+    names: list[str] = []
+    for node in matched_phenomena:
+        node_id = str(node.get("id") or "")
+        if not any(
+            str(edge.get("source_id") or "") == node_id and str(edge.get("target_id") or "") in located_ids
+            for edge in evidence.edges_with_type(REL_CAUSE_TYPE)
+        ):
+            continue
+        name = str(node.get("name") or "").strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
 def _reasoning_rows(
     evidence: Any,
     phenomena: list[dict[str, Any]],
     evaluations: list[Any],
 ) -> list[dict[str, Any]]:
-    """按现象分组图谱中的原因；每个现象都成行，没有原因时保留空行。"""
+    """为传入的每个现象成行并挂上图谱原因；没有原因时保留空行（调用方只传推理表要展示的现象）。"""
 
     by_id = {cause.cause_id: cause for cause in evaluations}
-    if evidence.cause_links == "fault_phenomenon":
-        links: dict[str, list[str]] = {}
-        for edge in evidence.edges_with_type(REL_CAUSE_TYPE):
-            links.setdefault(str(edge.get("source_id")), []).append(str(edge.get("target_id")))
-        rows = []
-        for node in phenomena:
-            linked = [by_id[cause_id] for cause_id in links.get(str(node["id"]), []) if cause_id in by_id]
-            rows.append(
-                {
-                    "phenomenon_id": str(node["id"]),
-                    "phenomenon": str(node.get("name") or ""),
-                    "link_level": "fault_phenomenon",
-                    "causes": linked,
-                }
-            )
-        return rows
-    representative = phenomena[0] if phenomena else None
-    return [
-        {
-            "phenomenon_id": str(representative["id"]) if representative is not None else None,
-            "phenomenon": (str(representative.get("name") or "") if representative is not None else "故障模式汇总"),
-            "link_level": "fault_mode",
-            "causes": list(evaluations),
-        }
-    ]
+    links: dict[str, list[str]] = {}
+    for edge in evidence.edges_with_type(REL_CAUSE_TYPE):
+        links.setdefault(str(edge.get("source_id")), []).append(str(edge.get("target_id")))
+    rows = []
+    for node in phenomena:
+        linked = [by_id[cause_id] for cause_id in links.get(str(node["id"]), []) if cause_id in by_id]
+        rows.append(
+            {
+                "phenomenon_id": str(node["id"]),
+                "phenomenon": str(node.get("name") or ""),
+                "link_level": "fault_phenomenon",
+                "causes": linked,
+            }
+        )
+    return rows
 
 
 def _cause_measures(evidence: Any) -> dict[str, list[str]]:
@@ -693,34 +787,25 @@ def _cause_measures(evidence: Any) -> dict[str, list[str]]:
 
 
 def _step_warnings(
-    evidence: Any,
     matched_phenomena: list[dict[str, Any]],
     values: dict[str, Any],
 ) -> list[str]:
     warnings: list[str] = []
-    if evidence.cause_links == "fault_mode":
-        warnings.append("故障原因挂在故障模式上（缺少现象→原因边），按模式汇总可能原因")
     if not matched_phenomena:
-        if evidence.cause_links == "fault_phenomenon":
-            warnings.append("未匹配到用户描述中的故障现象，推理过程列出该设备类型的全部现象")
-        else:
-            warnings.append("未匹配到具体故障现象，按故障模式汇总可能原因")
+        warnings.append("未匹配到用户描述中的故障现象，推理过程列出该设备类型的全部现象")
     if any(value.status in REALTIME_UNAVAILABLE_STATUSES for value in values.values()):
         warnings.append("实时数据服务暂时不可用，部分原因无法判定")
     return warnings
 
 
 def _causal_chain_summary(
-    modes: list[dict[str, Any]],
     phenomena: list[dict[str, Any]],
     evaluations: list[Any],
 ) -> str:
     established = sum(1 for cause in evaluations if cause.status == "established")
     unknown = sum(1 for cause in evaluations if cause.status == "unknown")
-    mode_part = f"{len(modes)} 个故障模式、" if modes else ""
     return (
-        f"匹配到 {mode_part}{len(phenomena)} 个故障现象、{len(evaluations)} 个可能原因；"
-        f"{established} 个成立、{unknown} 个待确认。"
+        f"匹配到 {len(phenomena)} 个故障现象、{len(evaluations)} 个可能原因；{established} 个成立、{unknown} 个待确认。"
     )
 
 
@@ -863,13 +948,17 @@ async def _prepare_device(
         intent_plan.update(
             {
                 "device_name": str(device.get("name") or query.device_name or ""),
-                "device_type": device_type_name,
+                # 设备类型保留模型/用户确认的识别结果；图谱归类单独展示，溯源证据按图谱归类取。
+                "graph_device_type": device_type_name,
                 "voltage_level": query.voltage_level or str(getattr(ledger_device, "voltage_level", "") or "") or None,
             }
         )
         if confirmed_intent:
             return prepared
 
+        if feedback:
+            # 重新识别的卡片要显示上一轮补充，用户才能确认输入已被采用。
+            intent_plan["correction"] = feedback
         emitter.emit(
             "parse_fault",
             "waiting",
@@ -885,17 +974,21 @@ async def _prepare_device(
         )
         answer = interrupt(build_confirmation_payload(intent_plan))
         decision, correction = parse_intent_confirmation(answer)
+        if decision == "cancel":
+            return INTENT_CANCELLED_MESSAGE
         if decision == "confirm":
             # 用户确认即最终口径：直接按已校验的设备继续，不拿模型重算的计划做一致性校验。
             return prepared
-            return prepared
         if decision == "invalid" or not correction:
-            correction = extract_correction_text(interrupt(build_correction_payload(intent_plan)))
+            correction_answer = interrupt(build_correction_payload(intent_plan))
+            if is_question_cancel(correction_answer):
+                return INTENT_CANCELLED_MESSAGE
+            correction = extract_correction_text(correction_answer)
         if not correction:
-            return "意图确认交互过多，未完成故障溯源"
+            return INTENT_ATTEMPTS_EXHAUSTED_MESSAGE
         previous = query
         feedback = correction
-    return "意图确认交互过多，未完成故障溯源"
+    return INTENT_ATTEMPTS_EXHAUSTED_MESSAGE
 
 
 async def _detect_uploaded_image(runtime: ToolRuntime | None) -> tuple[dict[str, Any] | None, str | None, bool]:

@@ -1,10 +1,10 @@
-"""kg5 图检索：定位设备、解析预测服务设备 ID，并按预测故障类型匹配维护知识。
+"""设备预测维护图检索：定位设备、解析预测服务设备 ID，并按预测故障类型匹配维护知识。
 
 本模块只做“读图 + 打分 + 过滤”，不做任何自然语言生成。图谱读取都指向设备预测维护
-自己的 ``kg5`` 图：``search_devices`` 在 ``设备实例`` 中按名称/层级路径召回，
+配置的图：``search_devices`` 在 ``设备实例`` 中按名称/层级路径召回，
 ``resolve_device_id`` 先取设备节点的 ``台账ID列表``（占位值时按精确名称回查三区台账），
 ``lookup_maintenance_guidance`` 沿 ``设备类型 -[具有现象]-> 故障现象`` 匹配预测故障类型，
-再从故障现象取 ``所需资源`` 与 ``注意事项``。图谱不读故障溯源 ``kg3`` 与处置方案 ``kg4``。
+再从故障现象取 ``所需资源`` 与 ``注意事项``。图谱不读历史图。
 
 TuGraph 4.5.2 实测限制：一条语句最多一个 MATCH，多跳必须拆成多条语句在 Python 侧拼接；
 中文标签/关系/属性直接写裸标识符，不加反引号；所有查询都带 LIMIT。
@@ -83,7 +83,7 @@ _ITEM_SEPARATOR_PATTERN = re.compile(r"[；;]+")
 def search_devices(
     client: TuGraphClient, query: PredictionQuery, *, limit: int = MAX_DEVICE_CANDIDATES
 ) -> list[DeviceCandidate]:
-    """按设备名称/位置线索在 kg5 的 ``设备实例`` 中召回并打分。
+    """按设备名称/位置线索在设备预测维护图的 ``设备实例`` 中召回并打分。
 
     - 关键词来自 ``device_name``（含“1号→#1/1#”的同义展开）与 ``location_hint``；
     - 设备类型只作为加分项与展示信息：缺少 ``属于`` 边不影响设备召回；
@@ -128,7 +128,7 @@ def search_devices(
 async def resolve_device_id(candidate: DeviceCandidate) -> tuple[str, str] | None:
     """解析预测服务使用的设备 ID，返回 ``(设备ID, 来源)``；取不到时返回 None。
 
-    先取 ``kg5`` 设备节点的 ``台账ID列表``（跳过“补充数据”等占位值）；只有节点上的 ID 不可
+    先取设备预测维护图节点的 ``台账ID列表``（跳过“补充数据”等占位值）；只有节点上的 ID 不可
     用时，才按**精确名称 + 层级祖先**回查三区设备台账（MinIO ``fault-assets/ledger/devices.json``）。
     台账里只接受与设备名称完全一致的行，不采用子串匹配，避免把报告绑定到另一台设备；
     图谱节点 id 属于图内部命名空间，不作为业务设备 ID 外发。
@@ -288,7 +288,7 @@ def lookup_maintenance_guidance(
         phenomena = _query_phenomena(client, device_type=scoped, limit=limit)
         matched = _best_phenomenon(phenomena, wanted, allow_fuzzy=scoped is not None)
     except TuGraphError as exc:
-        logger.warning(f"kg5 维护知识查询失败（故障类型：{fault_type}）: {exc}")
+        logger.warning(f"设备预测维护图维护知识查询失败（故障类型：{fault_type}）: {exc}")
         return MaintenanceGuidance(notes=[GUIDANCE_QUERY_FAILED_NOTE])
     if matched is None:
         return MaintenanceGuidance(
@@ -473,7 +473,7 @@ def _query_devices_by_device_type(client: TuGraphClient, *, device_type: str) ->
 def _query_device_types(client: TuGraphClient, *, device_ids: list[str]) -> dict[str, str]:
     """设备 id → 设备类型名称（来自 ``属于`` 边）。
 
-    kg5 没有设备类型层（或查询失败）时返回空映射：设备类型只是展示与加分项，
+    设备预测维护图没有设备类型层（或查询失败）时返回空映射：设备类型只是展示与加分项，
     不能因为它缺失而让整次设备召回失败。
     """
 
@@ -492,7 +492,7 @@ def _query_device_types(client: TuGraphClient, *, device_ids: list[str]) -> dict
             node_limit=KG_QUERY_LIMIT,
         )
     except TuGraphError as exc:
-        logger.info(f"kg5 设备类型查询不可用，按无类型继续：{exc}")
+        logger.info(f"设备预测维护图设备类型查询不可用，按无类型继续：{exc}")
         return {}
     types: dict[str, str] = {}
     for record in records:

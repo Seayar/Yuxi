@@ -1,4 +1,4 @@
-"""kg4 分支判定单元测试：假 MGET，不连接 Redis。"""
+"""处置方案分支判定单元测试：假 MGET/SCAN，不连接 Redis。"""
 
 from __future__ import annotations
 
@@ -69,11 +69,105 @@ def test_lookup_states(monkeypatch, values, expected_state, expected_branch):
     async def fake_mget(url, keys, *, db, prefix):
         return values
 
+    async def fake_scan(url, ledger_ids, *, db, prefix):
+        return []
+
     monkeypatch.setattr(branch_module, "_mget", fake_mget)
+    monkeypatch.setattr(branch_module, "_scan_values", fake_scan)
     result = asyncio.run(lookup_branch(DEVICE, SCENE))
 
     assert result.state == expected_state
     assert result.branch == expected_branch
+
+
+def test_dimension_alias_uses_value_match(monkeypatch):
+    """精确维度没有 key 时，设备其他中文维度 key 的值匹配场景条件也可自动判定。"""
+
+    monkeypatch.setenv("FAULT_TRACE_REDIS_URL", "redis://example:6379/0")
+    scene = Scenario(
+        "SCENE_A3",
+        "主变母线带电检修",
+        branch_dimension="停电范围",
+        branch1_condition="母线可停",
+        branch2_condition="母线带电",
+    )
+
+    async def fake_mget(url, keys, *, db, prefix):
+        return [None, None]
+
+    async def fake_scan(url, ledger_ids, *, db, prefix):
+        return [("母线带电", "L1")]
+
+    monkeypatch.setattr(branch_module, "_mget", fake_mget)
+    monkeypatch.setattr(branch_module, "_scan_values", fake_scan)
+    result = asyncio.run(lookup_branch(DEVICE, scene))
+
+    assert result.state == "ok"
+    assert result.branch == "分支2"
+    assert result.value == "母线带电"
+    assert result.ledger_id == "L1"
+
+
+def test_dimension_alias_conflicting_values_is_invalid(monkeypatch):
+    monkeypatch.setenv("FAULT_TRACE_REDIS_URL", "redis://example:6379/0")
+    scene = Scenario(
+        "SCENE_A3",
+        "主变母线带电检修",
+        branch_dimension="停电范围",
+        branch1_condition="母线可停",
+        branch2_condition="母线带电",
+    )
+
+    async def fake_mget(url, keys, *, db, prefix):
+        return [None, None]
+
+    async def fake_scan(url, ledger_ids, *, db, prefix):
+        return [("母线带电", "L1"), ("母线可停", "L2")]
+
+    monkeypatch.setattr(branch_module, "_mget", fake_mget)
+    monkeypatch.setattr(branch_module, "_scan_values", fake_scan)
+    result = asyncio.run(lookup_branch(DEVICE, scene))
+
+    assert result.state == "invalid"
+
+
+def test_dimension_alias_value_not_matching_is_invalid(monkeypatch):
+    monkeypatch.setenv("FAULT_TRACE_REDIS_URL", "redis://example:6379/0")
+    scene = Scenario(
+        "SCENE_A3",
+        "主变母线带电检修",
+        branch_dimension="停电范围",
+        branch1_condition="母线可停",
+        branch2_condition="母线带电",
+    )
+
+    async def fake_mget(url, keys, *, db, prefix):
+        return [None, None]
+
+    async def fake_scan(url, ledger_ids, *, db, prefix):
+        return [("别的条件", "L1")]
+
+    monkeypatch.setattr(branch_module, "_mget", fake_mget)
+    monkeypatch.setattr(branch_module, "_scan_values", fake_scan)
+    result = asyncio.run(lookup_branch(DEVICE, scene))
+
+    assert result.state == "invalid"
+
+
+def test_dimension_alias_scan_failure_is_unavailable(monkeypatch):
+    monkeypatch.setenv("FAULT_TRACE_REDIS_URL", "redis://example:6379/0")
+
+    async def fake_mget(url, keys, *, db, prefix):
+        return [None, None]
+
+    async def fake_scan(url, ledger_ids, *, db, prefix):
+        return None
+
+    monkeypatch.setattr(branch_module, "_mget", fake_mget)
+    monkeypatch.setattr(branch_module, "_scan_values", fake_scan)
+    result = asyncio.run(lookup_branch(DEVICE, SCENE))
+
+    assert result.state == "unavailable"
 
 
 def test_unavailable_when_mget_returns_none(monkeypatch):

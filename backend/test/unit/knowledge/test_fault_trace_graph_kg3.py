@@ -1,4 +1,4 @@
-"""kg3 适配器的查询编排单元测试（替身客户端，不依赖真实 TuGraph）。"""
+"""故障图谱适配器的查询编排单元测试（替身客户端，不依赖真实 TuGraph）。"""
 
 from __future__ import annotations
 
@@ -19,12 +19,10 @@ DEVICE = {
     "设备分类": "中压线路",
 }
 TYPE = {"名称": "架空线路", "id": "DEV#架空线路"}
-MODE = {"名称": "异物搭挂", "id": "FM-WR-01"}
 PHENOMENON = {"名称": "树木倒伏枝干压覆导线", "id": "PH-04"}
 CAUSE = {"名称": "通道内树木未及时砍伐或修剪，遇大风倒伏压线", "id": "CA-04"}
 TRIGGER = {"名称": "泄漏电流超1mA", "id": "TC-R03", "表达式": "leakage_current > 1"}
 MEASURE = {"名称": "修剪通道内树木", "id": "MM-03"}
-CONSEQUENCE = {"名称": "相间短路", "id": "FC-01"}
 STATION = {"名称": "35kV#3变电站", "id": "LGR#station", "电压等级": "35kV"}
 
 
@@ -50,20 +48,14 @@ def _base_responder(cypher: str, params: dict):
         return []
     if rel == "属于" and params.get("src") == "设备类型":
         return [{"b": {"名称": "架空线路", "id": "DEV#架空线路"}}]
-    if rel == "具有故障模式":
-        return [{"a": TYPE, "rel_type": "具有故障模式", "b": MODE}]
     if rel == "具有现象":
-        return [{"a": MODE, "rel_type": "具有现象", "b": PHENOMENON}]
-    if rel == "具有原因" and params.get("src") == "故障现象":
-        return []
+        return [{"a": TYPE, "rel_type": "具有现象", "b": PHENOMENON}]
     if rel == "具有原因":
-        return [{"a": MODE, "rel_type": "具有原因", "b": CAUSE}]
+        return [{"a": PHENOMENON, "rel_type": "具有原因", "b": CAUSE}]
     if rel == "具有触发条件":
         return [{"a": CAUSE, "rel_type": "具有触发条件", "b": TRIGGER}]
     if rel == "具有措施":
         return [{"a": CAUSE, "rel_type": "具有措施", "b": MEASURE}]
-    if rel == "可能导致":
-        return [{"a": CAUSE, "rel_type": "可能导致", "b": CONSEQUENCE}]
     if rel == "电气连接":
         return [{"a": STATION, "rel_type": "电气连接", "b": DEVICE}]
     return []
@@ -84,6 +76,32 @@ def test_find_devices_falls_back_to_contains():
     devices = find_devices(client, ["3B"])
 
     assert {device["name"] for device in devices} == {"3B-7Y", "35kV#3变电站"}
+
+
+def test_find_devices_strips_voltage_prefix():
+    """用户与意图识别常带电压前缀：故障图设备名不带前缀，查询要先展开。"""
+
+    def responder(cypher: str, params: dict):
+        if "coalesce(n.名称, '') = $name" in cypher:
+            return [{"n": {**DEVICE, "名称": "银开线"}}] if params.get("name") == "银开线" else []
+        return _base_responder(cypher, params)
+
+    devices = find_devices(_FakeClient(responder), ["110kV银开线"])
+
+    assert [device["name"] for device in devices] == ["银开线"]
+
+
+def test_find_devices_expands_ordinal_name():
+    """“1号主变”要能命中故障图的 ``#1主变…`` 写法。"""
+
+    def responder(cypher: str, params: dict):
+        if "CONTAINS $kw" in cypher and params.get("label") == "设备实例":
+            return [{"n": {**DEVICE, "名称": "#1主变间隔"}}] if params.get("kw") == "#1主变" else []
+        return _base_responder(cypher, params)
+
+    devices = find_devices(_FakeClient(responder), ["1号主变"])
+
+    assert [device["name"] for device in devices] == ["#1主变间隔"]
 
 
 def test_resolve_device_type_maps_device_class_when_edge_missing():
@@ -119,32 +137,35 @@ def test_resolve_device_type_returns_none_for_unmapped_station_class():
     assert resolve_device_type(client, device) == (None, None)
 
 
-def test_collect_kg3_evidence_marks_mode_level_cause_links():
+def test_collect_kg3_evidence_reads_device_type_phenomenon_cause_chain():
+    """适配器只读 设备类型→现象→原因→触发条件/措施，不查询已移除的模式/后果。"""
+
     client = _FakeClient(_base_responder)
     device = {"id": "LGR#3b7y", "name": "3B-7Y", "type": "device", "properties": DEVICE}
     type_node = {"id": "DEV#架空线路", "name": "架空线路", "type": "device_type", "properties": {"名称": "架空线路"}}
 
     evidence = collect_kg3_evidence(client, devices=[device], device_type=type_node)
 
-    assert evidence.cause_links == "fault_mode"
-    assert [node["name"] for node in evidence.nodes_with_label("fault_mode")] == ["异物搭挂"]
+    assert evidence.cause_links == "fault_phenomenon"
+    assert evidence.nodes_with_label("fault_mode") == []
     assert [node["name"] for node in evidence.nodes_with_label("phenomenon")] == ["树木倒伏枝干压覆导线"]
     assert [node["name"] for node in evidence.nodes_with_label("cause")] == [
         "通道内树木未及时砍伐或修剪，遇大风倒伏压线"
     ]
     assert [node["name"] for node in evidence.nodes_with_label("trigger")] == ["泄漏电流超1mA"]
-    assert [node["name"] for node in evidence.nodes_with_label("consequence")] == ["相间短路"]
+    assert evidence.nodes_with_label("consequence") == []
     edge_types = {edge["type"] for edge in evidence.edges}
     assert {
         "belongs_to_device_type",
-        "has_fault_mode",
         "has_phenomenon",
         "has_cause",
         "has_trigger_condition",
         "has_measure",
-        "may_lead_to_consequence",
         "electrically_connected_to",
     } <= edge_types
+    assert "has_fault_mode" not in edge_types
+    assert "may_lead_to_consequence" not in edge_types
+    assert not any(params.get("rel") in {"具有故障模式", "可能导致"} for _, params in client.queries)
 
 
 TRANSFORMER = {"名称": "变压器", "id": "DEV#变压器"}
@@ -161,8 +182,6 @@ TR_TRIGGER = {
 
 def _type_level_responder(cypher: str, params: dict):
     rel = params.get("rel")
-    if rel == "具有故障模式":
-        return []
     if rel == "具有现象":
         if "DEV#变压器" in (params.get("ids") or []):
             return [{"a": TRANSFORMER, "rel_type": "具有现象", "b": TR_PHENOMENON}]
@@ -174,8 +193,8 @@ def _type_level_responder(cypher: str, params: dict):
     return []
 
 
-def test_collect_evidence_supports_type_level_phenomena_without_mode():
-    """新数据没有故障模式层，设备类型直接挂现象；原因按现象 id 精确过滤。"""
+def test_collect_evidence_reads_type_level_phenomena_and_causes():
+    """现象直接挂设备类型；原因按当前类型现象节点 id 精确过滤。"""
 
     client = _FakeClient(_type_level_responder)
     device = {"id": "LGR#tr", "name": "#1主变压器", "type": "device", "properties": {"名称": "#1主变压器"}}
@@ -188,6 +207,13 @@ def test_collect_evidence_supports_type_level_phenomena_without_mode():
     assert [node["name"] for node in evidence.nodes_with_label("cause")] == ["绕组匝间短路与局部放电"]
     assert [node["name"] for node in evidence.nodes_with_label("trigger")] == ["绕组局部温度超过145℃"]
     assert evidence.cause_links == "fault_phenomenon"
+    phenomenon_params = [params for _, params in client.queries if params.get("rel") == "具有现象"]
+    assert phenomenon_params[0]["ids"] == ["DEV#变压器"]
+    cause_params = [
+        params for _, params in client.queries if params.get("rel") == "具有原因" and params.get("src") == "故障现象"
+    ]
+    assert cause_params[0]["ids"] == ["PHEN-TR-SMOKE"]
+    assert OTHER_PHENOMENON["id"] not in cause_params[0]["ids"]
     cause_query = next(
         cypher
         for cypher, params in client.queries
@@ -248,8 +274,55 @@ def test_resolve_device_type_skips_edge_lookup_without_any_identifier():
     assert all(params.get("rel") != "属于" for _, params in client.queries)
 
 
+def test_resolve_device_type_prefers_device_id_over_shared_ledger():
+    """设备 id 命中类型边时忽略台账 ID：补充数据设备共用占位台账 ID，不能串到别的类型。"""
+
+    target = {
+        "id": "LGR#SUPLINEYK",
+        "name": "银开线",
+        "type": "device",
+        "properties": {"台账ID列表": "补充数据", "设备分类": "输电线路"},
+    }
+    client = _GraphFakeClient(
+        belongs_to={"LGR#SUPLINEYK": {"名称": "架空线路", "id": "DEV#架空线路"}},
+        # 同占位台账 ID 下还有别的设备；按台账 ID 等值查询会把这些类型边一起返回。
+        ledger_belongs_to={"补充数据": {"名称": "变压器", "id": "DEV#变压器"}},
+    )
+
+    name, node = resolve_device_type(client, target)
+
+    assert name == "架空线路"
+    assert node["id"] == "DEV#架空线路"
+    belongs_queries = [cypher for cypher, params in client.queries if params.get("rel") == "属于"]
+    assert len(belongs_queries) == 1
+    assert "$ledger_id" not in belongs_queries[0]
+
+
+def test_resolve_device_type_rejects_ambiguous_ledger_fallback():
+    """id 没有类型边、台账 ID 命中多个不同设备类型时无法唯一归属，不能猜一个类型。"""
+
+    class _AmbiguousLedgerClient:
+        def __init__(self) -> None:
+            self.queries: list[tuple[str, dict]] = []
+
+        def run(self, cypher: str, **params):
+            self.queries.append((cypher, params))
+            if params.get("rel") != "属于":
+                return []
+            if params.get("ledger_id") != "补充数据":
+                return []
+            return [
+                {"b": {"名称": "变压器", "id": "DEV#变压器"}},
+                {"b": {"名称": "架空线路", "id": "DEV#架空线路"}},
+            ]
+
+    device = {"id": "LGR#x", "name": "x", "type": "device", "properties": {"台账ID列表": "补充数据"}}
+
+    assert resolve_device_type(_AmbiguousLedgerClient(), device) == (None, None)
+
+
 def test_resolve_device_type_falls_back_to_ledger_id_edge():
-    """设备 id 没有类型边时仍可按台账 ID 命中，并使用稳定排序。"""
+    """设备 id 没有类型边、也没有台账分类映射时仍可按唯一台账 ID 命中。"""
 
     target = {"id": "LGR#x", "name": "x", "type": "device", "properties": {"台账ID列表": "3b7y"}}
     client = _GraphFakeClient(
@@ -261,11 +334,12 @@ def test_resolve_device_type_falls_back_to_ledger_id_edge():
 
     assert name == "架空线路"
     assert node["id"] == "DEV#架空线路"
-    belongs_queries = [cypher for cypher, params in client.queries if params.get("rel") == "属于"]
+    belongs_queries = [(cypher, params) for cypher, params in client.queries if params.get("rel") == "属于"]
+    # id 先查、台账 ID 后查：两次等值查询不能合并成一条 OR 查询，否则共享台账 ID 会串类型。
+    assert [params.get("device_id") for _cypher, params in belongs_queries] == ["LGR#x", None]
+    assert [params.get("ledger_id") for _cypher, params in belongs_queries] == [None, "3b7y"]
     # TuGraph 4.5.2 的 cypher 计划器不接受 ORDER BY coalesce(...)，排序必须在客户端做。
-    assert all("ORDER BY" not in cypher for cypher in belongs_queries)
-    # 空台账 ID 只在设备没有台账 ID 时才会被排除；这里有值，两个条件都应出现在同一条查询里。
-    assert all("$device_id" in cypher and "$ledger_id" in cypher for cypher in belongs_queries)
+    assert all("ORDER BY" not in cypher for cypher, _params in belongs_queries)
 
 
 def test_resolve_device_type_picks_smallest_name_when_server_order_is_unstable():

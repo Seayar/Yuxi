@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import html
 import os
 import re
 from collections.abc import Awaitable, Callable, Sequence
@@ -621,7 +620,12 @@ def render_srs_cards(items: Sequence[dict], source_urls: Sequence[str | None] = 
                 lines.extend([f"- **{label}**", "", str(value or "未提供"), ""])
                 continue
             lines.append(f"- **{label}**：{value if value else '未提供'}")
-        marker = _pdf_marker(source_urls[index - 1] if index <= len(source_urls) else None)
+        # 第三方测评项目暂时不需要体现PDF原文索引。
+        # todo: PDF 的 URL 现在显示 localhost，前端页面解析调用该地址会 404；后续由前台拼服务器地址，
+        # 此处只返回服务器 IP 和端口后的静态文件地址即可。
+        # todo: 此外，顾客需求需要的是PDF原文档，后续需要建立一套PDF映射静态地址
+        # marker = _pdf_marker(source_urls[index - 1] if index <= len(source_urls) else None)
+        marker = ""
         if marker:
             lines.extend([marker, ""])
         else:
@@ -743,9 +747,23 @@ def _highlight_terms(query: str) -> list[str]:
     )
 
 
+_HTML_TAG_PATTERN = re.compile(r"(<[^>]*>)")
+
+
 def _highlight(text: str, terms: list[str]) -> str:
-    escaped = html.escape(text, quote=False)
-    for term in terms:
-        escaped_term = html.escape(term, quote=False)
-        escaped = re.sub(re.escape(escaped_term), lambda match: f"<mark>{match.group(0)}</mark>", escaped)
-    return escaped
+    """只在文本段插入高亮标签，保留原文 Markdown/HTML 供前端渲染器处理。
+
+    条款正文来自 Markdown（表格、``<br>``、LaTeX）或解析出的 HTML 表格，HTML 转义会把
+    这些结构变成普通文本。这里只注入 ``<mark>``，安全性由前端 Markdown 渲染的 sanitizer
+    负责；按标签切分后只处理文本段，避免词元命中标签名或属性。
+    """
+
+    unique_terms = sorted({term for term in terms if term}, key=len, reverse=True)
+    if not unique_terms:
+        return text
+    pattern = re.compile("|".join(re.escape(term) for term in unique_terms))
+    parts = _HTML_TAG_PATTERN.split(text)
+    return "".join(
+        pattern.sub(lambda match: f"<mark>{match.group(0)}</mark>", part) if index % 2 == 0 else part
+        for index, part in enumerate(parts)
+    )

@@ -1,17 +1,19 @@
-"""工器具库存与人员数据（MinIO JSON）读取、匹配与抽样。
+"""工器具库存与人员数据（MinIO JSON）读取、班组匹配与负责人取值。
 
-两个数据源由数据团队放到 MinIO，运行时只读；接口先按“可替换的仓储”预留：
+两个数据源由数据团队放到 MinIO，运行时只读：
 
 - 工器具：默认 ``maintenance-plan/tools.json``，结构
   ``{"items":[{"name": "...", "quantity": 1}]}``；``quantity>0`` 判在库。
 - 人员：默认 ``maintenance-plan/personnel.json``，结构
-  ``{"班组":[{"班组名称": "...", "人员": ["姓名", ...]}]}``。
+  ``{"班组":[{"班组名称": "...", "责任区域": ["..."], "人员": ["姓名", ...]}]}``。
+  责任班组按设备 ``层级路径`` 节点与 ``责任区域`` 匹配（就近优先），未匹配统一为
+  ``电力巡护班组``；工作负责人取该班组 ``人员`` 数组第一个姓名。
 
 ``maintenance-plan`` 与故障溯源的 ``fault-assets`` 是平级 bucket；模块也分别由
 ``maintenance_plan`` / ``fault_trace`` 两个平级包拥有，互不嵌套。
 
 文件不存在、MinIO 不可用或字段不合法时不阻断方案生成：资源清单标注“库存数据未接入”，
-人员安排退化为岗位与人数。人员池不足所需人数时返回 ``shortage``，由工具层决定停止。
+人员安排保留责任班组与所需人数，工作负责人显示“未接入”。
 """
 
 from __future__ import annotations
@@ -19,24 +21,25 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import random
 import time
 from dataclasses import dataclass, replace
 from typing import Any
 
 from yuxi.knowledge.maintenance_plan.contracts import (
     PERSONNEL_DATA_MISSING_NOTE,
-    PERSONNEL_SHORTAGE_MESSAGE,
+    PERSONNEL_TEAM_MISSING_NOTE,
     TOOLS_DATA_MISSING_NOTE,
     DeviceCandidate,
     PersonnelAssignment,
     PersonnelRequirement,
     ResourceRequirement,
-    TeamInfo,
 )
 from yuxi.utils import logger
 
 CACHE_TTL_SECONDS = 300
+FALLBACK_TEAM_NAME = "电力巡护班组"
+LEADER_MISSING_TEXT = "未接入"
+PATH_SEPARATOR = ">"
 
 _TRUE_VALUES = frozenset({"true", "1", "是", "在库", "可用", "已入库", "正常"})
 _FALSE_VALUES = frozenset({"false", "0", "否", "不在库", "已出库", "已报废", "试验中", "停用"})
@@ -54,12 +57,12 @@ class ToolRecord:
 
 
 @dataclass(frozen=True)
-class PersonRecord:
-    """人员 JSON 中的一条记录。"""
+class TeamRecord:
+    """人员 JSON 中的一个班组：名称、责任区域与人员名单。"""
 
     name: str
-    team: str = ""
-    role: str = ""
+    areas: tuple[str, ...] = ()
+    members: tuple[str, ...] = ()
 
 
 class MaintenanceDataRepository:
@@ -67,8 +70,8 @@ class MaintenanceDataRepository:
 
     _tools: list[ToolRecord] | None = None
     _tools_loaded_at: float = 0.0
-    _personnel: list[PersonRecord] | None = None
-    _personnel_loaded_at: float = 0.0
+    _teams: list[TeamRecord] | None = None
+    _teams_loaded_at: float = 0.0
     _ledger: list[dict[str, Any]] | None = None
     _ledger_loaded_at: float = 0.0
     _lock = asyncio.Lock()
@@ -79,8 +82,8 @@ class MaintenanceDataRepository:
 
         cls._tools = None
         cls._tools_loaded_at = 0.0
-        cls._personnel = None
-        cls._personnel_loaded_at = 0.0
+        cls._teams = None
+        cls._teams_loaded_at = 0.0
         cls._ledger = None
         cls._ledger_loaded_at = 0.0
 
@@ -108,29 +111,28 @@ class MaintenanceDataRepository:
             type(self)._tools_loaded_at = time.monotonic()
             return type(self)._tools
 
-    async def load_personnel(self, *, force: bool = False) -> list[PersonRecord] | None:
-        """读取人员 JSON；未配置/读取失败返回 ``None``。"""
+    async def load_teams(self, *, force: bool = False) -> list[TeamRecord] | None:
+        """读取人员 JSON 的班组；未配置/读取失败返回 ``None``。"""
 
         if (
             not force
-            and type(self)._personnel is not None
-            and time.monotonic() - type(self)._personnel_loaded_at < CACHE_TTL_SECONDS
+            and type(self)._teams is not None
+            and time.monotonic() - type(self)._teams_loaded_at < CACHE_TTL_SECONDS
         ):
-            return type(self)._personnel
+            return type(self)._teams
         async with type(self)._lock:
             if (
                 not force
-                and type(self)._personnel is not None
-                and time.monotonic() - type(self)._personnel_loaded_at < CACHE_TTL_SECONDS
+                and type(self)._teams is not None
+                and time.monotonic() - type(self)._teams_loaded_at < CACHE_TTL_SECONDS
             ):
-                return type(self)._personnel
-            rows = await _read_person_rows(_personnel_bucket(), _personnel_object())
-            if rows is None:
+                return type(self)._teams
+            teams = await _read_teams(_personnel_bucket(), _personnel_object())
+            if teams is None:
                 return None
-            records = [_parse_person(row) for row in rows]
-            type(self)._personnel = [record for record in records if record is not None]
-            type(self)._personnel_loaded_at = time.monotonic()
-            return type(self)._personnel
+            type(self)._teams = teams
+            type(self)._teams_loaded_at = time.monotonic()
+            return type(self)._teams
 
     async def load_ledger(self, *, force: bool = False) -> list[dict[str, Any]] | None:
         """读取故障台账 ``fault-assets/ledger/devices.json``；只用于补全设备台账 ID。"""
@@ -159,7 +161,7 @@ class MaintenanceDataRepository:
             return type(self)._ledger
 
     async def resolve_ledger_ids(self, device: DeviceCandidate) -> tuple[str, ...]:
-        """补全设备台账 ID：kg4 的“补充数据”占位无法作为 Redis key 前缀时，按名称+层级回查台账。
+        """补全设备台账 ID：处置方案图的“补充数据”占位无法作为 Redis key 前缀时，按名称+层级回查台账。
 
         台账不可用或匹配不到时保留原 ID，不阻断方案；匹配结果只追加，不替换图上的真实 ID。
         """
@@ -288,43 +290,32 @@ async def _read_rows(bucket: str, object_name: str) -> list[dict[str, Any]] | No
     return [row for row in rows if isinstance(row, dict)]
 
 
-async def _read_person_rows(bucket: str, object_name: str) -> list[dict[str, Any]] | None:
-    """读取人员数据，支持 ``{"班组":[{"班组名称":...,"人员":[...]}]}`` 的分组结构。"""
+async def _read_teams(bucket: str, object_name: str) -> list[TeamRecord] | None:
+    """读取 ``{"班组":[{"班组名称":...,"责任区域":[...],"人员":[...]}]}``。"""
 
     payload = await _read_json(bucket, object_name)
     if payload is None:
         return None
-    if isinstance(payload, list):
-        return [row for row in payload if isinstance(row, dict)]
-    if not isinstance(payload, dict):
-        logger.warning(f"处置方案人员数据不是对象或数组（{bucket}/{object_name}）")
+    groups = payload.get("班组") if isinstance(payload, dict) else None
+    if not isinstance(groups, list):
+        logger.warning(f"处置方案人员数据缺少班组数组（{bucket}/{object_name}）")
         return None
 
-    groups = payload.get("班组")
-    if isinstance(groups, list):
-        rows: list[dict[str, Any]] = []
-        for group in groups:
-            if not isinstance(group, dict):
-                continue
-            team = _first_text(group, "班组名称", "名称", "班组")
-            members = _first_value(group, "人员", "成员", "members")
-            if not isinstance(members, list):
-                continue
-            for member in members:
-                if isinstance(member, str) and member.strip():
-                    rows.append({"姓名": member.strip(), "班组": team})
-                elif isinstance(member, dict):
-                    row = dict(member)
-                    if team and not _first_text(row, "班组", "所属班组"):
-                        row["班组"] = team
-                    rows.append(row)
-        return rows
-
-    rows = payload.get("data") or payload.get("items") or payload.get("人员")
-    if not isinstance(rows, list):
-        logger.warning(f"处置方案人员数据缺少可用数组（{bucket}/{object_name}）")
-        return None
-    return [row for row in rows if isinstance(row, dict)]
+    teams: list[TeamRecord] = []
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        name = _first_text(group, "班组名称")
+        if not name:
+            continue
+        teams.append(
+            TeamRecord(
+                name=name,
+                areas=_text_list(_first_value(group, "责任区域")),
+                members=_text_list(_first_value(group, "人员")),
+            )
+        )
+    return teams
 
 
 def _parse_tool(row: dict[str, Any]) -> ToolRecord | None:
@@ -349,15 +340,12 @@ def _parse_tool(row: dict[str, Any]) -> ToolRecord | None:
     )
 
 
-def _parse_person(row: dict[str, Any]) -> PersonRecord | None:
-    name = _first_text(row, "姓名", "名称", "员工姓名", "name")
-    if not name:
-        return None
-    return PersonRecord(
-        name=name,
-        team=_first_text(row, "班组", "所属班组", "team"),
-        role=_first_text(row, "岗位角色", "角色", "职务", "role"),
-    )
+def _text_list(value: Any) -> tuple[str, ...]:
+    """把 JSON 数组收敛为非空字符串元组；其他类型返回空元组。"""
+
+    if not isinstance(value, list):
+        return ()
+    return tuple(text for item in value if (text := str(item).strip() if item is not None else ""))
 
 
 def _first_value(row: dict[str, Any], *keys: str) -> Any:
@@ -448,67 +436,51 @@ def _match_tool(name: str, tools: list[ToolRecord]) -> ToolRecord | None:
     return max(contained, key=lambda record: len(record.name))
 
 
-def select_personnel(
+def assign_personnel(
     requirements: list[PersonnelRequirement],
-    personnel: list[PersonRecord] | None,
-    team: TeamInfo | None,
-    *,
-    rng: random.Random | None = None,
+    teams: list[TeamRecord] | None,
+    device_path: str,
 ) -> PersonnelAssignment:
-    """按人员需求合计人数从人员池随机抽样（不重复），优先责任班组与岗位角色。"""
+    """匹配责任班组并取首名人员为工作负责人；所需人数据人员需求合计，不抽样。"""
 
     total = sum(item.count for item in requirements if item.count > 0)
-    if total <= 0:
-        return PersonnelAssignment(total=0)
+    if teams is None:
+        return PersonnelAssignment(team=FALLBACK_TEAM_NAME, total=total, note=PERSONNEL_DATA_MISSING_NOTE)
 
-    if personnel is None or not personnel:
-        return PersonnelAssignment(total=total, note=PERSONNEL_DATA_MISSING_NOTE)
-
-    pool = list(personnel)
-    note = ""
-    if team is not None and any(record.team for record in pool):
-        team_pool = [record for record in pool if _normalize(record.team) == _normalize(team.name)]
-        if len(team_pool) >= total:
-            pool = team_pool
-        elif team_pool:
-            note = "责任班组人员不足，已从全体人员池抽取"
-
-    if len(pool) < total:
-        return PersonnelAssignment(total=total, note=PERSONNEL_SHORTAGE_MESSAGE, shortage=True)
-
-    generator = rng or random.Random()
-    remaining = list(pool)
-    # 先按岗位角色把需求合计（同一角色可能来自多个需求节点，如通用+分支），再逐角色抽样；
-    # 若逐节点写 roles，后写会覆盖前写，导致 named != total 并误杀整份合法方案。
-    per_role: dict[str, int] = {}
-    for requirement in sorted(requirements, key=lambda item: item.node_id):
-        count = max(requirement.count, 0)
-        if count:
-            per_role[requirement.role] = per_role.get(requirement.role, 0) + count
-
-    roles: dict[str, tuple[str, ...]] = {}
-    for role, count in per_role.items():
-        preferred = [record for record in remaining if _role_matches(record.role, role)]
-        take = min(count, len(preferred))
-        chosen = generator.sample(preferred, take) if take else []
-        for record in chosen:
-            remaining.remove(record)
-        if take < count:
-            extra = generator.sample(remaining, count - take)
-            chosen.extend(extra)
-            for record in extra:
-                remaining.remove(record)
-        roles[role] = tuple(record.name for record in chosen)
-
-    return PersonnelAssignment(roles=roles, total=total, note=note)
+    team = _match_team(teams, device_path) or _find_team_by_name(teams, FALLBACK_TEAM_NAME)
+    if team is None:
+        return PersonnelAssignment(team=FALLBACK_TEAM_NAME, total=total, note=PERSONNEL_TEAM_MISSING_NOTE)
+    leader = team.members[0] if team.members else ""
+    return PersonnelAssignment(
+        team=team.name,
+        leader=leader,
+        total=total,
+        note="" if leader else PERSONNEL_TEAM_MISSING_NOTE,
+    )
 
 
-def _role_matches(actual: str, wanted: str) -> bool:
-    left = _normalize(actual)
-    right = _normalize(wanted)
-    if not left or not right:
-        return False
-    return left == right or left in right or right in left
+def _match_team(teams: list[TeamRecord], device_path: str) -> TeamRecord | None:
+    """按层级路径节点由近到远匹配责任区域；同一节点按 JSON 顺序取第一个班组。"""
+
+    for node in reversed(_path_nodes(device_path)):
+        wanted = _normalize_name(node)
+        if not wanted:
+            continue
+        for team in teams:
+            if any(_normalize_name(area) == wanted for area in team.areas):
+                return team
+    return None
+
+
+def _find_team_by_name(teams: list[TeamRecord], name: str) -> TeamRecord | None:
+    wanted = _normalize_name(name)
+    return next((team for team in teams if _normalize_name(team.name) == wanted), None)
+
+
+def _path_nodes(path: str) -> list[str]:
+    """层级路径 → 节点名称，从根到设备。"""
+
+    return [part.strip() for part in str(path or "").split(PATH_SEPARATOR) if part.strip()]
 
 
 def _normalize(text: str) -> str:
@@ -516,10 +488,6 @@ def _normalize(text: str) -> str:
 
 
 def format_personnel(assignment: PersonnelAssignment) -> list[str]:
-    """把抽样结果格式化为“岗位角色：姓名、姓名”行；无名单时返回空列表。"""
+    """人员安排只输出工作负责人一行；名单缺失时显示占位。"""
 
-    lines: list[str] = []
-    for role, names in assignment.roles.items():
-        if names:
-            lines.append(f"{role}：{'、'.join(names)}")
-    return lines
+    return [f"工作负责人：{assignment.leader or LEADER_MISSING_TEXT}"]

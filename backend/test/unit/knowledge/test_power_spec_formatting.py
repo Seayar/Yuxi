@@ -286,3 +286,39 @@ def test_apply_organized_clauses_appends_pdf_marker_to_pinned_graph_card():
     first_card, second_card = result["answer_markdown"].split("### 规范卡片 2")
     assert first_card.rstrip().endswith(f"[[PDF:{graph_url}]]")
     assert second_card.rstrip().endswith(f"[[PDF:{other_url}]]")
+
+
+def test_card_body_keeps_markdown_html_and_latex_for_frontend_rendering():
+    """条款正文保持 Markdown 原文：<br>、& 和表格不能被 HTML 转义成文本。"""
+
+    body = "| 名称 | 说明 |\n|---|---|\n| 电流速断保护 | 躲本线路末端故障：<br>$I=1$ & 备注 |"
+
+    result = format_power_spec_results("电流速断保护", [_evidence(clause_body=body)])
+    card = result["items"][0]
+
+    assert "<br>" in card["clause_body"]
+    assert "& 备注" in card["clause_body"]
+    assert "&lt;br&gt;" not in card["clause_body"]
+    assert "&amp;" not in card["clause_body"]
+    assert "<mark>电流速断保护</mark>" in card["clause_body"]
+    assert "&lt;br&gt;" not in result["answer_markdown"]
+
+
+def test_highlight_does_not_insert_mark_inside_html_tags():
+    """高亮词元命中标签名或属性时，不能改写 HTML 结构。"""
+
+    body = '<table class="spec"><tr><td>数据</td></tr></table>'
+
+    result = format_power_spec_results("spec table", [_evidence(clause_body=body)])
+
+    assert result["items"][0]["clause_body"] == body
+    assert "<mark>" not in result["items"][0]["clause_body"]
+
+
+def test_apply_organized_clauses_keeps_model_body_html():
+    """模型整理出的正文同样按原文发布，由前端 Markdown 渲染器处理换行与表格。"""
+
+    result = apply_organized_clauses("巡检", [_evidence()], [_organized("doc-1#6.2.1", "第一行<br>第二行")])
+
+    assert result["items"][0]["clause_body"] == "第一行<br>第二行"
+    assert "&lt;br&gt;" not in result["answer_markdown"]

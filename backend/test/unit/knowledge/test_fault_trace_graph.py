@@ -5,7 +5,6 @@ from __future__ import annotations
 import pytest
 from yuxi.knowledge.fault_trace.graph import (
     FaultGraphEvidence,
-    collect_consequences,
     resolve_device_type,
     trace_topology_evidence,
 )
@@ -37,7 +36,6 @@ def _evidence() -> FaultGraphEvidence:
         _node("type_line", "架空线路", "device_type"),
         _node("type_station", "变电站", "device_type"),
         _node("cause", "树木倒伏压线", "cause"),
-        _node("conseq_short", "相间短路", "consequence"),
     ]
     edges = [
         _edge("dev_main", "type_line", "belongs_to_device_type"),
@@ -47,7 +45,6 @@ def _evidence() -> FaultGraphEvidence:
         _edge("dev_main", "dev_downstream", "electrically_connected_to"),
         _edge("dev_upstream", "dev_station", "supplies_power_to"),
         _edge("dev_line", "dev_upstream", "supplies_power_to"),
-        _edge("cause", "conseq_short", "may_lead_to_consequence"),
     ]
     return FaultGraphEvidence(nodes=nodes, edges=edges)
 
@@ -67,6 +64,7 @@ def test_topology_splits_electrical_edges_by_direction():
     assert topology.paths == ["35kV#3变电站 → 3B-7Y", "3B-7Y → 10kV开闭所"]
     # 供电于不入影响范围：110kV变电站只在供电链路上。
     assert "110kV变电站" not in [device["name"] for device in topology.upstream]
+    assert topology.consequences == []
 
 
 def test_topology_warns_when_no_electrical_neighbors():
@@ -81,10 +79,3 @@ def test_topology_warns_when_no_electrical_neighbors():
     assert topology.downstream == []
     assert any("上游电气连接" in warning for warning in topology.warnings)
     assert any("下游电气连接" in warning for warning in topology.warnings)
-
-
-def test_collect_consequences_deduplicates_nodes():
-    evidence = _evidence()
-    evidence.edges.append(_edge("cause", "conseq_short", "may_lead_to_consequence"))
-
-    assert collect_consequences(evidence) == [{"consequence_id": "conseq_short", "name": "相间短路"}]

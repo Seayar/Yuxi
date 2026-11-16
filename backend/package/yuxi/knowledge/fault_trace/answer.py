@@ -43,21 +43,32 @@ def build_fault_trace_payload(
     summary_text: str | None = None,
     location_reasoning: str | None = None,
     cause_measures: dict[str, list[str]] | None = None,
-    graph: str = "kg3",
+    graph: str,
+    location_phenomena: list[str] | None = None,
+    phenomenon_name: str | None = None,
+    located_override: list[CauseEvaluation] | None = None,
 ) -> dict[str, Any]:
-    """装配五段式报告与发布 Markdown；模型文本通过参数注入，失败时用模板回退。"""
+    """装配五段式报告与发布 Markdown；模型文本通过参数注入，失败时用模板回退。
 
-    located_all = located_causes(causes)
+    ``location_phenomena`` 是本次实际匹配到且已有定位原因的现象；模式级原因时由调用方
+    传入旧回退列表，未命中时传 None 由本函数回退。传入空列表表示已匹配但无成立原因，
+    用 ``—`` 展示，不再退回“全部现象”的第一行。
+    ``located_override`` 是工作流按命中现象过滤后的成立原因；缺省时从全部原因推导。
+    """
+
+    located_all = list(located_override) if located_override is not None else located_causes(causes)
     located = located_all[0] if located_all else None
     verdict = overall_verdict(causes)
     missing = missing_attributes(causes)
     location_missing = located.missing if located is not None else missing
-    phenomenon_name = _matched_phenomenon_name(reasoning_rows)
+    resolved_phenomenon = phenomenon_name or (
+        location_phenomena[0] if location_phenomena else _matched_phenomenon_name(reasoning_rows)
+    )
     measures = cause_measures or {}
     summary = {
         "text": (summary_text or "").strip() or build_summary_text(query, device, factor_phenomenon(query, None)),
         "device_names": [str(device.get("name") or "")],
-        "phenomenon": phenomenon_name,
+        "phenomenon": resolved_phenomenon,
         "image_used": image_used,
     }
     location = {
@@ -73,10 +84,20 @@ def build_fault_trace_payload(
             }
             for cause in located_all
         ],
-        "phenomena": supporting_phenomena(reasoning_rows, located_all),
+        "phenomena": (
+            list(location_phenomena)
+            if location_phenomena is not None
+            else supporting_phenomena(reasoning_rows, located_all)
+        ),
         "rule": location_rule(located),
         "reasoning": (location_reasoning or "").strip()
-        or _location_reasoning(located_all, verdict, causes, location_missing),
+        or _location_reasoning(
+            located_all,
+            verdict,
+            causes,
+            location_missing,
+            scoped=located_override is not None,
+        ),
         "evidence": _location_evidence(located, causes),
         "missing_data": location_missing,
     }
@@ -188,6 +209,7 @@ def build_fault_answer_markdown(report: dict[str, Any]) -> str:
     if impact.get("paths"):
         for path in impact["paths"]:
             lines.append(f"- 拓扑关系：{path}")
+    # 故障图谱已移除故障后果；字段保留为空以兼容旧报告，分支只在历史/自定义拓扑时生效。
     if impact.get("consequences"):
         names = "、".join(str(item.get("name") or "") for item in impact["consequences"])
         lines.append(f"- 故障后果：{names}")
@@ -314,6 +336,8 @@ def _location_reasoning(
     verdict: str,
     causes: list[CauseEvaluation],
     missing: list[str],
+    *,
+    scoped: bool = False,
 ) -> str:
     if located:
         names = "」「".join(cause.name for cause in located)
@@ -327,7 +351,7 @@ def _location_reasoning(
         detail = f"缺少实时数据：{'、'.join(missing)}。" if missing else "缺少可求值的实时判据。"
         return f"候选原因均未能判定成立或排除，{detail}"
     if not causes:
-        return "图谱未返回可判定的故障原因。"
+        return "命中的故障现象下没有可判定的原因。" if scoped else "图谱未返回可判定的故障原因。"
     return "全部候选原因的实时判据均不成立。"
 
 

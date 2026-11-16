@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 PlanIntentModelCall = Callable[[str], Awaitable[str]]
 
-# kg4 图中的设备类型名称清单由 contracts 统一拥有（归一结果必须落在其中）
+# 处置方案图中的设备类型名称清单由 contracts 统一拥有（归一结果必须落在其中）
 KG_DEVICE_TYPES = DEVICE_TYPES
 
 # ---------------------------------------------------------------------------
@@ -70,32 +70,63 @@ _LOCATION_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 # 设备名称：保留用户原话里的指称（台账名称如 3k18、#62箱变13馈出柜、991SVG开关）
-_DEVICE_NAME_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"#\s*\d+\s*箱变\s*\d*\s*(?:变压器出线柜|馈出柜|环出柜|环进柜|出线柜|进线柜|柜)?"),
-    re.compile(r"箱变\s*\d+\s*(?:变压器出线柜|馈出柜|环出柜|环进柜|出线柜|进线柜|柜)"),
-    re.compile(r"\d+\s*SVG\s*开关", re.IGNORECASE),
-    re.compile(
-        r"#\s*\d+\s*(?:主变压器|站用变压器|接地变压器|所用变压器|变压器|站用变|接地变|所用变|主变"
-        r"|断路器|隔离开关|开关柜|母线|电缆|避雷器|绝缘子)"
+# 具体设备/部件模式必须排在泛化模式之前；``_match_device_name`` 最终取最长命中，
+# 避免把“3B-6K线99#杆避雷器”截成线路名“3B-6K”、把“#1主变高压侧电流互感器”截成“#1主变”。
+# 元组第二项表示命中后是否要去掉粘在设备名前面的位置线索（只有线路/间隔这类会粘“变电站”）。
+_DEVICE_NAME_PATTERNS: tuple[tuple[re.Pattern[str], bool], ...] = (
+    (re.compile(r"#\s*\d+\s*主变(?:压器)?[^\s，。；;、]*?(?:电流互感器|电压互感器|避雷器)"), False),
+    (
+        re.compile(
+            r"(?<![0-9])\d+[A-Za-z]{1,2}\s*-\s*[A-Za-z]?\d+[A-Za-z]?\s*(?:线)?\s*\d+\s*#?\s*(?:杆|塔)?\s*"
+            r"(?:避雷器|绝缘子串|绝缘子)"
+        ),
+        False,
     ),
-    re.compile(
-        r"\d+\s*号\s*(?:主变压器|站用变压器|接地变压器|所用变压器|变压器|主变|开关柜|断路器"
-        r"|隔离开关|母线|电缆|避雷器|绝缘子|柜)"
+    (re.compile(r"[A-Za-z]{1,4}\d+[A-Za-z]?\s*相\s*(?:绝缘子串|绝缘子|避雷器)"), False),
+    (re.compile(r"\d+\s*SVG\s*(?:开关|柜)", re.IGNORECASE), False),
+    (re.compile(r"[\u4e00-\u9fa5]{2,}\s*PT\s*柜"), False),
+    (re.compile(r"\d+\s*-\s*\d+\s*(?:隔离柜|开关柜|低压柜|高压柜|PT柜)"), False),
+    (re.compile(r"\d+\s*电容器组"), False),
+    # 间隔类设备（如“岭开线进线间隔_1101”）：带下划线的台账命名必须整段取到，不能截成线路名。
+    (re.compile(r"[\u4e00-\u9fa5]{2,12}\s*间隔\s*_\s*\d+"), True),
+    (re.compile(r"[\u4e00-\u9fa5]{2,6}线(?![路])"), True),
+    (re.compile(r"#\s*\d+\s*箱变\s*\d*\s*(?:变压器出线柜|馈出柜|环出柜|环进柜|出线柜|进线柜|柜)?"), False),
+    (re.compile(r"箱变\s*\d+\s*(?:变压器出线柜|馈出柜|环出柜|环进柜|出线柜|进线柜|柜)"), False),
+    (re.compile(r"\d+\s*SVG\s*开关", re.IGNORECASE), False),
+    (
+        re.compile(
+            r"#\s*\d+\s*(?:主变压器|站用变压器|接地变压器|所用变压器|变压器|站用变|接地变|所用变|主变"
+            r"|断路器|隔离开关|开关柜|母线|电缆|避雷器|绝缘子)"
+        ),
+        False,
     ),
-    re.compile(r"[A-Za-z]{1,4}\s*\d+\s*杆塔"),
-    re.compile(r"\d+\s*#\s*杆塔"),
-    re.compile(r"#\s*\d+\s*(?:箱变|低压柜|高压柜|PT柜|开关柜)"),
-    re.compile(r"隔离_\d+"),
-    re.compile(r"\d+\s*[kKＫｋ][vV]\s*_\s*[ⅠⅡⅢⅣIV]+\s*母\s*PT\s*_\s*\d+", re.IGNORECASE),
-    re.compile(r"(?<![0-9])\d+\s*[kKＫｋ]\s*\d+"),
-    re.compile(r"(?<![0-9])\d+\s*[kKＫｋ][vV]\s*[ⅠⅡⅢⅣIV]+\s*段?\s*母线"),
-    re.compile(r"主变\s*\d+"),
-    re.compile(r"#?\s*\d+\s*主变"),
-    re.compile(r"馈线[一二三四五六七八九十百零\d]+\s*_\s*\d+"),
-    re.compile(r"(?<![0-9])\d+(?![kK][vV])[A-Za-z]{1,2}\s*-\s*[A-Za-z]?\d+[A-Za-z]?(?![A-Za-z0-9])"),
+    (
+        re.compile(
+            r"\d+\s*号\s*(?:主变压器|站用变压器|接地变压器|所用变压器|变压器|主变|开关柜|断路器"
+            r"|隔离开关|母线|电缆|避雷器|绝缘子|柜)"
+        ),
+        False,
+    ),
+    (re.compile(r"[A-Za-z]{1,4}\s*\d+\s*杆塔"), False),
+    (re.compile(r"\d+\s*#\s*杆塔"), False),
+    (re.compile(r"#\s*\d+\s*(?:箱变|低压柜|高压柜|PT柜|开关柜)"), False),
+    (re.compile(r"隔离_\d+"), False),
+    (re.compile(r"\d+\s*[kKＫｋ][vV]\s*_\s*[ⅠⅡⅢⅣIV]+\s*母\s*PT\s*_\s*\d+", re.IGNORECASE), False),
+    (re.compile(r"(?<![0-9])\d+\s*[kKＫｋ]\s*\d+"), False),
+    (re.compile(r"(?<![0-9])\d+\s*[kKＫｋ][vV]\s*[ⅠⅡⅢⅣIV]+\s*段?\s*母线"), False),
+    (re.compile(r"主变\s*\d+"), False),
+    (re.compile(r"#?\s*\d+\s*主变"), False),
+    (re.compile(r"馈线[一二三四五六七八九十百零\d]+\s*_\s*\d+"), False),
+    (re.compile(r"(?<![0-9])\d+(?![kK][vV])[A-Za-z]{1,2}\s*-\s*[A-Za-z]?\d+[A-Za-z]?(?![A-Za-z0-9])"), False),
 )
 
-# 设备类型关键词 → kg4 设备类型名称；顺序即优先级（“开关柜”优先于“断路器”，“杆塔”优先于“绝缘子”）
+# 设备名前面常粘着位置线索（“110kV变电站岭开线”），抽出后要把位置前缀去掉再当作设备名查询。
+_LOCATION_PREFIX_PATTERN = re.compile(
+    r"^(?:\d+(?:\.\d+)?\s*(?:[kKＫｋ][vVＶｖ]|千伏)\s*)?"
+    r"(?:#\s*\d+\s*)?(?:变电站|开闭所|箱变群\s*\d+\s*-\s*\d+|箱变)"
+)
+
+# 设备类型关键词 → 处置方案图设备类型名称；顺序即优先级（“开关柜”优先于“断路器”，“杆塔”优先于“绝缘子”）
 _DEVICE_TYPE_KEYWORDS: tuple[tuple[str, str], ...] = (
     ("开关柜", "开关柜"),
     ("断路器柜", "开关柜"),
@@ -113,6 +144,9 @@ _DEVICE_TYPE_KEYWORDS: tuple[tuple[str, str], ...] = (
     ("箱变", "箱式变电站"),
     ("杆塔", "杆塔"),
     ("铁塔", "杆塔"),
+    ("电压互感器", "电压互感器"),
+    ("电流互感器", "电流互感器"),
+    ("避雷器", "避雷器"),
     ("主变压器", "变压器"),
     ("主变", "变压器"),
     ("站用变", "变压器"),
@@ -123,9 +157,6 @@ _DEVICE_TYPE_KEYWORDS: tuple[tuple[str, str], ...] = (
     ("刀闸", "隔离开关"),
     ("断路器", "断路器"),
     ("开关", "断路器"),
-    ("电压互感器", "电压互感器"),
-    ("电流互感器", "电流互感器"),
-    ("避雷器", "避雷器"),
     ("熔断器", "熔断器"),
     ("电容器", "电容器"),
     ("电抗器", "电抗器"),
@@ -243,17 +274,28 @@ def _match_maintenance_level(text: str) -> str | None:
 
 
 def _match_device_name(text: str) -> str | None:
-    """抽取用户原话中的设备指称（如 3k18、991SVG开关、#62箱变13馈出柜）。"""
+    """抽取用户原话中的设备指称（如 3k18、991SVG柜、#62箱变13馈出柜）；取最长命中。"""
 
-    for pattern in _DEVICE_NAME_PATTERNS:
+    matches = []
+    for pattern, strip_location in _DEVICE_NAME_PATTERNS:
         match = pattern.search(text)
-        if match:
-            return _squeeze(match.group(0))
-    return None
+        if not match:
+            continue
+        squeezed = _squeeze(match.group(0))
+        matches.append(_strip_location_prefix(squeezed) if strip_location else squeezed)
+    matches = [item for item in matches if item]
+    return max(matches, key=len) if matches else None
+
+
+def _strip_location_prefix(name: str) -> str:
+    """去掉设备名前面粘着的位置线索；去掉后为空说明整段本身就是位置，保留原值。"""
+
+    stripped = _LOCATION_PREFIX_PATTERN.sub("", name).strip()
+    return stripped or name
 
 
 def _match_device_type(text: str) -> str | None:
-    """按关键词把口语设备类型归一到 kg4 设备类型名称。"""
+    """按关键词把口语设备类型归一到处置方案图设备类型名称。"""
 
     if not text:
         return None
@@ -285,7 +327,7 @@ def _squeeze(text: str) -> str:
 
 
 def normalize_device_type(raw: str | None) -> str | None:
-    """把口语设备类型归一到 kg4 的设备类型名称。
+    """把口语设备类型归一到处置方案图的设备类型名称。
 
     例：主变/站用变/接地变→变压器；箱变→箱式变电站；开关/断路器→断路器（但“开关柜”→开关柜）；
     刀闸→隔离开关；PT→电压互感器；CT→电流互感器；集电线路/配电线路/输电线路/线路→架空线路。

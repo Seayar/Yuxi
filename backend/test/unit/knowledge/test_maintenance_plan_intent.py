@@ -107,6 +107,27 @@ def test_ledger_repair_991svg_switch():
     assert query.voltage_level == "35kV"
 
 
+def test_kiosk_number_is_kept_as_location_not_device_name():
+    """“#1开闭所”没有更具体的设备指称时是位置线索，由检索按名称精确取回该设备。"""
+
+    query = rule_extract("#1开闭所检修，需确定监护与人员配置的方案。")
+
+    assert query.device_name is None
+    assert query.device_type == "开闭所"
+    assert query.location_hint == "#1开闭所"
+
+
+def test_interval_device_name_keeps_full_ledger_name():
+    """“岭开线进线间隔_1101”不能被截成线路名“变电站岭开线”。"""
+
+    query = rule_extract("110kV变电站岭开线进线间隔_1101 隔离开关触头氧化、轻微烧蚀，需处理方案")
+
+    assert query.device_name == "岭开线进线间隔_1101"
+    assert query.device_type == "隔离开关"
+    assert query.location_hint is None
+    assert query.voltage_level == "110kV"
+
+
 def test_ledger_patrol_box_substation_feeder_cabinet():
     query = rule_extract("#62箱变13馈出柜巡视")
 
@@ -607,6 +628,13 @@ def test_rule_extract_matches_real_ledger_device_names():
         ("馈线八_922 柜体锈蚀五防失效整柜更换", "馈线八_922"),
         ("10kVⅠ段母线A4同室并列检修方案", "10kVⅠ段母线"),
         ("处理主变1温度异常", "主变1"),
+        ("3B-6K线99#杆避雷器更换", "3B-6K线99#杆避雷器"),
+        ("#1主变高压侧电流互感器膨胀器更换", "#1主变高压侧电流互感器"),
+        ("991SVG柜检修", "991SVG柜"),
+        ("柴发PT柜更换熔断器", "柴发PT柜"),
+        ("910-1隔离柜触头检查", "910-1隔离柜"),
+        ("BN91A相绝缘子串更换", "BN91A相绝缘子串"),
+        ("971电容器组更换", "971电容器组"),
     ]
     for text, expected in cases:
         assert rule_extract(text).device_name == expected, text

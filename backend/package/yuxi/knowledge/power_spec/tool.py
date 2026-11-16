@@ -15,6 +15,7 @@ from yuxi.agents.toolkits.registry import tool
 from yuxi.knowledge.power_spec.answer import build_subagent_caller, produce_power_spec_answer
 from yuxi.knowledge.power_spec.contracts import (
     INTENT_ATTEMPTS_EXHAUSTED_MESSAGE,
+    INTENT_CANCELLED_MESSAGE,
     KNOWLEDGE_BASE_NOT_READY_MESSAGE,
     NO_EVIDENCE_MESSAGE,
     OUT_OF_SCOPE_MESSAGE,
@@ -54,6 +55,7 @@ from yuxi.knowledge.runtime import knowledge_base
 from yuxi.repositories.power_spec_repository import PowerSpecRepository
 from yuxi.storage.postgres.manager import pg_manager
 from yuxi.utils import logger
+from yuxi.utils.question_utils import is_question_cancel
 
 
 POWER_SPEC_RETRIEVAL_OPTIONS = {
@@ -148,11 +150,12 @@ async def search_power_spec(
         )
         query = await _confirm_intent_with_user(query_text, context=context)
         if isinstance(query, str):
+            error_code = "intent_cancelled" if query == INTENT_CANCELLED_MESSAGE else "intent_attempts_exhausted"
             emitter.emit(
                 "parse_query",
                 "failed",
                 content=query,
-                error={"code": "intent_attempts_exhausted", "message": query},
+                error={"code": error_code, "message": query},
             )
             return query
     emitter.emit(
@@ -740,8 +743,13 @@ async def _confirm_intent_with_user(query_text: str, *, context: Any) -> PowerSp
         )
         intent_plan = build_intent_plan(query)
         intent_plan["attempt"] = attempt
+        if feedback:
+            # 重新识别的卡片要显示上一轮补充，用户才能确认输入已被采用。
+            intent_plan["correction"] = feedback
         answer = interrupt(build_confirmation_payload(intent_plan))
         decision, correction = parse_intent_confirmation(answer)
+        if decision == "cancel":
+            return INTENT_CANCELLED_MESSAGE
         if decision == "confirm":
             # 用户确认即最终检索条件：卡片把计划整体随选项值带回，直接用它检索。
             # 不拿模型重算结果做一致性校验——用户已在卡片上确认，模型识别偏差由用户修正流程处理。
@@ -750,7 +758,10 @@ async def _confirm_intent_with_user(query_text: str, *, context: Any) -> PowerSp
                 return query_from_confirmed_plan(confirmed_plan, fallback=query)
             return query
         if decision == "invalid" or not correction:
-            correction = extract_correction_text(interrupt(build_correction_payload(intent_plan)))
+            correction_answer = interrupt(build_correction_payload(intent_plan))
+            if is_question_cancel(correction_answer):
+                return INTENT_CANCELLED_MESSAGE
+            correction = extract_correction_text(correction_answer)
         if not correction:
             return INTENT_ATTEMPTS_EXHAUSTED_MESSAGE
         previous = query

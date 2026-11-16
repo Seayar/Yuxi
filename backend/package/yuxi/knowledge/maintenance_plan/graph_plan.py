@@ -1,9 +1,9 @@
-"""kg4 图检索：定位设备实例与检修作业场景，并收集场景下的四类证据。
+"""处置方案图检索：定位设备实例与检修作业场景，并收集场景下的四类证据。
 
 本模块只做“读图 + 打分 + 过滤”，不做任何自然语言生成。``search_devices`` 在 ``设备实例``
 中按名称/层级路径召回，并用 ``属于`` 边补全设备类型；``find_scenes`` 读取
 ``设备类型 -[包含作业]-> 检修作业场景``；``collect_scene_evidence`` 收集步骤、安全措施、
-资源需求、人员需求与责任班组，供装配模块确定性实例化。
+资源需求与人员需求，供装配模块确定性实例化。
 
 TuGraph 4.5.2 实测限制：一条语句最多一个 MATCH，多跳必须拆成多条语句在 Python 侧拼接；
 中文标签/关系/属性直接写裸标识符，不加反引号；所有查询都带 LIMIT。
@@ -12,6 +12,7 @@ TuGraph 4.5.2 实测限制：一条语句最多一个 MATCH，多跳必须拆成
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
@@ -23,7 +24,6 @@ from yuxi.knowledge.maintenance_plan.contracts import (
     DEVICE_NAME_PROPS,
     LABEL_DEVICE,
     LABEL_DEVICE_TYPE,
-    LABEL_ORG,
     LABEL_PERSONNEL,
     LABEL_RESOURCE,
     LABEL_SAFETY,
@@ -34,7 +34,6 @@ from yuxi.knowledge.maintenance_plan.contracts import (
     REL_HAS_SCENE,
     REL_HAS_STEP,
     REL_LOCATED_IN,
-    REL_MANAGES,
     REL_NEEDS_PERSONNEL,
     REL_NEEDS_RESOURCE,
     REL_NEEDS_SAFETY,
@@ -47,7 +46,6 @@ from yuxi.knowledge.maintenance_plan.contracts import (
     Scenario,
     ScenarioEvidence,
     Step,
-    TeamInfo,
 )
 
 # 单条语句的召回上限
@@ -64,6 +62,10 @@ PATH_CONTAINS_SCORE = 30.0
 LOCATION_HIT_SCORE = 30.0
 DEVICE_TYPE_MATCH_SCORE = 20.0
 VOLTAGE_MATCH_SCORE = 10.0
+# 用户原文包含设备全名时优先选最长全名，修正“3B-6K线99#杆避雷器”被截成线路名等歧义。
+# 文本命中不叠加名称精确分：短名往往同时命中“精确相等”和“原文包含”，叠加后反而压过完整名称。
+TEXT_NAME_SCORE = 120.0
+TEXT_NAME_LENGTH_WEIGHT = 10.0
 
 VOLTAGE_PATTERN = re.compile(r"(?P<value>\d+(?:\.\d+)?)\s*[kK][vV]")
 
@@ -95,7 +97,7 @@ def search_devices(
     """按设备名称/位置线索/设备类型在 ``设备实例`` 中召回，并用 ``属于`` 边补全类型。
 
     - 关键词来自 ``device_name``（含“1号→#1/1#”的同义展开）与 ``location_hint``；
-    - 只保留有 ``属于`` 设备类型边的设备（kg4 中区域/监测节点没有类型边）；
+    - 只保留有 ``属于`` 设备类型边的设备（处置方案图中区域/监测节点没有类型边）；
     - 候选不唯一时由调用方发中断让用户选择。
     """
 
@@ -106,6 +108,11 @@ def search_devices(
     for keyword in [*keywords, location_hint]:
         if keyword:
             records.extend(_query_devices_by_keyword(client, keyword=keyword))
+    # 位置线索（“#1开闭所”）本身可能就是一个设备；它同时命中其下所有设备的层级路径，
+    # 只靠关键词查询会被 200 行上限挤掉，必须再按名称精确取一次。
+    for exact_name in (_clean(query.device_name), location_hint):
+        if exact_name:
+            records.extend(_query_devices_by_exact_name(client, name=exact_name))
     if not keywords and not location_hint and query.device_type:
         records.extend(_query_devices_by_device_type(client, device_type=query.device_type))
 
@@ -143,11 +150,23 @@ def _build_candidate(props: dict[str, Any], *, query: PlanQuery, keywords: list[
     name = _device_name(props)
     path = str(props.get("层级路径") or "")
     score = _name_score(name, path, keywords)
+    # 用户点名的设备（名称或位置线索）就是目标本身，不能被“其下设备”的路径命中分盖过。
+    # 有设备名时只认设备名：位置线索只是“在哪儿”，不能反客为主当目标。
+    exact_names = {value for value in (_clean(query.device_name),) if value}
+    if not exact_names:
+        exact_names = {value for value in (_clean(query.location_hint),) if value}
+    if name and name in exact_names:
+        score = max(score, NAME_EXACT_SCORE)
     if not keywords and query.device_type:
-        score = 1.0
+        score = max(score, 1.0)
     location_hint = _clean(query.location_hint)
     if location_hint and location_hint in path:
         score += LOCATION_HIT_SCORE
+
+    normalized_name = _normalize_device_match_text(name)
+    if normalized_name and normalized_name in _normalize_device_match_text(query.raw_text):
+        text_score = TEXT_NAME_SCORE + min(len(normalized_name), 30) * TEXT_NAME_LENGTH_WEIGHT
+        score = max(score, text_score)
 
     voltage_level = _clean(props.get("电压等级"))
     if query.voltage_level and voltage_level == query.voltage_level:
@@ -312,7 +331,7 @@ def collect_scene_evidence(
     scenario: Scenario,
     branch: BranchSelection | None,
 ) -> ScenarioEvidence:
-    """收集场景下的步骤、安全措施、资源需求、人员需求与责任班组。
+    """收集场景下的步骤、安全措施、资源需求与人员需求。
 
     过滤规则：``是否通用=是`` 或 ``适用分支值=当前分支``；其他组合只记 warning，不纳入。
     步骤与分支无关，按 ``步骤序号`` 排序。
@@ -338,9 +357,7 @@ def collect_scene_evidence(
         f"（{scenario.level or '未标注等级'}，分支维度：{scenario.branch_dimension or '无'}）"
     )
     if branch is not None:
-        log.append(
-            f"分支判定：{branch.dimension} = {branch.condition}（{branch.branch}，来源：{_branch_source_text(branch)}）"
-        )
+        log.append(f"分支判定：{branch.dimension} = {branch.condition}（{branch.branch}，来源：{branch.source}）")
     else:
         log.append("该场景没有分支判定维度，仅输出通用内容")
 
@@ -384,12 +401,6 @@ def collect_scene_evidence(
     common_count = sum(item.count for item in personnel if item.common)
     log.append(f"人员需求：通用 {common_count} 人，当前分支 {total - common_count} 人，合计 {total} 人")
 
-    evidence.team = _find_team(client, ancestors=ancestors)
-    if evidence.team is None:
-        log.append("未检索到该设备或上级区域的管辖班组")
-    else:
-        log.append(f"沿层级向上在“{evidence.team.managed_area}”找到责任班组“{evidence.team.name}”")
-
     return evidence
 
 
@@ -415,12 +426,6 @@ def _select_items(
     return selected
 
 
-def _branch_source_text(branch: BranchSelection) -> str:
-    if branch.source == "user":
-        return "用户确认"
-    return "Redis"
-
-
 # ---------------------------------------------------------------------------
 # 查询语句（一条语句一个 MATCH；中文标签/属性不加反引号；用户输入只走参数）
 # ---------------------------------------------------------------------------
@@ -439,6 +444,19 @@ def _query_devices_by_keyword(client: TuGraphClient, *, keyword: str) -> list[di
         f"MATCH (n) WHERE labels(n)[0] = $label AND ({conditions}) RETURN n LIMIT $node_limit",
         label=LABEL_DEVICE,
         kw=keyword,
+        node_limit=KG_QUERY_LIMIT,
+    )
+
+
+def _query_devices_by_exact_name(client: TuGraphClient, *, name: str) -> list[dict[str, Any]]:
+    """按设备名称精确召回：位置线索指向的设备本身。"""
+
+    props = DEVICE_NAME_PROPS
+    conditions = " OR ".join(f"coalesce(n.{prop}, '') = $name" for prop in props)
+    return client.run(
+        f"MATCH (n) WHERE labels(n)[0] = $label AND ({conditions}) RETURN n LIMIT $node_limit",
+        label=LABEL_DEVICE,
+        name=name,
         node_limit=KG_QUERY_LIMIT,
     )
 
@@ -512,38 +530,6 @@ def _query_children(client: TuGraphClient, scene_id: str, relation: str, target_
         scene_id=scene_id,
         node_limit=KG_QUERY_LIMIT,
     )
-
-
-def _find_team(client: TuGraphClient, *, ancestors: list[str]) -> TeamInfo | None:
-    """沿 ancestors 由近到远找第一个被班组管辖的区域节点。"""
-
-    if not ancestors:
-        return None
-    records = client.run(
-        "MATCH (a)-[r]->(b) WHERE labels(a)[0] = $src AND labels(b)[0] = $dst "
-        "AND type(r) = $rel AND coalesce(a.组织类型, '') = '班组' "
-        "AND " + _in_condition("b", "名称", "area_names") + " "
-        "RETURN a, b LIMIT $node_limit",
-        src=LABEL_ORG,
-        dst=LABEL_DEVICE,
-        rel=REL_MANAGES,
-        area_names=ancestors,
-        node_limit=KG_QUERY_LIMIT,
-    )
-    teams_by_area: dict[str, TeamInfo] = {}
-    for record in records:
-        area = _device_name(record.get("b") or {})
-        org = record.get("a") or {}
-        if area and area not in teams_by_area:
-            teams_by_area[area] = TeamInfo(
-                name=_clean(org.get("名称")) or "",
-                managed_area=area,
-                source_note=_clean(org.get("来源")) or "",
-            )
-    for area in ancestors:
-        if area in teams_by_area:
-            return teams_by_area[area]
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -640,7 +626,7 @@ def _resolve_voltage_level(parents: list[dict[str, Any]], ancestors: list[str]) 
 
 
 def plan_graph_ready(client: TuGraphClient) -> bool:
-    """探测 kg4 图是否可用。"""
+    """探测处置方案图是否可用。"""
 
     try:
         client.run("RETURN 1")
@@ -667,6 +653,12 @@ def _dedup(items: Iterable[Any]) -> list[str]:
             seen.add(text)
             result.append(text)
     return result
+
+
+def _normalize_device_match_text(value: Any) -> str:
+    """全角转半角、去空白、忽略大小写，用于判断设备全名是否出现在用户原文。"""
+
+    return "".join(unicodedata.normalize("NFKC", str(value or "")).split()).casefold()
 
 
 def _clean(value: Any) -> str | None:

@@ -4,22 +4,18 @@
 （``graph_plan``）、分支判定（``branch``）、外部数据（``sources``）与方案装配
 （``answer``）各自拥有模块，跨模块流动的数据形状统一由 ``contracts`` 拥有。
 
-三类引导选择都走 LangGraph ``interrupt``（载荷沿用 Yuxi 既有选择卡片格式
-``source + questions[]``）：设备候选不唯一时选设备，场景候选不唯一或并列时选场景，
-Redis 分支缺失或非法时让用户确认分支。
-分支判定优先读 Redis；Redis 未配置/无 key/值非法时降级为让用户确认分支，
-保证外部数据未接入时仍能生成单一分支的完整方案。``interrupt`` 会让工具从头重放，
-因此中断之前的步骤必须确定性且不产生副作用（不写图、不写外部日志）。
-所有同步图查询一律放到 ``asyncio.to_thread`` 执行。
+设备/场景两类引导选择走 LangGraph ``interrupt``（载荷沿用 Yuxi 既有选择卡片格式
+``source + questions[]``）：设备候选不唯一时选设备，场景候选不唯一或并列时选场景。
+分支只从 Redis 读取；未配置、无 key、读取失败或值非法时返回固定失败文案，不让人工选择，
+也不默认任何分支。``interrupt`` 会让工具从头重放，因此中断之前的步骤必须确定性且不产生
+副作用（不写图、不写外部日志）。所有同步图查询一律放到 ``asyncio.to_thread`` 执行。
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
-import re
 import time
-import unicodedata
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from typing import Any
@@ -35,12 +31,7 @@ from yuxi.config.options import fault_trace_opts
 from yuxi.knowledge.maintenance_plan.answer import produce_maintenance_plan_answer
 from yuxi.knowledge.maintenance_plan.branch import lookup_branch
 from yuxi.knowledge.maintenance_plan.contracts import (
-    BRANCH_1,
-    BRANCH_2,
-    BRANCH_CHOICE_QUESTION,
-    BRANCH_CHOICE_SOURCE,
-    BRANCH_QUESTION_ID,
-    BRANCH_VALUES,
+    BRANCH_UNRESOLVED_MESSAGE,
     CHOICE_ABORTED_MESSAGE,
     CLARIFY_ALL_MESSAGE,
     DEVICE_CHOICE_QUESTION,
@@ -54,7 +45,6 @@ from yuxi.knowledge.maintenance_plan.contracts import (
     NO_DEVICE_MESSAGE,
     NO_PERMISSION_MESSAGE,
     NO_SCENE_MESSAGE,
-    PERSONNEL_SHORTAGE_MESSAGE,
     PLAN_GRAPH_NOT_CONFIGURED_MESSAGE,
     PLAN_VERIFICATION_FAILED_MESSAGE,
     SCENE_CHOICE_QUESTION,
@@ -69,7 +59,7 @@ from yuxi.knowledge.maintenance_plan.intent import extract_plan_intent
 from yuxi.knowledge.maintenance_plan.sources import (
     MaintenanceDataRepository,
     annotate_resources,
-    select_personnel,
+    assign_personnel,
 )
 from yuxi.utils import logger
 
@@ -117,11 +107,11 @@ class MaintenancePlanInput(BaseModel):
     args_schema=MaintenancePlanInput,
 )
 async def generate_maintenance_plan(query_text: str, runtime: ToolRuntime = None) -> dict[str, Any] | str:
-    """根据运维任务从 kg4 图检索设备、检修作业场景与四类证据，确定性装配处置方案。
+    """根据运维任务从配置的处置方案图检索设备、检修作业场景与四类证据，确定性装配处置方案。
 
-    图谱数据来自 TuGraph ``kg4`` 图（管理员配置 ``fault_trace_opts`` 的
-    ``maintenance_plan_graph``，默认 kg4）；分支优先读故障溯源 Redis 的
-    ``{台账ID}:{分支判定维度}``，未接入时让用户确认；工器具/人员数据从 MinIO 读取，
+    图谱数据来自管理员配置的 TuGraph 处置方案图（``fault_trace_opts`` 的
+    ``maintenance_plan_graph``，默认图名由配置默认值决定）；分支只读故障溯源 Redis 的
+    ``{台账ID}:{分支判定维度}``，读不到时返回固定失败文案；工器具/人员数据从 MinIO 读取，
     未接入时在方案中如实标注。
     """
 
@@ -205,7 +195,7 @@ async def generate_maintenance_plan(query_text: str, runtime: ToolRuntime = None
         repository = MaintenanceDataRepository()
         ledger_ids = await repository.resolve_ledger_ids(device)
         branch_device = replace(device, ledger_ids=ledger_ids) if ledger_ids != device.ledger_ids else device
-        branch = await _resolve_branch(branch_device, scene, rounds, emitter=emitter)
+        branch = await _resolve_branch(branch_device, scene)
         if isinstance(branch, str):
             emitter.emit(
                 "retrieve_graph",
@@ -261,16 +251,8 @@ async def generate_maintenance_plan(query_text: str, runtime: ToolRuntime = None
     emitter.emit("assemble_plan", "started", content="正在按执行分支组装方案模板。")
     tools = await repository.load_tools()
     evidence.resources, tools_note = annotate_resources(evidence.resources, tools)
-    personnel = await repository.load_personnel()
-    assignment = select_personnel(evidence.personnel, personnel, evidence.team)
-    if assignment.shortage:
-        emitter.emit(
-            "assemble_plan",
-            "failed",
-            content=PERSONNEL_SHORTAGE_MESSAGE,
-            error={"code": "personnel_shortage", "message": PERSONNEL_SHORTAGE_MESSAGE},
-        )
-        return _remember(context, cache_key, PERSONNEL_SHORTAGE_MESSAGE)
+    personnel = await repository.load_teams()
+    assignment = assign_personnel(evidence.personnel, personnel, evidence.device.path)
     emitter.emit(
         "assemble_plan",
         "completed",
@@ -348,7 +330,7 @@ async def _locate_device(
     rounds: list[int],
     emitter: ThinkingEmitter,
 ) -> tuple[PlanQuery, DeviceCandidate] | str:
-    """检索设备；候选不唯一时引导用户选择，用户补充文字后带上上一轮结果重新检索。"""
+    """检索设备并由用户确认；用户补充文字后带上上一轮结果重新检索。"""
 
     while True:
         candidates = await asyncio.to_thread(_graph_plan().search_devices, client, query)
@@ -367,15 +349,14 @@ async def _locate_device(
 def _pick_device(
     candidates: list[DeviceCandidate], query: PlanQuery, rounds: list[int], *, emitter: ThinkingEmitter
 ) -> DeviceCandidate | str | None:
-    """从候选中定设备：唯一候选、或唯一最高分且名称与用户说法一致时直接采用。"""
+    """每次都由用户确认目标设备，唯一候选或名称正好命中也不自动采用。
 
-    if len(candidates) == 1:
-        return candidates[0]
+    图谱里存在同名/同前缀设备，自动确认一旦选错，后续场景、分支和人员都会按错误设备生成，
+    用户很难从结果里发现。卡片允许用户改选候选或自行填写设备名。
+    """
 
-    top = candidates[0]
-    wanted = _normalize_name(query.device_name)
-    if wanted and top.score > candidates[1].score and _normalize_name(top.name) == wanted:
-        return top
+    if not candidates:
+        return None
 
     emitter.emit(
         "retrieve_graph",
@@ -397,7 +378,11 @@ def _pick_device(
 
 
 def _device_payload(query: PlanQuery, candidates: list[DeviceCandidate]) -> dict[str, Any]:
-    """设备选择卡片：展示前 MAX_DEVICE_CANDIDATES 个候选，value 用设备 id 便于回填。"""
+    """设备选择卡片：展示前 MAX_DEVICE_CANDIDATES 个候选，value 用设备 id 便于回填。
+
+    选项 label 只放设备名/类型/电压，层级路径作为 description 供同名设备区分，避免把
+    “目标设备”显示成一长串路径。
+    """
 
     return {
         "source": DEVICE_CHOICE_SOURCE,
@@ -406,7 +391,7 @@ def _device_payload(query: PlanQuery, candidates: list[DeviceCandidate]) -> dict
                 "question_id": DEVICE_QUESTION_ID,
                 "question": DEVICE_CHOICE_QUESTION,
                 "options": [
-                    {"label": candidate.label(), "value": candidate.device_id}
+                    {"label": candidate.label(), "value": candidate.device_id, "description": candidate.location()}
                     for candidate in candidates[:MAX_DEVICE_CANDIDATES]
                 ],
                 "multi_select": False,
@@ -473,88 +458,32 @@ def _scene_payload(query: PlanQuery, scenes: list[Scenario]) -> dict[str, Any]:
     }
 
 
-async def _resolve_branch(
-    device: DeviceCandidate, scenario: Scenario, rounds: list[int], *, emitter: ThinkingEmitter
-) -> BranchSelection | None | str:
-    """分支判定：优先 Redis；未接入/无值/非法时让用户确认分支。"""
+async def _resolve_branch(device: DeviceCandidate, scenario: Scenario) -> BranchSelection | None | str:
+    """分支判定：只读 Redis；未接入/无值/非法时返回固定失败文案，不默认分支。"""
 
     if not scenario.branch_dimension or not scenario.branch1_condition or not scenario.branch2_condition:
         return None
 
-    while True:
-        lookup = await lookup_branch(device, scenario)
-        if lookup.state == "ok":
-            return BranchSelection(
-                dimension=scenario.branch_dimension,
-                condition=lookup.value,
-                branch=lookup.branch,
-                source="redis",
-                ledger_id=lookup.ledger_id,
-            )
-        if lookup.state == "not_required":
-            return None
-        if lookup.reason:
-            logger.info(f"分支判定未命中 Redis（{lookup.state}）：{lookup.reason}")
-
-        emitter.emit(
-            "retrieve_graph",
-            "waiting",
-            content=f"等待用户确认分支条件“{scenario.branch_dimension}”。",
-            data={"source": BRANCH_CHOICE_SOURCE, "lookup_state": lookup.state},
-        )
-        answer = _ask_choice(_branch_payload(scenario, lookup.state), BRANCH_QUESTION_ID, rounds)
-        if answer is None:
-            return CHOICE_ABORTED_MESSAGE
-        selected, free_text = answer
-        branch = _branch_from_answer(selected, free_text, scenario)
-        if branch is not None:
-            return branch
-
-
-def _branch_from_answer(selected: str | None, free_text: str | None, scenario: Scenario) -> BranchSelection | None:
-    """把用户选择/自由文字收敛到 分支1/分支2 与对应条件。"""
-
-    if selected in BRANCH_VALUES:
-        condition = scenario.branch1_condition if selected == BRANCH_1 else scenario.branch2_condition
+    lookup = await lookup_branch(device, scenario)
+    if lookup.state == "ok":
         return BranchSelection(
             dimension=scenario.branch_dimension,
-            condition=condition,
-            branch=selected,
-            source="user",
+            condition=lookup.value,
+            branch=lookup.branch,
+            source="redis",
+            ledger_id=lookup.ledger_id,
         )
-
-    text = _normalize_name(free_text or selected)
-    if not text:
+    if lookup.state == "not_required":
         return None
-    first = _normalize_name(scenario.branch1_condition)
-    second = _normalize_name(scenario.branch2_condition)
-    if text == first:
-        return BranchSelection(scenario.branch_dimension, scenario.branch1_condition, BRANCH_1, source="user")
-    if text == second:
-        return BranchSelection(scenario.branch_dimension, scenario.branch2_condition, BRANCH_2, source="user")
-    return None
-
-
-def _branch_payload(scenario: Scenario, state: str) -> dict[str, Any]:
-    """分支选择卡片：两个分支条件各一个选项，允许自由输入条件原文。"""
-
-    reason = "未读取到分支判定值" if state != "invalid" else "分支判定值不匹配"
-    return {
-        "source": BRANCH_CHOICE_SOURCE,
-        "questions": [
-            {
-                "question_id": BRANCH_QUESTION_ID,
-                "question": f"{BRANCH_CHOICE_QUESTION}{scenario.branch_dimension}（{reason}）",
-                "options": [
-                    {"label": f"{scenario.branch1_condition}（分支1）", "value": BRANCH_1},
-                    {"label": f"{scenario.branch2_condition}（分支2）", "value": BRANCH_2},
-                ],
-                "multi_select": False,
-                "allow_other": True,
-            }
-        ],
-        "query": {"scene_id": scenario.scene_id, "scene_name": scenario.name},
-    }
+    logger.warning(
+        "分支判定未命中 Redis：设备=%s 台账ID=%s 维度=%s 状态=%s 原因=%s",
+        device.name,
+        device.ledger_ids,
+        scenario.branch_dimension,
+        lookup.state,
+        lookup.reason,
+    )
+    return BRANCH_UNRESOLVED_MESSAGE
 
 
 def _parse_choice(value: Any, question_id: str) -> tuple[str | None, str | None]:
@@ -598,19 +527,11 @@ def _is_other(text: str) -> bool:
     return text.strip().lower() in OTHER_VALUES
 
 
-def _normalize_name(value: str | None) -> str:
-    """规范化比较文本：全角转半角、去空白、忽略大小写。"""
-
-    if not value:
-        return ""
-    return re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(value))).casefold()
-
-
 # ---------------------------------------------------------------------------
 # 配置、模型调用与缓存
 # ---------------------------------------------------------------------------
 async def _resolve_kg_config() -> TuGraphConfig | None:
-    """读取管理员配置的 TuGraph 连接；处置方案图默认 kg4，关键字段缺失时返回 None。"""
+    """读取管理员配置的 TuGraph 连接；处置方案图默认图名由配置决定，关键字段缺失时返回 None。"""
 
     try:
         resolved = await fault_trace_opts.get()
@@ -618,7 +539,7 @@ async def _resolve_kg_config() -> TuGraphConfig | None:
         logger.warning(f"读取处置方案知识图谱配置失败: {exc}")
         return None
     uri = str(resolved.get("server_url") or "").strip()
-    graph = str(resolved.get("maintenance_plan_graph") or os.getenv("MAINTENANCE_PLAN_GRAPH") or "kg4").strip()
+    graph = str(resolved.get("maintenance_plan_graph") or os.getenv("MAINTENANCE_PLAN_GRAPH") or "kg5").strip()
     username = str(resolved.get("username") or "").strip()
     password = str(resolved.get("password") or "").strip()
     if not uri or not graph:

@@ -1,7 +1,7 @@
 """设备预测维护报告的确定性装配、Markdown 渲染与内容校验。
 
 报告四个部分的字段全部来自两处外部事实：健康评估/故障预测服务返回的业务字段，以及
-``kg5`` 中按预测故障类型匹配到的维护知识；装配不发明数值。唯一由大模型生成的内容是
+设备预测维护图中按预测故障类型匹配到的维护知识；装配不发明数值。唯一由大模型生成的内容是
 “状态解读”，它必须在给定数值范围内说话——生成文本里出现的数字必须能在健康评估结果里
 找到，否则退回按评分、等级与指标确定性拼出的解读句。
 
@@ -299,9 +299,9 @@ def build_report_markdown(report: PredictionReport) -> str:
     lines = [
         f"# {report.title}",
         "",
-        f"- 目标设备：{report.device_label}",
-        f"- 设备 ID（内部编号，用于对接预测服务）：{report.device_id}",
-        "",
+        # f"- 目标设备：{report.device_label}",
+        # f"- 设备 ID（内部编号，用于对接预测服务）：{report.device_id}",
+        # "",
         "## 一、设备健康评估",
         "",
         f"- 健康评分：{report.health_score} 分",
@@ -326,18 +326,11 @@ def build_report_markdown(report: PredictionReport) -> str:
         "",
         "## 四、维护计划建议",
         "",
-        f"- 维护时机：{report.maintenance_time}",
-        f"- 匹配故障现象：{report.matched_phenomenon or '未匹配'}",
-        "",
-        "所需资源：",
-        "",
     ]
-    lines += _list_block(report.resources, empty_text="（知识图谱中未匹配到该故障现象的所需资源）")
-    lines += ["", "注意事项：", ""]
-    lines += _list_block(report.cautions, empty_text="（知识图谱中未匹配到该故障现象的注意事项）")
+    lines += _maintenance_table(report)
 
     if report.data_notes:
-        lines += ["", "## 五、数据说明", ""]
+        lines += ["## 五、数据说明", ""]
         lines += [f"- {note}" for note in report.data_notes]
         lines.append("")
 
@@ -364,20 +357,33 @@ def _indicator_table(indicators: list[dict[str, str]]) -> list[str]:
     return rows
 
 
+def _maintenance_table(report: PredictionReport) -> list[str]:
+    """维护计划建议表格：维护时机、匹配故障现象、所需资源与注意事项各占一行。"""
+
+    cells = [
+        ("维护时机", report.maintenance_time),
+        ("匹配故障现象", report.matched_phenomenon or "未匹配"),
+        ("所需资源", _numbered_cell(report.resources, empty_text="（知识图谱中未匹配到该故障现象的所需资源）")),
+        ("注意事项", _numbered_cell(report.cautions, empty_text="（知识图谱中未匹配到该故障现象的注意事项）")),
+    ]
+    rows = [f"| {key} | {_escape_cell(value)} |" for key, value in cells]
+    return ["| 项目 | 内容 |", "|---|---|", *rows, ""]
+
+
+def _numbered_cell(items: list[str], *, empty_text: str) -> str:
+    """单元格内的有序条目：条目自带编号时保留原编号，多条之间用换行分隔。"""
+
+    if not items:
+        return empty_text
+    return "<br>".join(
+        item if NUMBERED_ITEM_PATTERN.match(item) else f"{index}. {item}" for index, item in enumerate(items, start=1)
+    )
+
+
 def _escape_cell(value: str) -> str:
     """表格单元格转义：竖线会破坏 Markdown 表格。"""
 
     return str(value or "").replace("|", "\\|")
-
-
-def _list_block(items: list[str], *, empty_text: str) -> list[str]:
-    """有序列表块；条目自带编号时保留原编号，没有内容时给一句缺省说明。"""
-
-    if not items:
-        return [empty_text]
-    return [
-        item if NUMBERED_ITEM_PATTERN.match(item) else f"{index}. {item}" for index, item in enumerate(items, start=1)
-    ]
 
 
 def build_thinking(evidence: PredictionEvidence, *, elapsed_seconds: float) -> str:

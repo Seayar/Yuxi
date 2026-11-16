@@ -4,6 +4,10 @@
 类型：feature
 Owner：backend/package/yuxi/knowledge/maintenance_plan/tool.py
 
+> 现状：2026-11-13 起处置方案默认读取 TuGraph `kg5`（场景 schema 与 kg4 相同），见[故障溯源与处置方案统一读取 kg5](./2026-11-13-unify-knowledge-graph-kg5.md)；2026-11-16 起分支读不到不再让用户确认，改为固定失败文案，见[处置方案分支不再人工选择，并修正设备意图抽取](./2026-11-16-maintenance-plan-no-branch-popup-and-device-intent.md)。本文保留 kg4 迁移的决策背景。
+>
+> 责任班组与人员安排：2026-11-13 起改为按人员 JSON 的 `责任区域` 匹配设备层级路径，方案只显示责任班组、所需人数与工作负责人，见[处置方案责任班组改为按人员 JSON 责任区域匹配](./2026-11-13-maintenance-plan-team-from-personnel-region.md)；本文第 4、5 条及后果中的人员抽样与“人员数据不足”描述已被取代。
+
 ## 问题
 
 处置方案生成原先读 TuGraph `kg3` 的 `作业模板`，按任务类型（更换/检修/试验/巡视）装配六段式方案。现场已把处置方案知识迁到 `kg4`：设备实例经 `属于` 关联设备类型，设备类型经 `包含作业` 关联检修作业场景；场景自身带 `分支判定维度/分支1条件/分支2条件`，步骤与分支无关，安全措施、资源需求、人员需求按 `是否通用` 与 `适用分支值` 取当前分支内容。旧链路在 kg4 上取不到设备类型（kg4 无 `Scheme1标签`），也查不到 `作业模板`，只能返回“暂无作业规程”。
@@ -16,7 +20,7 @@ Owner：backend/package/yuxi/knowledge/maintenance_plan/tool.py
 4. **装配**：步骤按 `步骤序号` 排序，输出 `序号+操作内容`；安全措施输出 `名称+具体内容`；资源按 `数量>0` 输出名称+数量+单位、`数量=0` 输出名称+数量要求，并附库存标记；人员按 `岗位角色` 分组求和，从人员池随机抽样。四段内容加设备/场景/分支头，不再保留 kg3 的停电范围、安全距离、验收标准。
 5. **外部数据**：工器具与人员 JSON 从 MinIO 的 `maintenance-plan` bucket 读取（与 `fault-assets` 平级，默认 `tools.json` / `personnel.json`，可用 `MAINTENANCE_PLAN_*_BUCKET/OBJECT` 覆盖）。读取失败不阻断方案：资源标注“库存数据未接入”，人员只输出岗位与人数；人员池不足时返回固定“人员数据不足”文案。
 6. **校验与发布**：`verify_report` 校验分支值、四段条目与证据一致、人员名单数量与合计一致、报告数字能在证据中找到；工具侧与 `chat_service` 发布门仍只发布 `answer_verified is True` 的载荷。
-7. **kg3 资产**：`seed.py`/`preflight.py`/`data/` 保留为 kg3 历史导入资产，不再是处置方案运行时路径；其标签/关系常量移到 `seed.py` 自己拥有，`contracts` 只拥有 kg4 运行时 schema。
+7. **kg3 资产**：`seed.py`/`preflight.py`/`data/` 保留为 kg3 历史导入资产，不再是处置方案运行时路径；其标签/关系常量移到 `seed.py` 自己拥有，`contracts` 只拥有 kg4 运行时 schema。位置见[处置方案 kg3 导入资产移出运行时包](./2026-11-13-move-kg3-import-out-of-runtime-package.md)。
 8. **思考过程**：`contracts` 为 `maintenance-plan-agent` 注册四步（解析任务需求、检索知识图谱、组装方案模板、生成标准化方案）；工具用 `ThinkingEmitter` 在对应阶段发射 `started/completed/failed/waiting` 事件，并在结果载荷附带 `thinking_steps` 快照。设备/场景/分支等待用户选择时标记 `waiting`，校验失败或数据不足标记 `failed`。
 
 ## 替代方案
@@ -65,5 +69,5 @@ docker compose exec api uv run ruff check package
 
 ## 相关决策
 
-- [处置方案智能体](./2026-10-16-maintenance-plan-agent.md)：本记录取代该记录的 kg3 作业模板六段式运行时；kg3 的 seed/preflight/data 保留为历史导入资产。
+- [处置方案智能体](./2026-10-16-maintenance-plan-agent.md)：本记录取代该记录的 kg3 作业模板六段式运行时；kg3 的 seed/preflight/data 保留为历史导入资产（`backend/scripts/legacy_kg3_seed/`）。
 - [故障图谱迁移到 kg3 并移除公开故障路由](./2026-10-28-fault-trace-kg3-and-route-removal.md)：故障溯源仍使用 kg3；自本记录起处置方案使用 kg4，两者共用 TuGraph 连接配置、图名分离。

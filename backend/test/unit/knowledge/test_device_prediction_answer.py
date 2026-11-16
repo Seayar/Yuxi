@@ -125,9 +125,10 @@ def test_verified_report_covers_all_required_fields():
     assert "发生概率：67%" in markdown
     assert "预计发生时间：未来 30–60 天" in markdown
     assert "| 绕组温度 | 85 | ℃ | 30% | -8 分 |" in markdown
-    assert "匹配故障现象：触头过热" in markdown
-    assert "1. 红外热像仪" in markdown
-    assert "1. 停电范围提前报备" in markdown
+    assert "| 维护时机 | 建议在 30 天内完成针对性检查维护 |" in markdown
+    assert "| 匹配故障现象 | 触头过热 |" in markdown
+    assert "| 所需资源 | 1. 红外热像仪 |" in markdown
+    assert "| 注意事项 | 1. 停电范围提前报备 |" in markdown
     assert "维护内容" not in markdown
 
 
@@ -153,7 +154,7 @@ def test_missing_optional_parts_are_marked_not_invented():
     assert MAINTENANCE_TIME_DERIVED_NOTE in report["data_notes"]
     assert guidance.notes[0] in report["data_notes"]
     assert "- 故障率：未返回" in payload["answer_markdown"]
-    assert "- 匹配故障现象：未匹配" in payload["answer_markdown"]
+    assert "| 匹配故障现象 | 未匹配 |" in payload["answer_markdown"]
     assert "（知识图谱中未匹配到该故障现象的所需资源）" in payload["answer_markdown"]
     assert "（知识图谱中未匹配到该故障现象的注意事项）" in payload["answer_markdown"]
 
@@ -191,8 +192,28 @@ def test_numbered_items_are_not_double_numbered():
     markdown = payload["answer_markdown"]
 
     assert "1. 1. " not in markdown
-    assert "\n1. 先复核整基倾斜。\n2. 办理工作票。" in markdown
-    assert "- 匹配故障现象：杆塔倾斜故障" in markdown
+    assert "| 注意事项 | 1. 先复核整基倾斜。<br>2. 办理工作票。 |" in markdown
+    assert "| 匹配故障现象 | 杆塔倾斜故障 |" in markdown
+
+
+def test_maintenance_plan_is_a_two_column_table():
+    """维护计划建议以「项目/内容」表格渲染，资源与注意事项在单元格内逐条换行。"""
+
+    guidance = MaintenanceGuidance(
+        fault_type="触头过热",
+        resources=["红外热像仪", "滤油机（备用）"],
+        cautions=["停电范围提前报备", "避开午后 14:00–16:00 高温时段"],
+    )
+
+    markdown = _payload(_evidence(guidance=guidance))["answer_markdown"]
+    section = markdown.split("## 四、维护计划建议")[1].split("## 五、数据说明")[0]
+
+    assert "| 项目 | 内容 |" in section
+    assert "| 维护时机 | 建议在 30 天内完成针对性检查维护 |" in section
+    assert "| 匹配故障现象 | 触头过热 |" in section
+    assert "| 所需资源 | 1. 红外热像仪<br>2. 滤油机（备用） |" in section
+    assert "| 注意事项 | 1. 停电范围提前报备<br>2. 避开午后 14:00–16:00 高温时段 |" in section
+    assert "所需资源：" not in section
 
 
 # ---------------------------------------------------------------------------

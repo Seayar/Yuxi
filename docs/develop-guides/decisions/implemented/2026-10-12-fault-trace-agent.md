@@ -4,7 +4,7 @@
 类型：feature
 Owner：backend/package/yuxi/knowledge/fault_trace/tool.py
 
-> 现状：2026-10-27 起运行时使用 TuGraph `kg3` + Redis 实时判据 + 五段式报告，`kg`、`kg2` 已废弃；当前机制见[故障溯源](../../../mechanisms/fault-trace.md)；本文保留首次交付的决策背景。`POST /api/fault/images` 与 `GET /api/fault/health` 均已移除，上传图片由故障溯源智能体从会话状态读取并调用 YOLO。
+> 现状：2026-10-27 起运行时使用 TuGraph 故障图 + Redis 实时判据 + 五段式报告；2026-11-13 起故障图默认切换为 `kg5`，见[故障溯源与处置方案统一读取 kg5](./2026-11-13-unify-knowledge-graph-kg5.md)。`kg`、`kg2` 已废弃；当前机制见[故障溯源](../../../mechanisms/fault-trace.md)；本文保留首次交付的决策背景。`POST /api/fault/images` 与 `GET /api/fault/health` 均已移除，上传图片由故障溯源智能体从会话状态读取并调用 YOLO。
 
 ## 问题
 

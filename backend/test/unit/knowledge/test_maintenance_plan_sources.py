@@ -1,28 +1,28 @@
-"""工器具库存与人员抽样单元测试（不连接 MinIO）。"""
+"""工器具库存、人员班组匹配与台账补全单元测试（不连接 MinIO）。"""
 
 from __future__ import annotations
 
 import asyncio
-import random
 
+from yuxi.knowledge.maintenance_plan import sources as sources_module
 from yuxi.knowledge.maintenance_plan.contracts import (
     PERSONNEL_DATA_MISSING_NOTE,
+    PERSONNEL_TEAM_MISSING_NOTE,
     DeviceCandidate,
     PersonnelRequirement,
     ResourceRequirement,
-    TeamInfo,
 )
-from yuxi.knowledge.maintenance_plan import sources as sources_module
 from yuxi.knowledge.maintenance_plan.sources import (
+    LEADER_MISSING_TEXT,
     MaintenanceDataRepository,
-    PersonRecord,
+    TeamRecord,
     ToolRecord,
     _match_ledger_row,
     _parse_tool,
-    _read_person_rows,
+    _read_teams,
     annotate_resources,
+    assign_personnel,
     format_personnel,
-    select_personnel,
 )
 
 
@@ -57,48 +57,120 @@ def test_annotate_resources_without_data_keeps_items_and_adds_note():
     assert "未接入" in note
 
 
-def test_select_personnel_prefers_team_and_roles():
-    personnel = [
-        PersonRecord("张三", "1号班组", "工作负责人"),
-        PersonRecord("李四", "1号班组", "检修工"),
-        PersonRecord("王五", "1号班组", "检修工"),
-        PersonRecord("赵六", "2号班组", "检修工"),
-    ]
+TEAMS = [
+    TeamRecord("1号站监控调度班组", ("35kV#1变电站",), ("王伟", "任敏")),
+    TeamRecord("电力巡护班组", ("岭开线",), ("曹世杰", "黄洪飞")),
+]
+
+
+def test_assign_personnel_matches_nearest_path_node():
     requirements = [
-        PersonnelRequirement("P1", "工作负责人", 1, common=True),
-        PersonnelRequirement("P2", "检修工", 2, common=True),
+        PersonnelRequirement("P1", "工作负责人", 1),
+        PersonnelRequirement("P2", "检修工", 3),
     ]
 
-    assignment = select_personnel(
-        requirements, personnel, TeamInfo("1号班组", "#3开闭所"), rng=random.Random(0)
+    assignment = assign_personnel(requirements, TEAMS, "变电设施 > 35kV#1变电站 > 10kV电压等级区域 > 主变1")
+
+    assert assignment.team == "1号站监控调度班组"
+    assert assignment.leader == "王伟"
+    assert assignment.total == 4
+    assert assignment.note == ""
+
+
+def test_assign_personnel_prefers_deeper_path_node():
+    """多个责任区域都能匹配时，取层级路径上更近的节点对应班组。"""
+
+    teams = [
+        TeamRecord("根区域班组", ("变电设施",), ("甲",)),
+        TeamRecord("1号站监控调度班组", ("35kV#1变电站",), ("王伟",)),
+    ]
+
+    assignment = assign_personnel([], teams, "变电设施 > 35kV#1变电站 > 主变1")
+
+    assert assignment.team == "1号站监控调度班组"
+    assert assignment.leader == "王伟"
+
+
+def test_assign_personnel_falls_back_to_patrol_team():
+    assignment = assign_personnel(
+        [PersonnelRequirement("P1", "检修工", 2)], TEAMS, "变电设施 > 35kV#9变电站 > 未知设备"
     )
 
-    assert assignment.total == 3
-    assert assignment.shortage is False
-    names = [name for group in assignment.roles.values() for name in group]
-    assert "赵六" not in names
-    assert assignment.roles["工作负责人"] == ("张三",)
-
-
-def test_select_personnel_shortage_returns_explicit_flag():
-    personnel = [PersonRecord("张三", "1号班组", "检修工")]
-    requirements = [PersonnelRequirement("P1", "检修工", 5, common=True)]
-
-    assignment = select_personnel(requirements, personnel, TeamInfo("1号班组", "#3开闭所"))
-
-    assert assignment.shortage is True
-    assert assignment.total == 5
-
-
-def test_select_personnel_without_data_returns_requirement_only():
-    requirements = [PersonnelRequirement("P1", "检修工", 2, common=True)]
-
-    assignment = select_personnel(requirements, None, None)
-
+    assert assignment.team == "电力巡护班组"
+    assert assignment.leader == "曹世杰"
     assert assignment.total == 2
-    assert assignment.shortage is False
+    assert assignment.note == ""
+
+
+def test_assign_personnel_keeps_requirement_total_for_small_team():
+    """班组人数小于所需人数时不再报“人员数据不足”，所需人数仍按人员需求合计。"""
+
+    assignment = assign_personnel(
+        [PersonnelRequirement("P1", "检修工", 16)], TEAMS, "变电设施 > 35kV#1变电站 > 主变1"
+    )
+
+    assert assignment.total == 16
+    assert assignment.leader == "王伟"
+    assert assignment.note == ""
+
+
+def test_assign_personnel_without_minio_data_returns_fallback_team():
+    assignment = assign_personnel(
+        [PersonnelRequirement("P1", "检修工", 2)], None, "变电设施 > 35kV#1变电站 > 主变1"
+    )
+
+    assert assignment.team == "电力巡护班组"
+    assert assignment.leader == ""
+    assert assignment.total == 2
     assert assignment.note == PERSONNEL_DATA_MISSING_NOTE
-    assert format_personnel(assignment) == []
+    assert format_personnel(assignment) == [f"工作负责人：{LEADER_MISSING_TEXT}"]
+
+
+def test_assign_personnel_without_usable_members_marks_note():
+    teams = [TeamRecord("1号站监控调度班组", ("35kV#1变电站",), ())]
+
+    assignment = assign_personnel(
+        [PersonnelRequirement("P1", "检修工", 4)], teams, "变电设施 > 35kV#1变电站 > 主变1"
+    )
+
+    assert assignment.team == "1号站监控调度班组"
+    assert assignment.leader == ""
+    assert assignment.note == PERSONNEL_TEAM_MISSING_NOTE
+    assert format_personnel(assignment) == [f"工作负责人：{LEADER_MISSING_TEXT}"]
+
+
+def test_assign_personnel_falls_back_when_patrol_team_absent():
+    teams = [TeamRecord("1号站监控调度班组", ("35kV#1变电站",), ("王伟",))]
+
+    assignment = assign_personnel([], teams, "变电设施 > 35kV#9变电站 > 未知设备")
+
+    assert assignment.team == "电力巡护班组"
+    assert assignment.leader == ""
+    assert assignment.note == PERSONNEL_TEAM_MISSING_NOTE
+
+
+def test_read_teams_parses_region_and_members(monkeypatch):
+    async def fake_read_json(bucket, object_name):
+        return {
+            "班组": [
+                {"班组名称": "1号站监控调度班组", "责任区域": ["35kV#1变电站"], "人员": ["王伟", "任敏"]},
+                {"班组名称": "", "责任区域": [], "人员": []},
+            ]
+        }
+
+    monkeypatch.setattr(sources_module, "_read_json", fake_read_json)
+    teams = asyncio.run(_read_teams("b", "o"))
+
+    assert teams == [TeamRecord("1号站监控调度班组", ("35kV#1变电站",), ("王伟", "任敏"))]
+
+
+def test_read_teams_rejects_payload_without_team_array(monkeypatch):
+    async def fake_read_json(bucket, object_name):
+        return {"data": [{"姓名": "张三"}]}
+
+    monkeypatch.setattr(sources_module, "_read_json", fake_read_json)
+
+    assert asyncio.run(_read_teams("b", "o")) is None
 
 
 def test_default_buckets_are_peers_of_fault_assets(monkeypatch):
@@ -124,25 +196,6 @@ def test_parse_tool_uses_quantity_as_stock_flag():
     assert available is not None and available.in_stock is True
     assert unavailable is not None and unavailable.in_stock is False
     assert explicit is not None and explicit.in_stock is True
-
-
-def test_read_person_rows_flattens_team_groups(monkeypatch):
-    async def fake_read_json(bucket, object_name):
-        return {
-            "班组": [
-                {"班组名称": "1号班组", "人员": ["张三", "李四"]},
-                {"班组名称": "2号班组", "人员": [{"姓名": "王五"}]},
-            ]
-        }
-
-    monkeypatch.setattr(sources_module, "_read_json", fake_read_json)
-    rows = asyncio.run(_read_person_rows("b", "o"))
-
-    assert rows == [
-        {"姓名": "张三", "班组": "1号班组"},
-        {"姓名": "李四", "班组": "1号班组"},
-        {"姓名": "王五", "班组": "2号班组"},
-    ]
 
 
 LEDGER_ROWS = [
@@ -191,20 +244,3 @@ def test_resolve_ledger_ids_keeps_real_ids_without_loading_ledger():
     ids = asyncio.run(repository.resolve_ledger_ids(device))
 
     assert ids == ("real-id",)
-
-
-def test_select_personnel_aggregates_same_role_across_requirement_nodes():
-    """同一岗位角色来自多个需求节点（通用+分支）时先合计再抽样，不允许后写覆盖前写。"""
-
-    requirements = [
-        PersonnelRequirement("P1", "检修工", 2, common=True),
-        PersonnelRequirement("P2", "检修工", 1, common=False, applicable_branch="分支1"),
-    ]
-    pool = [PersonRecord(f"员工{i}", "1号班组", "检修工") for i in range(1, 6)]
-
-    assignment = select_personnel(requirements, pool, None, rng=random.Random(7))
-
-    assert assignment.total == 3
-    assert len(assignment.roles) == 1
-    assert len(assignment.roles["检修工"]) == 3
-    assert sum(len(names) for names in assignment.roles.values()) == assignment.total

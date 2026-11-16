@@ -1,19 +1,21 @@
-"""TuGraph ``kg3`` 故障图谱适配器。
+"""TuGraph 故障图谱适配器。
 
-按冻结的 kg3 schema 读取设备、设备类型、故障模式、故障现象、故障原因、触发条件、
-处置措施、故障后果与电气拓扑，映射为 ``FaultGraphEvidence``（内部英文类型）。
+按故障图谱 schema 读取设备、设备类型、故障现象、故障原因、触发条件、处置措施与电气拓扑，
+映射为 ``FaultGraphEvidence``（内部英文类型）。故障模式与故障后果已从图谱移除；运行时只走
+``设备类型 -[具有现象]-> 故障现象 -[具有原因]-> 故障原因``，每个设备类型拥有自己的现象节点。
 读接口只执行单条只读 MATCH；标签/关系名来自 ``contracts`` 白名单，变量全部参数化。
+运行时图名由管理员配置决定，不在适配器内写死。
 """
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from yuxi.knowledge.fault_trace.contracts import (
     DEVICE_CLASS_TO_TYPE,
     ENTITY_CAUSE,
     ENTITY_DEVICE,
-    ENTITY_FAULT_MODE,
     ENTITY_PHENOMENON,
     KG_DEVICE_LABEL,
     KG_DEVICE_NAME_PROPS,
@@ -29,93 +31,152 @@ QUERY_LIMIT = 200
 
 
 def find_devices(client: Any, names: list[str]) -> list[dict[str, Any]]:
-    """按名称精确匹配设备实例；没有精确命中时退回包含匹配。"""
+    """按名称精确匹配设备实例；没有精确命中时退回包含匹配。
+
+    用户与意图识别经常带电压等级前缀（``110kV银开线``）或序号口语写法（``1号主变``），
+    故障图设备名是不带前缀的 ``银开线`` / ``#1主变…``，因此每个名称先展开成等价的
+    查询写法，再执行精确/包含匹配。
+    """
 
     evidence = FaultGraphEvidence()
+    lookup_names = list(dict.fromkeys(item for name in names for item in _device_lookup_names(name)))
+
     exact: list[dict[str, Any]] = []
-    for name in names:
-        clean = str(name or "").strip()
-        if not clean:
-            continue
+    for name in lookup_names:
         records = client.run(
             "MATCH (n) WHERE labels(n)[0] = $label AND coalesce(n.名称, '') = $name RETURN n LIMIT $node_limit",
             label=KG_DEVICE_LABEL,
-            name=clean,
+            name=name,
             node_limit=QUERY_LIMIT,
         )
         exact.extend(_add_nodes(evidence, records, "n", KG_DEVICE_LABEL))
     if exact:
         return _dedupe(exact)
+
     contains: list[dict[str, Any]] = []
-    for name in names:
-        clean = str(name or "").strip()
-        if not clean:
-            continue
+    for name in lookup_names:
         records = client.run(
             "MATCH (n) WHERE labels(n)[0] = $label "
             "AND (coalesce(n.名称, '') CONTAINS $kw OR coalesce(n.显示名, '') CONTAINS $kw) "
             "RETURN n LIMIT $node_limit",
             label=KG_DEVICE_LABEL,
-            kw=clean,
+            kw=name,
             node_limit=QUERY_LIMIT,
         )
         contains.extend(_add_nodes(evidence, records, "n", KG_DEVICE_LABEL))
     return _dedupe(contains)
 
 
+# 电压等级前缀：用户常写“110kV银开线”，故障图设备名是“银开线”。
+_VOLTAGE_PREFIX_PATTERN = re.compile(r"^\s*\d+(?:\.\d+)?\s*(?:[kK][vV]|千伏)\s*")
+# 序号口语写法：“1号主变”对应故障图的“#1主变…/1#主变…/1主变…”。
+_ORDINAL_NAME_PATTERN = re.compile(r"^\s*(?P<number>\d+)\s*号\s*(?P<rest>\S.*)$")
+
+
+def _device_lookup_names(name: str) -> list[str]:
+    """把一个设备名称展开成故障图里可能使用的查询写法。"""
+
+    clean = str(name or "").strip()
+    if not clean:
+        return []
+    candidates = [clean]
+    without_voltage = _VOLTAGE_PREFIX_PATTERN.sub("", clean).strip()
+    if without_voltage and without_voltage != clean:
+        candidates.append(without_voltage)
+    for base in list(candidates):
+        match = _ORDINAL_NAME_PATTERN.match(base)
+        if match:
+            number = match.group("number")
+            rest = match.group("rest").strip()
+            candidates.extend((f"#{number}{rest}", f"{number}#{rest}", f"{number}{rest}"))
+    return list(dict.fromkeys(item for item in candidates if item))
+
+
 def resolve_device_type(client: Any, device: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
-    """解析设备类型：优先 ``属于`` 边，其次台账分类映射；无法确定时返回 (None, None)。"""
+    """解析设备类型：设备 id 的 ``属于`` 边 → 台账分类映射 → 台账 ID 的 ``属于`` 边。
+
+    台账 ID 放最后，因为补充数据设备共用占位台账 ID（例如“补充数据”）：按台账 ID 等值
+    查询会同时命中其它设备的类型边，任何一个结果都不能证明属于当前设备，因此只有唯一
+    类型时才采用。无法唯一确定时返回 ``(None, None)``，由调用方按 device_type_missing 处理。
+    """
 
     device_evidence = FaultGraphEvidence(nodes=[device], edges=[])
-    device_id = str(device.get("id") or "")
-    ledger_id = str((device.get("properties") or {}).get("台账ID列表") or "")
-    # 空值不能参与等值匹配：``coalesce(缺失, '') = ''`` 会命中所有缺该属性的设备，
-    # 把别的设备的类型串到当前设备上。
-    matchers: list[str] = []
-    if device_id:
-        matchers.append("coalesce(a.id, '') = $device_id")
-    if ledger_id:
-        matchers.append("coalesce(a.台账ID列表, '') = $ledger_id")
-    if matchers:
-        records = client.run(
-            "MATCH (a)-[r]->(b) WHERE type(r) = $rel AND labels(a)[0] = $src AND labels(b)[0] = $dst "
-            f"AND ({' OR '.join(matchers)}) "
-            "RETURN b LIMIT $node_limit",
-            rel="属于",
-            src=KG_DEVICE_LABEL,
-            dst=KG_DEVICE_TYPE_LABEL,
-            device_id=device_id,
-            ledger_id=ledger_id,
-            node_limit=QUERY_LIMIT,
-        )
-        type_nodes = _add_nodes(device_evidence, records, "b", KG_DEVICE_TYPE_LABEL)
-        if type_nodes:
-            # 排序在客户端完成：TuGraph 4.5.2 的 cypher 计划器不接受 ``ORDER BY coalesce(...)``
-            # （CypherException），而返回顺序本身不稳定。按名称、id 排序保证首项确定。
-            first = min(type_nodes, key=lambda node: (str(node.get("name") or ""), str(node.get("id") or "")))
-            return str(first.get("name") or "") or None, first
-
     properties = device.get("properties") or {}
+    device_id = str(device.get("id") or "")
+    ledger_id = str(properties.get("台账ID列表") or "")
+
+    if device_id:
+        type_nodes = _belongs_to_types(
+            client,
+            device_evidence,
+            condition="coalesce(a.id, '') = $device_id",
+            device_id=device_id,
+        )
+        if type_nodes:
+            return _first_type(type_nodes)
+
     device_class = str(properties.get("设备分类") or properties.get("台账分类") or "").strip()
     if device_class in UNMAPPED_STATION_CLASSES:
         return None, None
     mapped = DEVICE_CLASS_TO_TYPE.get(device_class)
-    if not mapped:
-        return None, None
-    records = client.run(
-        "MATCH (t) WHERE labels(t)[0] = $label AND coalesce(t.名称, '') = $name RETURN t LIMIT $node_limit",
-        label=KG_DEVICE_TYPE_LABEL,
-        name=mapped,
-        node_limit=QUERY_LIMIT,
-    )
-    type_nodes = _add_nodes(device_evidence, records, "t", KG_DEVICE_TYPE_LABEL)
-    if type_nodes:
-        return str(type_nodes[0].get("name") or "") or None, type_nodes[0]
+    if mapped:
+        records = client.run(
+            "MATCH (t) WHERE labels(t)[0] = $label AND coalesce(t.名称, '') = $name RETURN t LIMIT $node_limit",
+            label=KG_DEVICE_TYPE_LABEL,
+            name=mapped,
+            node_limit=QUERY_LIMIT,
+        )
+        type_nodes = _add_nodes(device_evidence, records, "t", KG_DEVICE_TYPE_LABEL)
+        if type_nodes:
+            return _first_type(type_nodes)
+
+    if ledger_id:
+        type_nodes = _belongs_to_types(
+            client,
+            device_evidence,
+            condition="coalesce(a.台账ID列表, '') = $ledger_id",
+            ledger_id=ledger_id,
+        )
+        if len({str(node.get("name") or "") for node in type_nodes}) == 1:
+            return _first_type(type_nodes)
     return None, None
 
 
+def _belongs_to_types(
+    client: Any,
+    evidence: FaultGraphEvidence,
+    *,
+    condition: str,
+    **params: Any,
+) -> list[dict[str, Any]]:
+    """按给定等值条件读取设备 ``属于`` 的设备类型节点。"""
+
+    records = client.run(
+        "MATCH (a)-[r]->(b) WHERE type(r) = $rel AND labels(a)[0] = $src AND labels(b)[0] = $dst "
+        f"AND {condition} "
+        "RETURN b LIMIT $node_limit",
+        rel="属于",
+        src=KG_DEVICE_LABEL,
+        dst=KG_DEVICE_TYPE_LABEL,
+        node_limit=QUERY_LIMIT,
+        **params,
+    )
+    return _add_nodes(evidence, records, "b", KG_DEVICE_TYPE_LABEL)
+
+
+def _first_type(type_nodes: list[dict[str, Any]]) -> tuple[str | None, dict[str, Any] | None]:
+    """在一组类型节点中取名称/id 最小的一个。
+
+    TuGraph 4.5.2 的 cypher 计划器不接受 ``ORDER BY coalesce(...)``，返回顺序本身也不稳定，
+    排序只能在客户端完成。
+    """
+
+    first = min(type_nodes, key=lambda node: (str(node.get("name") or ""), str(node.get("id") or "")))
+    return str(first.get("name") or "") or None, first
+
+
 def device_ancestors(client: Any, device: dict[str, Any]) -> list[str]:
-    """取设备在 kg3 里的上级设备名称（``位于`` 边），用于同名设备消歧。"""
+    """取设备在故障图里的上级设备名称（``位于`` 边），用于同名设备消歧。"""
 
     device_id = str(device.get("id") or "")
     if not device_id:
@@ -140,7 +201,7 @@ def collect_kg3_evidence(
     devices: list[dict[str, Any]],
     device_type: dict[str, Any] | None,
 ) -> FaultGraphEvidence:
-    """采集因果链、触发条件、处置措施、故障后果与电气拓扑。"""
+    """采集因果链、触发条件、处置措施与电气拓扑。"""
 
     evidence = FaultGraphEvidence()
     device_ids: list[str] = []
@@ -169,82 +230,43 @@ def collect_kg3_evidence(
                     }
                 )
 
-    mode_ids, mode_names = _collect_modes(client, evidence, type_ids=type_ids, type_names=type_names)
     phenomenon_ids, phenomenon_names = _collect_phenomena(
         client,
         evidence,
-        mode_ids=mode_ids,
-        mode_names=mode_names,
         type_ids=type_ids,
         type_names=type_names,
     )
-
     cause_ids, cause_names = _collect_causes(
         client,
         evidence,
         phenomenon_ids=phenomenon_ids,
         phenomenon_names=phenomenon_names,
-        mode_ids=mode_ids,
-        mode_names=mode_names,
     )
     _collect_triggers(client, evidence, cause_ids=cause_ids, cause_names=cause_names)
     _collect_measures(client, evidence, cause_ids=cause_ids, cause_names=cause_names)
-    _collect_consequences(client, evidence, cause_ids=cause_ids, cause_names=cause_names)
     _collect_topology(client, evidence, device_ids=device_ids)
     _collect_device_types(client, evidence)
     return evidence
-
-
-def _collect_modes(
-    client: Any,
-    evidence: FaultGraphEvidence,
-    *,
-    type_ids: list[str],
-    type_names: list[str],
-) -> tuple[list[str], list[str]]:
-    edges = _query_related(
-        client,
-        source_label=KG_DEVICE_TYPE_LABEL,
-        relation="具有故障模式",
-        target_label="故障模式",
-        source_ids=type_ids,
-        source_names=type_names,
-    )
-    _add_edges(evidence, edges, KG_DEVICE_TYPE_LABEL, "故障模式")
-    modes = evidence.nodes_with_label(ENTITY_FAULT_MODE)
-    return [str(node["id"]) for node in modes], [str(node["name"]) for node in modes]
 
 
 def _collect_phenomena(
     client: Any,
     evidence: FaultGraphEvidence,
     *,
-    mode_ids: list[str],
-    mode_names: list[str],
     type_ids: list[str],
     type_names: list[str],
 ) -> tuple[list[str], list[str]]:
-    """优先 ``故障模式→故障现象``；新数据没有模式层时回退 ``设备类型→故障现象``。"""
+    """只读当前设备类型自己的 ``具有现象`` 边；共享现象已拆成每类型独立节点。"""
 
     edges = _query_related(
         client,
-        source_label="故障模式",
+        source_label=KG_DEVICE_TYPE_LABEL,
         relation="具有现象",
         target_label="故障现象",
-        source_ids=mode_ids,
-        source_names=mode_names,
+        source_ids=type_ids,
+        source_names=type_names,
     )
-    _add_edges(evidence, edges, "故障模式", "故障现象")
-    if not evidence.nodes_with_label(ENTITY_PHENOMENON):
-        edges = _query_related(
-            client,
-            source_label=KG_DEVICE_TYPE_LABEL,
-            relation="具有现象",
-            target_label="故障现象",
-            source_ids=type_ids,
-            source_names=type_names,
-        )
-        _add_edges(evidence, edges, KG_DEVICE_TYPE_LABEL, "故障现象")
+    _add_edges(evidence, edges, KG_DEVICE_TYPE_LABEL, "故障现象")
     nodes = evidence.nodes_with_label(ENTITY_PHENOMENON)
     return [str(node["id"]) for node in nodes], [str(node["name"]) for node in nodes]
 
@@ -255,10 +277,8 @@ def _collect_causes(
     *,
     phenomenon_ids: list[str],
     phenomenon_names: list[str],
-    mode_ids: list[str],
-    mode_names: list[str],
 ) -> tuple[list[str], list[str]]:
-    """优先取 ``故障现象→故障原因``；数据只有模式级原因时标记 ``cause_links``。"""
+    """只读当前设备类型现象节点的 ``具有原因`` 边；原因不再跨现象/设备类型共享。"""
 
     edges = _query_related(
         client,
@@ -268,20 +288,7 @@ def _collect_causes(
         source_ids=phenomenon_ids,
         source_names=phenomenon_names,
     )
-    if edges:
-        _add_edges(evidence, edges, "故障现象", "故障原因")
-        evidence.cause_links = "fault_phenomenon"
-    else:
-        edges = _query_related(
-            client,
-            source_label="故障模式",
-            relation="具有原因",
-            target_label="故障原因",
-            source_ids=mode_ids,
-            source_names=mode_names,
-        )
-        _add_edges(evidence, edges, "故障模式", "故障原因")
-        evidence.cause_links = "fault_mode"
+    _add_edges(evidence, edges, "故障现象", "故障原因")
     causes = evidence.nodes_with_label(ENTITY_CAUSE)
     return [str(node["id"]) for node in causes], [str(node["name"]) for node in causes]
 
@@ -320,24 +327,6 @@ def _collect_measures(
         source_names=cause_names,
     )
     _add_edges(evidence, edges, "故障原因", "处置措施")
-
-
-def _collect_consequences(
-    client: Any,
-    evidence: FaultGraphEvidence,
-    *,
-    cause_ids: list[str],
-    cause_names: list[str],
-) -> None:
-    edges = _query_related(
-        client,
-        source_label="故障原因",
-        relation="可能导致",
-        target_label="故障后果",
-        source_ids=cause_ids,
-        source_names=cause_names,
-    )
-    _add_edges(evidence, edges, "故障原因", "故障后果")
 
 
 def _collect_topology(client: Any, evidence: FaultGraphEvidence, *, device_ids: list[str]) -> None:
@@ -471,7 +460,7 @@ def _store_edge(evidence: FaultGraphEvidence, source_id: str, target_id: str, ra
 
 
 def _map_node(raw: Any, *, expected_label: str) -> dict[str, Any] | None:
-    """把 kg3 节点映射为内部证据节点（id/name/type/properties）。"""
+    """把故障图节点映射为内部证据节点（id/name/type/properties）。"""
 
     if raw is None:
         return None

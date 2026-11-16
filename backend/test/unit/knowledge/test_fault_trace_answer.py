@@ -47,7 +47,7 @@ def _topology() -> FaultTopology:
         ],
         downstream=[],
         paths=["35kV#3变电站 → 3B-7Y"],
-        consequences=[{"consequence_id": "FC-01", "name": "相间短路"}],
+        consequences=[],
         warnings=["未发现 3B-7Y 的下游电气连接设备"],
     )
 
@@ -80,7 +80,13 @@ def _located_cause() -> CauseEvaluation:
     )
 
 
-def _payload(causes: list[CauseEvaluation] | None = None, *, cause_measures: dict | None = None) -> dict:
+def _payload(
+    causes: list[CauseEvaluation] | None = None,
+    *,
+    cause_measures: dict | None = None,
+    location_phenomena: list[str] | None = None,
+    phenomenon_name: str | None = None,
+) -> dict:
     evaluations = causes or [_located_cause()]
     return build_fault_trace_payload(
         query=_query(),
@@ -90,17 +96,20 @@ def _payload(causes: list[CauseEvaluation] | None = None, *, cause_measures: dic
             {
                 "phenomenon_id": "PH-04",
                 "phenomenon": "树木倒伏枝干压覆导线",
-                "link_level": "fault_mode",
+                "link_level": "fault_phenomenon",
                 "causes": evaluations,
             }
         ],
         causes=evaluations,
         topology=_topology(),
-        cause_links="fault_mode",
+        cause_links="fault_phenomenon",
+        graph="kg5",
         image_used=False,
         elapsed_ms=1200,
-        warnings=["故障原因挂在故障模式上（缺少现象→原因边），按模式汇总可能原因"],
+        warnings=[],
         cause_measures=cause_measures,
+        location_phenomena=location_phenomena,
+        phenomenon_name=phenomenon_name,
     )
 
 
@@ -120,9 +129,9 @@ def test_payload_has_five_sections_and_location():
     assert report["location"]["missing_data"] == ["image_tree_fall_detected"]
     assert report["location"]["evidence"][0]["trigger_id"] == "TC-R03"
     assert report["impact"]["upstream"][0]["name"] == "35kV#3变电站"
-    assert report["impact"]["consequences"] == [{"consequence_id": "FC-01", "name": "相间短路"}]
-    assert report["meta"]["graph"] == "kg3"
-    assert report["meta"]["cause_link_level"] == "fault_mode"
+    assert report["impact"]["consequences"] == []
+    assert report["meta"]["graph"] == "kg5"
+    assert report["meta"]["cause_link_level"] == "fault_phenomenon"
     assert report["suggestions"] == [
         {
             "cause_id": "CA-04",
@@ -157,6 +166,28 @@ def test_payload_has_five_sections_and_location():
     assert "- 故障现象：" not in summary_section
     assert "- 图片识别：" not in summary_section
     assert "（成立，" not in markdown
+
+
+def test_payload_uses_matched_phenomenon_override():
+    """命中现象优先于“全部现象”的第一行，摘要与定位必须一致。"""
+
+    payload = _payload(location_phenomena=["燃烧起火"], phenomenon_name="燃烧起火")
+    report = payload["report"]
+
+    assert report["summary"]["phenomenon"] == "燃烧起火"
+    assert report["location"]["phenomena"] == ["燃烧起火"]
+    assert "- 判定成立的故障现象：燃烧起火" in payload["answer_markdown"]
+
+
+def test_payload_empty_location_phenomena_does_not_fall_back_to_first_row():
+    """已命中但无成立原因时显示破折号，不能把展示表的第一个现象当成成立现象。"""
+
+    payload = _payload(location_phenomena=[], phenomenon_name="燃烧起火")
+    report = payload["report"]
+
+    assert report["summary"]["phenomenon"] == "燃烧起火"
+    assert report["location"]["phenomena"] == []
+    assert "- 判定成立的故障现象：—" in payload["answer_markdown"]
 
 
 def test_payload_unknown_verdict_when_no_cause_established():
@@ -226,7 +257,8 @@ def test_payload_uses_model_text_overrides():
         reasoning_rows=[{"phenomenon_id": "PH-04", "phenomenon": "树木倒伏枝干压覆导线", "causes": [_located_cause()]}],
         causes=[_located_cause()],
         topology=_topology(),
-        cause_links="fault_mode",
+        cause_links="fault_phenomenon",
+        graph="kg5",
         image_used=False,
         elapsed_ms=10,
         warnings=[],
