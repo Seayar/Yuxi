@@ -74,7 +74,10 @@ _LOCATION_PATTERNS: tuple[re.Pattern[str], ...] = (
 # 避免把“3B-6K线99#杆避雷器”截成线路名“3B-6K”、把“#1主变高压侧电流互感器”截成“#1主变”。
 # 元组第二项表示命中后是否要去掉粘在设备名前面的位置线索（只有线路/间隔这类会粘“变电站”）。
 _DEVICE_NAME_PATTERNS: tuple[tuple[re.Pattern[str], bool], ...] = (
-    (re.compile(r"#\s*\d+\s*主变(?:压器)?[^\s，。；;、]*?(?:电流互感器|电压互感器|避雷器)"), False),
+    (
+        re.compile(r"(?:#\s*\d+|\d+\s*号)\s*主变(?:压器)?[^\s，。；;、]*?(?:电流互感器|电压互感器|避雷器)"),
+        False,
+    ),
     (
         re.compile(
             r"(?<![0-9])\d+[A-Za-z]{1,2}\s*-\s*[A-Za-z]?\d+[A-Za-z]?\s*(?:线)?\s*\d+\s*#?\s*(?:杆|塔)?\s*"
@@ -89,7 +92,8 @@ _DEVICE_NAME_PATTERNS: tuple[tuple[re.Pattern[str], bool], ...] = (
     (re.compile(r"\d+\s*电容器组"), False),
     # 间隔类设备（如“岭开线进线间隔_1101”）：带下划线的台账命名必须整段取到，不能截成线路名。
     (re.compile(r"[\u4e00-\u9fa5]{2,12}\s*间隔\s*_\s*\d+"), True),
-    (re.compile(r"[\u4e00-\u9fa5]{2,6}线(?![路])"), True),
+    # 母线是设备/部件名，不是线路名；排除“母线”避免把“主变低压侧母线”截成线路。
+    (re.compile(r"[\u4e00-\u9fa5]{2,6}(?<!母)线(?![路])"), True),
     (re.compile(r"#\s*\d+\s*箱变\s*\d*\s*(?:变压器出线柜|馈出柜|环出柜|环进柜|出线柜|进线柜|柜)?"), False),
     (re.compile(r"箱变\s*\d+\s*(?:变压器出线柜|馈出柜|环出柜|环进柜|出线柜|进线柜|柜)"), False),
     (re.compile(r"\d+\s*SVG\s*开关", re.IGNORECASE), False),

@@ -93,6 +93,18 @@ kg5 的 `设备实例.台账ID列表` 为 `补充数据` 等占位时，`sources
 
 走管理员系统配置时不需要环境变量；环境变量只在对应配置项字段留空时兜底，已保存的配置不会被环境变量覆盖。`kg5` 不可达或未建图时，图连接失败在设备检索阶段返回“设备预测维护知识图谱未配置或不可用”；图可达但没有匹配设备时返回“未在设备台账中找到该设备”；设备节点没有可用 `台账ID列表` 且三区台账里也没有精确同名行时返回“未找到该设备的台账 ID”。设备类型下没有匹配的故障现象时，报告只标注所需资源与注意事项未匹配。三区台账由运维更新到 MinIO，进程内缓存 5 分钟。字段口径、服务响应与未联调范围见[设备预测维护智能体](../develop-guides/decisions/implemented/2026-11-09-device-prediction-agent.md)。
 
+### 设备识别与候选选择（三个智能体共用）
+
+故障溯源、处置方案与设备预测维护共用同一套“候选召回 → 模型在候选内选择”逻辑：先按名称精确/写法变体、包含、词元、设备类型/位置、设备名索引逐级召回有界候选，再由当前 Agent 模型在候选内选择目标设备（目标不在候选中时返回 `null`，不做猜测）。模型不可用或返回非法结果时回退规则排序。设备确认环节保持各智能体的既有约束：处置方案每次弹设备确认卡片；故障溯源保留确认卡片；设备预测维护唯一候选直接采用、多候选（>1）弹卡片，不再按“名称精确匹配”静默采用。设备名索引按 `{服务地址}|{图名}` 在进程内缓存，只用于召回。
+
+| 变量 | 读取者 | 缺省与条件 |
+|---|---|---|
+| `DEVICE_SELECTION_ENABLED` | `knowledge/device_selection.py` | 缺省 `true`；设为 `0`/`false`/`no` 时跳过模型选择，只用规则排序 |
+| `DEVICE_SELECTION_MAX_CANDIDATES` | `device_selection.py` | 缺省 `24`；交给模型的候选上限，按调用方现有排序截断 |
+| `DEVICE_SELECTION_PATH_SEGMENTS` | `device_selection.py` | 缺省 `3`；提示词里层级路径只保留末尾段数 |
+| `DEVICE_NAME_INDEX_TTL_SECONDS`、`DEVICE_NAME_INDEX_MAX_ENTRIES` | `device_index.py` | 缺省 `600` 秒与 `5000` 条；索引一次读取 `设备实例` 后在进程内复用 |
+| `DEVICE_NAME_INDEX_CANDIDATES`、`DEVICE_NAME_TOKEN_RECALL_LIMIT`、`DEVICE_RECALL_MAX_RECORDS` | `device_index.py` | 缺省 `8`、`3` 与 `24`；索引逐个名称返回的候选数、词元召回最多使用的词元数、兜底召回最多交给后续步骤的记录数 |
+
 ## 电力规范问答图谱
 
 电力规范检索在意图确认后、常规召回之前查询独立 TuGraph 图 `power_spec_qa`。该图只保存测评集的“问题—答案—依据条款”映射，条款正文仍从当前可见知识库的 `processing_params["power_spec"]["clauses"]` 读取。管理员系统配置项 `power_spec_graph_opts` 拥有连接参数，环境变量只在配置项字段留空时兜底。导入命令、schema 与匹配规则见[电力规范检索](../mechanisms/power-spec-retrieval.md)。

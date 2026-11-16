@@ -18,6 +18,12 @@ from dataclasses import replace
 from typing import Any
 
 from yuxi.agents.toolkits.tugraph import TuGraphClient, TuGraphError
+from yuxi.knowledge.device_index import (
+    DEVICE_RECALL_MAX_RECORDS,
+    device_recall_tokens,
+    fallback_score,
+    get_device_name_index,
+)
 from yuxi.knowledge.maintenance_plan.contracts import (
     BRANCH_VALUES,
     COMMON_YES,
@@ -92,11 +98,17 @@ ORDINAL_PATTERN = re.compile(r"(?P<num>\d+)\s*号")
 # 设备定位
 # ---------------------------------------------------------------------------
 def search_devices(
-    client: TuGraphClient, query: PlanQuery, *, limit: int = MAX_DEVICE_CANDIDATES
+    client: TuGraphClient,
+    query: PlanQuery,
+    *,
+    limit: int = MAX_DEVICE_CANDIDATES,
+    graph_key: str = "",
 ) -> list[DeviceCandidate]:
     """按设备名称/位置线索/设备类型在 ``设备实例`` 中召回，并用 ``属于`` 边补全类型。
 
     - 关键词来自 ``device_name``（含“1号→#1/1#”的同义展开）与 ``location_hint``；
+    - 名称/位置都没有命中时，依次用名称词元与设备名索引扩大召回（图谱里有这台设备，
+      但用户写法与图谱名称不一致时仍能找到候选）；
     - 只保留有 ``属于`` 设备类型边的设备（处置方案图中区域/监测节点没有类型边）；
     - 候选不唯一时由调用方发中断让用户选择。
     """
@@ -116,10 +128,17 @@ def search_devices(
     if not keywords and not location_hint and query.device_type:
         records.extend(_query_devices_by_device_type(client, device_type=query.device_type))
 
+    fallback_scores: dict[str, float] = {}
+    if not records:
+        records, fallback_scores = _recall_devices_by_fallback(client, query, graph_key=graph_key)
+
     candidates: dict[str, DeviceCandidate] = {}
     for record in records:
         props = record.get("n") or record.get("a") or {}
         candidate = _build_candidate(props, query=query, keywords=keywords)
+        fallback = fallback_scores.get(candidate.device_id)
+        if fallback is not None and fallback > candidate.score:
+            candidate = replace(candidate, score=fallback)
         if not candidate.device_id or candidate.score <= 0:
             continue
         current = candidates.get(candidate.device_id)
@@ -142,6 +161,73 @@ def search_devices(
 
     typed.sort(key=lambda item: (-item.score, item.name, item.device_id))
     return typed[:limit]
+
+
+def _recall_devices_by_fallback(
+    client: TuGraphClient, query: PlanQuery, *, graph_key: str
+) -> tuple[list[dict[str, Any]], dict[str, float]]:
+    """名称/位置都没命中时的兜底召回：词元命中与设备名索引合并，按命中质量排序。
+
+    返回 (记录, 兜底分)；泛词元可能命中上百条，必须按命中数与索引排名打分并截断，
+    否则真正的目标会被名称排序挤出候选。
+    """
+
+    query_text = _clean(query.device_name) or _clean(query.location_hint) or _clean(query.raw_text) or ""
+    tokens = device_recall_tokens(query_text)
+    ranked: dict[str, tuple[float, dict[str, Any]]] = {}
+
+    def _add(record: dict[str, Any], *, index_rank: int | None = None) -> None:
+        device_id = _record_device_id(record)
+        if not device_id:
+            return
+        props = record.get("n") or record.get("a") or {}
+        score = fallback_score(_device_name(props), tokens, index_rank=index_rank)
+        current = ranked.get(device_id)
+        if current is None or score > current[0]:
+            ranked[device_id] = (score, record)
+
+    for token in tokens:
+        for record in _query_devices_by_keyword(client, keyword=token):
+            _add(record)
+
+    index = (
+        get_device_name_index(
+            client,
+            graph_key=graph_key,
+            label=LABEL_DEVICE,
+            name_props=DEVICE_NAME_PROPS,
+        )
+        if graph_key
+        else None
+    )
+    if index is not None:
+        entries = index.search(query_text)
+        rank_by_id = {entry.device_id: rank for rank, entry in enumerate(entries)}
+        if rank_by_id:
+            for record in _query_devices_by_ids(client, ids=list(rank_by_id)):
+                _add(record, index_rank=rank_by_id.get(_record_device_id(record)))
+
+    ordered = sorted(ranked.items(), key=lambda item: (-item[1][0], str(item[1][1].get("name") or "")))
+    records = [record for _device_id, (_score, record) in ordered[:DEVICE_RECALL_MAX_RECORDS]]
+    scores = {device_id: score for device_id, (score, _record) in ordered[:DEVICE_RECALL_MAX_RECORDS]}
+    return records, scores
+
+
+def _record_device_id(record: dict[str, Any]) -> str:
+    props = record.get("n") or record.get("a") or {}
+    return _clean(props.get("id")) or _device_name(props)
+
+
+def _query_devices_by_ids(client: TuGraphClient, *, ids: list[str]) -> list[dict[str, Any]]:
+    """按设备 id 批量取回设备节点（索引命中后回读完整属性）。"""
+
+    return client.run(
+        "MATCH (n) WHERE labels(n)[0] = $label AND " + _in_condition("n", "id", "device_ids") + " "
+        "RETURN n LIMIT $node_limit",
+        label=LABEL_DEVICE,
+        device_ids=ids,
+        node_limit=KG_QUERY_LIMIT,
+    )
 
 
 def _build_candidate(props: dict[str, Any], *, query: PlanQuery, keywords: list[str]) -> DeviceCandidate:

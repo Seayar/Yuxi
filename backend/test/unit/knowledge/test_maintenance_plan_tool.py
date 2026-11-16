@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -14,6 +15,7 @@ from yuxi.knowledge.maintenance_plan.branch import BranchLookup
 from yuxi.knowledge.maintenance_plan.contracts import (
     BRANCH_UNRESOLVED_MESSAGE,
     CHOICE_ABORTED_MESSAGE,
+    CHOICE_CANCELLED_MESSAGE,
     NO_DEVICE_MESSAGE,
     NO_SCENE_MESSAGE,
     PLAN_GRAPH_NOT_CONFIGURED_MESSAGE,
@@ -130,7 +132,9 @@ def _install(monkeypatch, *, branch=None, evidence=None, tools=None, personnel=N
 
     monkeypatch.setattr(tool_module, "extract_plan_intent", fake_intent)
     monkeypatch.setattr(
-        graph_plan_module, "search_devices", lambda client, query, limit=8: candidates if candidates is not None else [DEVICE]
+        graph_plan_module,
+        "search_devices",
+        lambda client, query, limit=8, graph_key="": candidates if candidates is not None else [DEVICE],
     )
     monkeypatch.setattr(
         graph_plan_module, "find_scenes", lambda client, device: scenes if scenes is not None else [SCENE]
@@ -400,6 +404,94 @@ def test_device_payload_puts_path_in_description():
 
     assert option["label"] == "#1开闭所（开闭所，10kV）"
     assert option["description"] == "变电设施 > 110kV变电站 > 10kV电压等级区域 > #1开闭所"
+
+
+def test_device_card_close_cancels_without_reintent(monkeypatch):
+    """关闭设备卡片是取消：不能把 reject 当补充设备名再识别一次。"""
+
+    _install(monkeypatch)
+    calls: list[int] = []
+
+    async def counting(text, *, model_call, previous=None, feedback=None):
+        calls.append(1)
+        return PlanQuery(device_name="3k18")
+
+    monkeypatch.setattr(tool_module, "extract_plan_intent", counting)
+    monkeypatch.setattr(tool_module, "interrupt", lambda payload: "reject")
+
+    result = asyncio.run(GENERATE("3k18 开关柜整柜更换", runtime=_context()))
+
+    assert result == CHOICE_CANCELLED_MESSAGE
+    assert len(calls) == 1
+
+
+def test_scene_card_close_cancels(monkeypatch):
+    other = Scenario("SCENE_B4", "开关柜柜内检修", level="B级", branch_dimension="柜型结构")
+    _install(monkeypatch, scenes=[SCENE, other])
+    answers = iter([{"maintenance_plan_device": DEVICE.device_id}, "reject"])
+    monkeypatch.setattr(tool_module, "interrupt", lambda payload: next(answers))
+
+    result = asyncio.run(GENERATE("3k18 开关柜整柜更换", runtime=_context()))
+
+    assert result == CHOICE_CANCELLED_MESSAGE
+
+
+def test_locate_device_uses_model_selection_as_recommendation(monkeypatch):
+    """模型在候选内选中设备只决定“推荐”，用户仍需在卡片上确认。"""
+
+    other = DeviceCandidate(
+        "LGR#kbs1",
+        "#1开闭所",
+        "开闭所",
+        "10kV",
+        "变电设施 > 110kV变电站 > #1开闭所",
+    )
+    candidates = [DEVICE, other]
+    monkeypatch.setattr(
+        graph_plan_module,
+        "search_devices",
+        lambda client, query, limit=8, graph_key="": candidates,
+    )
+    recorder = _InterruptRecorder([{"maintenance_plan_device": other.device_id}])
+    monkeypatch.setattr(tool_module, "interrupt", recorder)
+
+    async def choosing(_prompt):
+        return json.dumps({"device_id": other.device_id})
+
+    result = asyncio.run(
+        tool_module._locate_device(
+            object(),
+            PlanQuery(raw_text="#1开闭所检修", device_type="开闭所"),
+            model_call=choosing,
+            rounds=[0],
+            emitter=_Emitter(),
+        )
+    )
+
+    assert result[1] is other
+    options = recorder.payloads[0]["questions"][0]["options"]
+    # 推荐候选被提到第一位，保证在卡片可见范围内；仍由用户点击确认。
+    assert [item["value"] for item in options] == [other.device_id, DEVICE.device_id]
+    assert options[0]["label"].endswith("（推荐）")
+    assert not options[1]["label"].endswith("（推荐）")
+
+
+def test_single_candidate_does_not_call_model(monkeypatch):
+    """唯一候选不需要模型选择，避免每次请求多一次模型往返。"""
+
+    _install(monkeypatch)
+    called: list[int] = []
+
+    async def counting_select(*args, **kwargs):
+        called.append(1)
+        return None, "no_selection"
+
+    monkeypatch.setattr(tool_module, "select_device", counting_select)
+
+    result = asyncio.run(GENERATE("3k18 开关柜整柜更换", runtime=_context()))
+
+    assert "report" in result
+    assert called == []
 
 
 def test_cache_is_scoped_per_query_text(monkeypatch):

@@ -12,6 +12,13 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from yuxi.knowledge.device_index import (
+    DEVICE_RECALL_MAX_RECORDS,
+    DEVICE_RECALL_TOKEN_LIMIT,
+    device_recall_tokens,
+    fallback_score,
+    get_device_name_index,
+)
 from yuxi.knowledge.fault_trace.contracts import (
     DEVICE_CLASS_TO_TYPE,
     ENTITY_CAUSE,
@@ -21,6 +28,7 @@ from yuxi.knowledge.fault_trace.contracts import (
     KG_DEVICE_NAME_PROPS,
     KG_DEVICE_TYPE_LABEL,
     KG_ENTITY_LABELS,
+    LEDGER_ID_PLACEHOLDERS,
     KG_RELATION_TYPES,
     REL_DEVICE_TYPE,
     UNMAPPED_STATION_CLASSES,
@@ -30,12 +38,13 @@ from yuxi.knowledge.fault_trace.graph import FaultGraphEvidence
 QUERY_LIMIT = 200
 
 
-def find_devices(client: Any, names: list[str]) -> list[dict[str, Any]]:
-    """按名称精确匹配设备实例；没有精确命中时退回包含匹配。
+def find_devices(client: Any, names: list[str], *, graph_key: str = "") -> list[dict[str, Any]]:
+    """按名称精确/包含匹配设备实例；都未命中时依次用词元与设备名索引扩大召回。
 
     用户与意图识别经常带电压等级前缀（``110kV银开线``）或序号口语写法（``1号主变``），
     故障图设备名是不带前缀的 ``银开线`` / ``#1主变…``，因此每个名称先展开成等价的
-    查询写法，再执行精确/包含匹配。
+    查询写法，再执行精确/包含匹配；仍没有结果时用词元匹配与设备名索引兜底，避免
+    “图谱里有这台设备但按名称没查到”。索引只返回图谱里已存在的设备，不造新设备。
     """
 
     evidence = FaultGraphEvidence()
@@ -64,7 +73,98 @@ def find_devices(client: Any, names: list[str]) -> list[dict[str, Any]]:
             node_limit=QUERY_LIMIT,
         )
         contains.extend(_add_nodes(evidence, records, "n", KG_DEVICE_LABEL))
-    return _dedupe(contains)
+    if contains:
+        return _dedupe(contains)
+
+    return _find_devices_by_fallback(client, names, graph_key=graph_key)
+
+
+def _find_devices_by_fallback(client: Any, names: list[str], *, graph_key: str) -> list[dict[str, Any]]:
+    """兜底召回：词元命中与设备名索引合并，按命中质量排序后截断。
+
+    泛词元（“间隔”“线路”）可能命中上百条，统一给 1 分会让目标被名称排序挤出候选；
+    这里按词元命中数与索引排名打分，并限制交给后续消歧/卡片的记录数。
+    """
+
+    tokens = device_recall_tokens(" ".join(names))
+    token_records = _find_devices_by_tokens(client, tokens)
+    index_records = _find_devices_by_index(client, names, graph_key=graph_key) if graph_key else []
+
+    ranked: dict[str, tuple[float, dict[str, Any]]] = {}
+    for record in token_records:
+        device_id = str(record.get("id") or "")
+        if not device_id:
+            continue
+        score = fallback_score(str(record.get("name") or ""), tokens)
+        current = ranked.get(device_id)
+        if current is None or score > current[0]:
+            ranked[device_id] = (score, record)
+    for rank, record in enumerate(index_records):
+        device_id = str(record.get("id") or "")
+        if not device_id:
+            continue
+        score = fallback_score(str(record.get("name") or ""), tokens, index_rank=rank)
+        current = ranked.get(device_id)
+        if current is None or score > current[0]:
+            ranked[device_id] = (score, record)
+    ordered = sorted(ranked.values(), key=lambda item: (-item[0], str(item[1].get("name") or "")))
+    return [record for _score, record in ordered[:DEVICE_RECALL_MAX_RECORDS]]
+
+
+def _find_devices_by_tokens(client: Any, tokens: list[str]) -> list[dict[str, Any]]:
+    """按名称词元召回：名称里出现任一高区分度词元即视为候选。"""
+
+    tokens = list(dict.fromkeys(token for token in tokens if len(token) >= 2))[:DEVICE_RECALL_TOKEN_LIMIT]
+    if not tokens:
+        return []
+    evidence = FaultGraphEvidence()
+    found: list[dict[str, Any]] = []
+    for token in tokens:
+        records = client.run(
+            "MATCH (n) WHERE labels(n)[0] = $label "
+            "AND (coalesce(n.名称, '') CONTAINS $kw OR coalesce(n.显示名, '') CONTAINS $kw) "
+            "RETURN n LIMIT $node_limit",
+            label=KG_DEVICE_LABEL,
+            kw=token,
+            node_limit=QUERY_LIMIT,
+        )
+        found.extend(_add_nodes(evidence, records, "n", KG_DEVICE_LABEL))
+    return _dedupe(found)
+
+
+def _find_devices_by_index(client: Any, names: list[str], *, graph_key: str) -> list[dict[str, Any]]:
+    """按设备名索引召回：归一化/近似匹配后按 id 取回图谱节点，保留索引排序。"""
+
+    index = get_device_name_index(
+        client,
+        graph_key=graph_key,
+        label=KG_DEVICE_LABEL,
+        name_props=KG_DEVICE_NAME_PROPS,
+    )
+    if index is None:
+        return []
+    ordered_ids: list[str] = []
+    for name in names:
+        ordered_ids.extend(entry.device_id for entry in index.search(name))
+    ordered_ids = list(dict.fromkeys(ordered_ids))
+    if not ordered_ids:
+        return []
+    records = client.run(
+        "MATCH (n) WHERE labels(n)[0] = $label AND " + _in_condition("id") + " RETURN n LIMIT $node_limit",
+        label=KG_DEVICE_LABEL,
+        ids=ordered_ids,
+        node_limit=QUERY_LIMIT,
+    )
+    evidence = FaultGraphEvidence()
+    nodes = _add_nodes(evidence, records, "n", KG_DEVICE_LABEL)
+    by_id = {str(node.get("id") or ""): node for node in nodes}
+    return [by_id[device_id] for device_id in ordered_ids if device_id in by_id]
+
+
+def _in_condition(prop: str) -> str:
+    """生成 ``coalesce(n.属性, '') IN $ids`` 条件片段。"""
+
+    return f"coalesce(n.{prop}, '') IN $ids"
 
 
 # 电压等级前缀：用户常写“110kV银开线”，故障图设备名是“银开线”。
@@ -95,9 +195,9 @@ def _device_lookup_names(name: str) -> list[str]:
 def resolve_device_type(client: Any, device: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
     """解析设备类型：设备 id 的 ``属于`` 边 → 台账分类映射 → 台账 ID 的 ``属于`` 边。
 
-    台账 ID 放最后，因为补充数据设备共用占位台账 ID（例如“补充数据”）：按台账 ID 等值
-    查询会同时命中其它设备的类型边，任何一个结果都不能证明属于当前设备，因此只有唯一
-    类型时才采用。无法唯一确定时返回 ``(None, None)``，由调用方按 device_type_missing 处理。
+    ``属于`` 边按设备 id 匹配，多条不同类型边按 fail-closed 返回 ``(None, None)``：图谱里
+    没有多类型事实（kg5 当前 0 台），出现多类型说明数据有问题，猜一个会把现象/原因算错。
+    台账 ID 只在设备没有 id 时兜底，且跳过补充数据占位值、要求唯一类型。
     """
 
     device_evidence = FaultGraphEvidence(nodes=[device], edges=[])
@@ -113,7 +213,7 @@ def resolve_device_type(client: Any, device: dict[str, Any]) -> tuple[str | None
             device_id=device_id,
         )
         if type_nodes:
-            return _first_type(type_nodes)
+            return _unique_type(type_nodes)
 
     device_class = str(properties.get("设备分类") or properties.get("台账分类") or "").strip()
     if device_class in UNMAPPED_STATION_CLASSES:
@@ -130,16 +230,25 @@ def resolve_device_type(client: Any, device: dict[str, Any]) -> tuple[str | None
         if type_nodes:
             return _first_type(type_nodes)
 
-    if ledger_id:
+    if not device_id and ledger_id and ledger_id not in LEDGER_ID_PLACEHOLDERS:
         type_nodes = _belongs_to_types(
             client,
             device_evidence,
             condition="coalesce(a.台账ID列表, '') = $ledger_id",
             ledger_id=ledger_id,
         )
-        if len({str(node.get("name") or "") for node in type_nodes}) == 1:
-            return _first_type(type_nodes)
+        if type_nodes:
+            return _unique_type(type_nodes)
     return None, None
+
+
+def _unique_type(type_nodes: list[dict[str, Any]]) -> tuple[str | None, dict[str, Any] | None]:
+    """类型节点唯一时才采用；多类型视为数据歧义，返回 ``(None, None)``。"""
+
+    names = {str(node.get("name") or "") for node in type_nodes if str(node.get("name") or "")}
+    if len(names) != 1:
+        return None, None
+    return _first_type(type_nodes)
 
 
 def _belongs_to_types(
@@ -165,14 +274,15 @@ def _belongs_to_types(
 
 
 def _first_type(type_nodes: list[dict[str, Any]]) -> tuple[str | None, dict[str, Any] | None]:
-    """在一组类型节点中取名称/id 最小的一个。
+    """在一组类型节点中取名称/id 最小的一个；名称缺失时按无法确定处理。
 
     TuGraph 4.5.2 的 cypher 计划器不接受 ``ORDER BY coalesce(...)``，返回顺序本身也不稳定，
     排序只能在客户端完成。
     """
 
     first = min(type_nodes, key=lambda node: (str(node.get("name") or ""), str(node.get("id") or "")))
-    return str(first.get("name") or "") or None, first
+    name = str(first.get("name") or "").strip()
+    return (name, first) if name else (None, None)
 
 
 def device_ancestors(client: Any, device: dict[str, Any]) -> list[str]:

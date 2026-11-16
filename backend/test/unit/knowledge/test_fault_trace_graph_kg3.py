@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from yuxi.knowledge.device_index import reset_device_name_index
 from yuxi.knowledge.fault_trace.graph_kg3 import (
     collect_kg3_evidence,
     find_devices,
@@ -274,6 +275,37 @@ def test_resolve_device_type_skips_edge_lookup_without_any_identifier():
     assert all(params.get("rel") != "属于" for _, params in client.queries)
 
 
+def test_find_devices_falls_back_to_name_index():
+    """名称/包含/词元都没命中时用设备名索引召回；索引只返回图谱里已存在的设备。"""
+
+    reset_device_name_index()
+    kiosk = {"名称": "#1开闭所", "id": "LGR#kbs1", "设备分类": "开闭所", "层级路径": "变电设施 > #1开闭所"}
+
+    class _IndexClient:
+        def run(self, cypher, **params):
+            if "= $name" in cypher or "CONTAINS $kw" in cypher:
+                return []
+            if params.get("ids") or params.get("device_ids"):
+                return [{"n": kiosk}]
+            if "RETURN n LIMIT" in cypher:
+                return [{"n": kiosk}]  # 设备名索引构建
+            return []
+
+    devices = find_devices(_IndexClient(), ["一号开闭所"], graph_key="test-ft-index")
+
+    assert [device["name"] for device in devices] == ["#1开闭所"]
+
+
+def test_find_devices_returns_empty_without_graph_key_when_all_stages_miss():
+    """没有图配置时不构建索引；所有召回阶段都未命中就返回空，由调用方给固定文案。"""
+
+    class _EmptyClient:
+        def run(self, cypher, **params):
+            return []
+
+    assert find_devices(_EmptyClient(), ["完全无关的设备"]) == []
+
+
 def test_resolve_device_type_prefers_device_id_over_shared_ledger():
     """设备 id 命中类型边时忽略台账 ID：补充数据设备共用占位台账 ID，不能串到别的类型。"""
 
@@ -299,7 +331,7 @@ def test_resolve_device_type_prefers_device_id_over_shared_ledger():
 
 
 def test_resolve_device_type_rejects_ambiguous_ledger_fallback():
-    """id 没有类型边、台账 ID 命中多个不同设备类型时无法唯一归属，不能猜一个类型。"""
+    """没有 id 的设备：台账占位值命中的类型不唯一（或本身是占位值）时不猜类型。"""
 
     class _AmbiguousLedgerClient:
         def __init__(self) -> None:
@@ -307,45 +339,20 @@ def test_resolve_device_type_rejects_ambiguous_ledger_fallback():
 
         def run(self, cypher: str, **params):
             self.queries.append((cypher, params))
-            if params.get("rel") != "属于":
-                return []
-            if params.get("ledger_id") != "补充数据":
-                return []
-            return [
-                {"b": {"名称": "变压器", "id": "DEV#变压器"}},
-                {"b": {"名称": "架空线路", "id": "DEV#架空线路"}},
-            ]
+            return []
 
-    device = {"id": "LGR#x", "name": "x", "type": "device", "properties": {"台账ID列表": "补充数据"}}
+    device = {"name": "x", "type": "device", "properties": {"台账ID列表": "补充数据"}}
+    client = _AmbiguousLedgerClient()
 
-    assert resolve_device_type(_AmbiguousLedgerClient(), device) == (None, None)
+    assert resolve_device_type(client, device) == (None, None)
+    # 占位台账 ID 不作为匹配键，直接跳过“属于”查询。
+    assert all(params.get("rel") != "属于" for _, params in client.queries)
 
 
-def test_resolve_device_type_falls_back_to_ledger_id_edge():
-    """设备 id 没有类型边、也没有台账分类映射时仍可按唯一台账 ID 命中。"""
+def test_resolve_device_type_rejects_multiple_types():
+    """设备 id 属于多条不同类型边时按数据歧义处理，不取名称最小者。"""
 
-    target = {"id": "LGR#x", "name": "x", "type": "device", "properties": {"台账ID列表": "3b7y"}}
-    client = _GraphFakeClient(
-        belongs_to={},
-        ledger_belongs_to={"3b7y": {"名称": "架空线路", "id": "DEV#架空线路"}},
-    )
-
-    name, node = resolve_device_type(client, target)
-
-    assert name == "架空线路"
-    assert node["id"] == "DEV#架空线路"
-    belongs_queries = [(cypher, params) for cypher, params in client.queries if params.get("rel") == "属于"]
-    # id 先查、台账 ID 后查：两次等值查询不能合并成一条 OR 查询，否则共享台账 ID 会串类型。
-    assert [params.get("device_id") for _cypher, params in belongs_queries] == ["LGR#x", None]
-    assert [params.get("ledger_id") for _cypher, params in belongs_queries] == [None, "3b7y"]
-    # TuGraph 4.5.2 的 cypher 计划器不接受 ORDER BY coalesce(...)，排序必须在客户端做。
-    assert all("ORDER BY" not in cypher for cypher, _params in belongs_queries)
-
-
-def test_resolve_device_type_picks_smallest_name_when_server_order_is_unstable():
-    """服务端返回顺序不稳定：同一组类型节点必须始终取名称/id 最小的一个。"""
-
-    class _UnsortedClient:
+    class _MultiTypeClient:
         def __init__(self) -> None:
             self.queries: list[tuple[str, dict]] = []
 
@@ -358,10 +365,38 @@ def test_resolve_device_type_picks_smallest_name_when_server_order_is_unstable()
                 {"b": {"名称": "架空线路", "id": "DEV#架空线路"}},
             ]
 
-    device = {"id": "LGR#x", "name": "x", "type": "device", "properties": {"台账ID列表": "3b7y"}}
-    client = _UnsortedClient()
+    device = {"id": "LGR#x", "name": "x", "type": "device", "properties": {}}
 
-    name, node = resolve_device_type(client, device)
+    assert resolve_device_type(_MultiTypeClient(), device) == (None, None)
+
+
+def test_resolve_device_type_falls_back_to_ledger_id_edge():
+    """设备没有 id、也没有台账分类映射时仍可按唯一台账 ID 命中。"""
+
+    target = {"name": "x", "type": "device", "properties": {"台账ID列表": "3b7y"}}
+    client = _GraphFakeClient(
+        belongs_to={},
+        ledger_belongs_to={"3b7y": {"名称": "架空线路", "id": "DEV#架空线路"}},
+    )
+
+    name, node = resolve_device_type(client, target)
 
     assert name == "架空线路"
     assert node["id"] == "DEV#架空线路"
+    belongs_queries = [(cypher, params) for cypher, params in client.queries if params.get("rel") == "属于"]
+    assert [params.get("ledger_id") for _cypher, params in belongs_queries] == ["3b7y"]
+    # TuGraph 4.5.2 的 cypher 计划器不接受 ORDER BY coalesce(...)，排序必须在客户端做。
+    assert all("ORDER BY" not in cypher for cypher, _params in belongs_queries)
+
+
+def test_resolve_device_type_skips_ledger_fallback_when_device_has_id():
+    """有 id 的设备只按 id 查类型：台账 ID 是共享占位值，不能再作为匹配键兜底。"""
+
+    target = {"id": "LGR#x", "name": "x", "type": "device", "properties": {"台账ID列表": "3b7y"}}
+    client = _GraphFakeClient(
+        belongs_to={},
+        ledger_belongs_to={"3b7y": {"名称": "架空线路", "id": "DEV#架空线路"}},
+    )
+
+    assert resolve_device_type(client, target) == (None, None)
+    assert all("台账ID列表" not in cypher for cypher, _params in client.queries)

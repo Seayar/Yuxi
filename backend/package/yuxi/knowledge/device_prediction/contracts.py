@@ -43,6 +43,8 @@ NO_DEVICE_MESSAGE = "未在设备台账中找到该设备，请核对设备名�
 DEVICE_ID_UNRESOLVED_MESSAGE = "未找到该设备的台账 ID，无法执行故障预测与健康评估，请核对台账数据"
 CLARIFY_DEVICE_MESSAGE = "未能识别完整的设备信息，请明确目标设备"
 CHOICE_ABORTED_MESSAGE = "交互次数过多，未完成设备选择，请补充完整的设备名称后重新提交"
+# 用户关闭设备选择卡片：按取消结束本次请求，不把关闭值当成补充的设备名重新识别。
+CHOICE_CANCELLED_MESSAGE = "已取消本次设备预测维护请求，请重新提交问题"
 HEALTH_SERVICE_NOT_CONFIGURED_MESSAGE = "设备健康评估服务未配置，无法执行健康评估"
 HEALTH_SERVICE_UNAVAILABLE_MESSAGE = "设备健康评估服务暂不可用，请稍后重试"
 HEALTH_SERVICE_UNKNOWN_DEVICE_MESSAGE = "设备健康评估服务中没有该设备的数据，请核对设备台账 ID"
@@ -60,6 +62,7 @@ PLAIN_TOOL_MESSAGES = frozenset(
         DEVICE_ID_UNRESOLVED_MESSAGE,
         CLARIFY_DEVICE_MESSAGE,
         CHOICE_ABORTED_MESSAGE,
+        CHOICE_CANCELLED_MESSAGE,
         HEALTH_SERVICE_NOT_CONFIGURED_MESSAGE,
         HEALTH_SERVICE_UNAVAILABLE_MESSAGE,
         HEALTH_SERVICE_UNKNOWN_DEVICE_MESSAGE,

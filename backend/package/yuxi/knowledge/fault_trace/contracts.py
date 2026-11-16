@@ -128,6 +128,8 @@ DEVICE_CLASS_TO_TYPE = {
 }
 # 台账分类里明确无对应设备类型的站/所，命中时返回 device_type_missing。
 UNMAPPED_STATION_CLASSES = frozenset({"站", "变电站"})
+# 补充数据设备共用占位台账 ID：这类值不能作为“属于”边的唯一匹配键。
+LEDGER_ID_PLACEHOLDERS = frozenset({"", "补充数据", "无", "null", "None", "未知"})
 
 # ---------------------------------------------------------------------------
 # 实时值属性（触发条件 ``表达式`` 引用的标识符）

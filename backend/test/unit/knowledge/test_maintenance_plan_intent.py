@@ -128,6 +128,19 @@ def test_interval_device_name_keeps_full_ledger_name():
     assert query.voltage_level == "110kV"
 
 
+def test_bus_device_name_keeps_transformer_identifier():
+    """母线是设备/部件名，不能被线路正则吞成“主变低压侧母线”。"""
+
+    assert rule_extract("#1主变低压侧母线检修").device_name == "#1主变"
+    assert rule_extract("1号主变低压侧母线检修").device_name == "1号主变"
+
+
+def test_ordinal_ct_name_keeps_full_identifier():
+    """“1号主变高压侧电流互感器”要取到完整设备名，不能只剩“1号主变”。"""
+
+    assert rule_extract("1号主变高压侧电流互感器检修").device_name == "1号主变高压侧电流互感器"
+
+
 def test_ledger_patrol_box_substation_feeder_cabinet():
     query = rule_extract("#62箱变13馈出柜巡视")
 

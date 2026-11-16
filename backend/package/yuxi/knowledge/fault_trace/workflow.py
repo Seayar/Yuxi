@@ -21,6 +21,8 @@ from langgraph.prebuilt.tool_node import ToolRuntime
 from langgraph.types import interrupt
 
 from yuxi.agents.thinking import ThinkingEmitter
+from yuxi.knowledge.device_index import graph_key as device_graph_key
+from yuxi.knowledge.device_selection import DeviceOption, select_device
 from yuxi.knowledge.fault_trace.answer import (
     build_fault_trace_payload,
     build_summary_text,
@@ -191,6 +193,7 @@ async def _parse_fault(state: FaultTraceState, client: TuGraphClient) -> None:
         context=state.context,
         emitter=state.emitter,
         confirmed_intent=state.confirmed_intent,
+        graph_key=device_graph_key(state.config),
     )
     if isinstance(prepared, str):
         if prepared in {INTENT_CANCELLED_MESSAGE, INTENT_ATTEMPTS_EXHAUSTED_MESSAGE}:
@@ -478,6 +481,44 @@ def _fault_device_data(query: FaultTraceQuery) -> dict[str, Any]:
         "device_type": query.device_type,
         "voltage_level": query.voltage_level,
     }
+
+
+async def _select_device_candidate(
+    devices: list[dict[str, Any]],
+    *,
+    query: FaultTraceQuery,
+    query_text: str,
+    model_call: Callable[[str], Awaitable[str]] | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    """多候选设备用模型在候选内选择；选中则收敛为该设备，否则保留澄清路径。"""
+
+    options = [
+        DeviceOption(
+            device_id=str(device.get("id") or ""),
+            name=str(device.get("name") or ""),
+            voltage_level=str((device.get("properties") or {}).get("电压等级") or "") or None,
+            path=str((device.get("properties") or {}).get("层级路径") or ""),
+            category=str((device.get("properties") or {}).get("设备分类") or "") or None,
+        )
+        for device in devices
+        if str(device.get("id") or "")
+    ]
+    selected_id, state = await select_device(
+        options,
+        user_text=query_text,
+        intent={
+            "device_name": query.device_name,
+            "device_type": query.device_type,
+            "voltage_level": query.voltage_level,
+        },
+        model_call=model_call,
+    )
+    info = {"state": state, "candidate_count": len(options), "selected_id": selected_id}
+    if selected_id:
+        picked = [device for device in devices if str(device.get("id") or "") == selected_id]
+        if picked:
+            return picked, info
+    return devices, info
 
 
 async def _disambiguate_devices(
@@ -833,6 +874,7 @@ async def _prepare_device(
     context: Any,
     emitter: ThinkingEmitter,
     confirmed_intent: bool,
+    graph_key: str = "",
 ) -> _PreparedDevice | dict[str, Any] | str:
     """先校验设备存在且可解析类型，再请用户通过选项卡确认；返回澄清载荷或固定文案表示未通过。"""
 
@@ -850,7 +892,12 @@ async def _prepare_device(
         if query.clarification_required:
             return _clarify(emitter, query, DEVICE_NOT_FOUND_MESSAGE, image_payload)
         try:
-            devices = await asyncio.to_thread(find_devices, client, [query.device_name or ""])
+            devices = await asyncio.to_thread(
+                find_devices,
+                client,
+                [query.device_name or ""],
+                graph_key=graph_key,
+            )
         except TuGraphError as exc:
             logger.warning(f"故障溯源设备查询失败: {exc}")
             emitter.emit(
@@ -861,6 +908,7 @@ async def _prepare_device(
             )
             return FAULT_GRAPH_UNAVAILABLE_MESSAGE
         if not devices:
+            logger.warning(f"故障溯源设备召回为空: device_name={query.device_name!r} device_type={query.device_type!r}")
             emitter.emit(
                 "parse_fault",
                 "waiting",
@@ -881,6 +929,14 @@ async def _prepare_device(
             }
         if len(devices) > 1:
             devices = await _disambiguate_devices(client, devices, query_text)
+        selection: dict[str, Any] | None = None
+        if len(devices) > 1:
+            devices, selection = await _select_device_candidate(
+                devices,
+                query=query,
+                query_text=query_text,
+                model_call=model_call,
+            )
         if len(devices) > 1:
             candidates = [
                 {
@@ -902,6 +958,7 @@ async def _prepare_device(
                     "candidates": candidates,
                     "device": _fault_device_data(query),
                     "image": _intent_image_data(image_payload),
+                    "device_selection": selection,
                 },
             )
             return {
@@ -970,6 +1027,7 @@ async def _prepare_device(
                 "device": device_data,
                 "image": _intent_image_data(image_payload),
                 "phenomena": list(query.phenomena),
+                "device_selection": selection,
             },
         )
         answer = interrupt(build_confirmation_payload(intent_plan))

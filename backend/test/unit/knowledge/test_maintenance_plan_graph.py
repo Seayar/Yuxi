@@ -10,6 +10,7 @@ from yuxi.knowledge.maintenance_plan.contracts import (
     PlanQuery,
     Scenario,
 )
+from yuxi.knowledge.device_index import reset_device_name_index
 from yuxi.knowledge.maintenance_plan.graph_plan import (
     collect_scene_evidence,
     find_scenes,
@@ -169,6 +170,40 @@ def test_search_devices_keeps_the_device_named_by_location_hint():
             device_type="开闭所",
             location_hint="#1开闭所",
         ),
+    )
+
+    assert [item.name for item in candidates] == ["#1开闭所"]
+    assert candidates[0].device_type == "开闭所"
+
+
+def test_search_devices_falls_back_to_device_name_index():
+    """名称/词元都没命中时用设备名索引召回：图谱里有这台设备，用户写法与图谱不一致。"""
+
+    reset_device_name_index()
+    kiosk = {
+        "id": "LGR#kbs1",
+        "名称": "#1开闭所",
+        "层级路径": "变电设施 > 110kV变电站 > #1开闭所",
+        "电压等级": "10kV",
+        "设备分类": "开闭所",
+    }
+
+    class _IndexClient:
+        def run(self, cypher, **params):
+            if params.get("rel") == "属于":
+                return [{"a": {"id": "LGR#kbs1"}, "b": {"名称": "开闭所"}}]
+            if "CONTAINS $kw" in cypher or "= $name" in cypher:
+                return []
+            if params.get("device_ids"):
+                return [{"n": kiosk}]
+            if "labels(n)[0] = $label" in cypher and "RETURN n LIMIT" in cypher:
+                return [{"n": kiosk}]  # 设备名索引构建
+            return []
+
+    candidates = search_devices(
+        _IndexClient(),
+        PlanQuery(raw_text="一号开闭所检修", device_name="一号开闭所", device_type="开闭所"),
+        graph_key="test-index-graph",
     )
 
     assert [item.name for item in candidates] == ["#1开闭所"]

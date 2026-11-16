@@ -26,10 +26,13 @@ from yuxi.agents.thinking import ThinkingEmitter
 from yuxi.agents.toolkits.registry import tool
 from yuxi.agents.toolkits.tugraph import TuGraphClient, TuGraphConfig, TuGraphError
 from yuxi.config.options import fault_trace_opts
+from yuxi.knowledge.device_index import graph_key as device_graph_key
+from yuxi.knowledge.device_selection import DeviceOption, select_device
 from yuxi.knowledge.device_prediction import graph as kg5
 from yuxi.knowledge.device_prediction.answer import generate_status_readout, produce_prediction_answer
 from yuxi.knowledge.device_prediction.contracts import (
     CHOICE_ABORTED_MESSAGE,
+    CHOICE_CANCELLED_MESSAGE,
     CLARIFY_DEVICE_MESSAGE,
     DEVICE_CHOICE_QUESTION,
     DEVICE_CHOICE_SOURCE,
@@ -62,6 +65,7 @@ from yuxi.knowledge.device_prediction.services import (
     fetch_health_assessment,
 )
 from yuxi.utils import logger
+from yuxi.utils.question_utils import is_question_cancel
 
 # 最终结果在对话上下文上的缓存属性名，防止模型在同一轮内重复调用工具。
 # 缓存按规范化后的问题文本分组：用户补充设备后重新提问不能被上一次的结果挡住。
@@ -123,7 +127,13 @@ async def predict_device(query_text: str, runtime: ToolRuntime = None) -> dict[s
 
     client = TuGraphClient(config)
     try:
-        located = await _locate_device(client, query, model_call=model_call, emitter=emitter)
+        located = await _locate_device(
+            client,
+            query,
+            model_call=model_call,
+            emitter=emitter,
+            graph_key=device_graph_key(config),
+        )
     except TuGraphError as exc:
         logger.warning(f"设备预测维护图谱查询失败: {exc}")
         emitter.emit(
@@ -136,7 +146,7 @@ async def predict_device(query_text: str, runtime: ToolRuntime = None) -> dict[s
     finally:
         client.close()
     if isinstance(located, str):
-        error_code = "device_not_found" if located == NO_DEVICE_MESSAGE else "choice_aborted"
+        error_code = _device_choice_error_code(located)
         emitter.emit("load_device", "failed", content=located, error={"code": error_code, "message": located})
         return _remember(context, cache_key, located)
     query, device = located
@@ -313,15 +323,37 @@ async def _locate_device(
     *,
     model_call: PredictionModelCall | None,
     emitter: ThinkingEmitter,
+    graph_key: str = "",
 ) -> tuple[PredictionQuery, DeviceCandidate] | str:
-    """检索设备；候选不唯一时引导用户选择，用户补充文字后带上上一轮结果重新检索。"""
+    """检索设备；候选不唯一时由模型在候选内给出推荐项，再由用户选择确认。"""
 
     rounds = [0]
     while True:
-        candidates = await asyncio.to_thread(kg5.search_devices, client, query)
+        candidates = await asyncio.to_thread(
+            kg5.search_devices,
+            client,
+            query,
+            graph_key=graph_key,
+        )
         if not candidates:
+            logger.warning(
+                f"设备预测维护设备召回为空: device_name={query.device_name!r} "
+                f"device_type={query.device_type!r} location={query.location_hint!r}"
+            )
             return NO_DEVICE_MESSAGE
-        picked = _pick_device(candidates, query, rounds, emitter=emitter)
+        recommended_id: str | None = None
+        selection: dict[str, Any] | None = None
+        if len(candidates) > 1:
+            recommended_id, selection = await _select_device_candidate(
+                candidates,
+                query=query,
+                model_call=model_call,
+            )
+        if recommended_id:
+            candidates = _promote_candidate(candidates, recommended_id)
+        picked = _pick_device(candidates, query, rounds, emitter=emitter, selection=selection)
+        if picked is CHOICE_CANCELLED:
+            return CHOICE_CANCELLED_MESSAGE
         if isinstance(picked, DeviceCandidate):
             return query, picked
         if picked:
@@ -331,26 +363,75 @@ async def _locate_device(
             return CHOICE_ABORTED_MESSAGE
 
 
+async def _select_device_candidate(
+    candidates: list[DeviceCandidate],
+    *,
+    query: PredictionQuery,
+    model_call: PredictionModelCall | None,
+) -> tuple[str | None, dict[str, Any] | None]:
+    """模型在候选内选择设备；返回 (推荐候选 id, 选择状态信息)。"""
+
+    options = [
+        DeviceOption(
+            device_id=candidate.device_id,
+            name=candidate.name,
+            device_type=candidate.device_type,
+            voltage_level=candidate.voltage_level,
+            path=candidate.path,
+            category=None,
+        )
+        for candidate in candidates
+    ]
+    selected_id, state = await select_device(
+        options,
+        user_text=query.raw_text,
+        intent={
+            "device_name": query.device_name,
+            "device_type": query.device_type,
+            "voltage_level": query.voltage_level,
+            "location_hint": query.location_hint,
+        },
+        model_call=model_call,
+    )
+    info = {"state": state, "candidate_count": len(options), "selected_id": selected_id}
+    return selected_id, info
+
+
+def _promote_candidate(candidates: list[DeviceCandidate], selected_id: str) -> list[DeviceCandidate]:
+    """把模型选中的候选挪到第一位，保证推荐项出现在卡片可见范围内。"""
+
+    picked = [candidate for candidate in candidates if candidate.device_id == selected_id]
+    if not picked:
+        return candidates
+    return picked + [candidate for candidate in candidates if candidate.device_id != selected_id]
+
+
 def _pick_device(
-    candidates: list[DeviceCandidate], query: PredictionQuery, rounds: list[int], *, emitter: ThinkingEmitter
-) -> DeviceCandidate | str | None:
-    """从候选中定设备：唯一候选、或唯一最高分且名称与用户说法一致时直接采用。"""
+    candidates: list[DeviceCandidate],
+    query: PredictionQuery,
+    rounds: list[int],
+    *,
+    emitter: ThinkingEmitter,
+    selection: dict[str, Any] | None = None,
+) -> DeviceCandidate | str | None | _ChoiceCancelled:
+    """从候选中定设备：唯一候选直接采用；多个候选发卡片让用户选择（模型选择只做排序）。"""
 
     if len(candidates) == 1:
         return candidates[0]
-
-    top = candidates[0]
-    wanted = _normalize_text(query.device_name)
-    if wanted and top.score > candidates[1].score and _normalize_text(top.name) == wanted:
-        return top
 
     emitter.emit(
         "load_device",
         "waiting",
         content="等待用户选择目标设备。",
-        data={"source": DEVICE_CHOICE_SOURCE, "candidate_count": len(candidates)},
+        data={
+            "source": DEVICE_CHOICE_SOURCE,
+            "candidate_count": len(candidates),
+            "device_selection": selection,
+        },
     )
-    answer = _ask_choice(_device_payload(query, candidates), rounds)
+    answer = _ask_choice(_device_payload(query, candidates, recommended_id=_recommended_id(selection)), rounds)
+    if answer is CHOICE_CANCELLED:
+        return CHOICE_CANCELLED
     if answer is None:
         return None
     selected, free_text = answer
@@ -363,8 +444,33 @@ def _pick_device(
     return selected or None
 
 
-def _device_payload(query: PredictionQuery, candidates: list[DeviceCandidate]) -> dict[str, Any]:
-    """设备选择卡片：展示前 MAX_DEVICE_CANDIDATES 个候选，value 用设备节点 id 便于回填。"""
+def _device_choice_error_code(message: str) -> str:
+    """设备选择终止文案 → 思考步骤错误码：区分用户取消、轮次用尽与真的没找到。"""
+
+    if message == CHOICE_CANCELLED_MESSAGE:
+        return "device_choice_cancelled"
+    if message == CHOICE_ABORTED_MESSAGE:
+        return "choice_aborted"
+    return "device_not_found"
+
+
+def _recommended_id(selection: dict[str, Any] | None) -> str | None:
+    if not isinstance(selection, dict):
+        return None
+    value = selection.get("selected_id")
+    return str(value) if value else None
+
+
+def _device_payload(
+    query: PredictionQuery,
+    candidates: list[DeviceCandidate],
+    *,
+    recommended_id: str | None = None,
+) -> dict[str, Any]:
+    """设备选择卡片：展示前 MAX_DEVICE_CANDIDATES 个候选，value 用设备节点 id 便于回填。
+
+    模型选中的候选在 label 末尾标记“（推荐）”，仍由用户点击确认。
+    """
 
     return {
         "source": DEVICE_CHOICE_SOURCE,
@@ -373,7 +479,10 @@ def _device_payload(query: PredictionQuery, candidates: list[DeviceCandidate]) -
                 "question_id": DEVICE_QUESTION_ID,
                 "question": DEVICE_CHOICE_QUESTION,
                 "options": [
-                    {"label": candidate.label(), "value": candidate.device_id}
+                    {
+                        "label": candidate.label() + ("（推荐）" if candidate.device_id == recommended_id else ""),
+                        "value": candidate.device_id,
+                    }
                     for candidate in candidates[:MAX_DEVICE_CANDIDATES]
                 ],
                 "multi_select": False,
@@ -384,13 +493,27 @@ def _device_payload(query: PredictionQuery, candidates: list[DeviceCandidate]) -
     }
 
 
-def _ask_choice(payload: dict[str, Any], rounds: list[int]) -> tuple[str | None, str | None] | None:
-    """发一次引导选择中断并解析恢复值；整次请求的轮次预算已用尽时返回 None（不发中断）。"""
+class _ChoiceCancelled:
+    """用户关闭选择卡片的取消结果；与“轮次预算用尽”的 None 区分。"""
+
+
+CHOICE_CANCELLED = _ChoiceCancelled()
+
+
+def _ask_choice(payload: dict[str, Any], rounds: list[int]) -> tuple[str | None, str | None] | None | _ChoiceCancelled:
+    """发一次引导选择中断并解析恢复值；整次请求的轮次预算已用尽时返回 None（不发中断）。
+
+    关闭卡片提交的是 ``reject`` 这类取消值，先判取消再解析：否则会被当成用户补充的设备名，
+    带着 ``reject`` 重新识别并再次弹卡片。
+    """
 
     if rounds[0] >= MAX_CHOICE_ROUNDS:
         return None
     rounds[0] += 1
-    return _parse_choice(interrupt(payload))
+    raw = interrupt(payload)
+    if is_question_cancel(raw):
+        return CHOICE_CANCELLED
+    return _parse_choice(raw)
 
 
 def _parse_choice(value: Any) -> tuple[str | None, str | None]:

@@ -28,11 +28,14 @@ from yuxi.agents.toolkits.registry import tool
 from yuxi.agents.toolkits.tugraph import TuGraphClient, TuGraphConfig, TuGraphError
 from yuxi.agents.thinking import ThinkingEmitter
 from yuxi.config.options import fault_trace_opts
+from yuxi.knowledge.device_index import graph_key as device_graph_key
+from yuxi.knowledge.device_selection import DeviceOption, select_device
 from yuxi.knowledge.maintenance_plan.answer import produce_maintenance_plan_answer
 from yuxi.knowledge.maintenance_plan.branch import lookup_branch
 from yuxi.knowledge.maintenance_plan.contracts import (
     BRANCH_UNRESOLVED_MESSAGE,
     CHOICE_ABORTED_MESSAGE,
+    CHOICE_CANCELLED_MESSAGE,
     CLARIFY_ALL_MESSAGE,
     DEVICE_CHOICE_QUESTION,
     DEVICE_CHOICE_SOURCE,
@@ -62,6 +65,7 @@ from yuxi.knowledge.maintenance_plan.sources import (
     assign_personnel,
 )
 from yuxi.utils import logger
+from yuxi.utils.question_utils import is_question_cancel
 
 
 # ``graph_plan`` 在调用时延迟导入：本模块由 ``yuxi.agents.toolkits`` 在包初始化时导入，
@@ -162,13 +166,20 @@ async def generate_maintenance_plan(query_text: str, runtime: ToolRuntime = None
     emitter.emit("retrieve_graph", "started", content="正在检索目标设备与检修作业场景。")
     client = TuGraphClient(config)
     try:
-        located = await _locate_device(client, query, model_call=model_call, rounds=rounds, emitter=emitter)
+        located = await _locate_device(
+            client,
+            query,
+            model_call=model_call,
+            rounds=rounds,
+            emitter=emitter,
+            graph_key=device_graph_key(config),
+        )
         if isinstance(located, str):
             emitter.emit(
                 "retrieve_graph",
                 "failed",
                 content=located,
-                error={"code": "device_not_found", "message": located},
+                error={"code": _device_choice_error_code(located), "message": located},
             )
             return located
         query, device = located
@@ -188,7 +199,10 @@ async def generate_maintenance_plan(query_text: str, runtime: ToolRuntime = None
                 "retrieve_graph",
                 "failed",
                 content=scene,
-                error={"code": "scene_choice_aborted", "message": scene},
+                error={
+                    "code": "scene_choice_cancelled" if scene == CHOICE_CANCELLED_MESSAGE else "scene_choice_aborted",
+                    "message": scene,
+                },
             )
             return _remember(context, cache_key, scene)
 
@@ -313,13 +327,29 @@ def _task_summary(query: PlanQuery) -> str:
     return "已识别" + "、".join(parts) + "。" if parts else "任务信息不完整，等待补充。"
 
 
-def _ask_choice(payload: dict[str, Any], question_id: str, rounds: list[int]) -> tuple[str | None, str | None] | None:
-    """发一次引导选择中断并解析恢复值；整次请求的轮次预算已用尽时返回 None（不发中断）。"""
+class _ChoiceCancelled:
+    """用户关闭选择卡片的取消结果；与“轮次预算用尽”的 None 区分。"""
+
+
+CHOICE_CANCELLED = _ChoiceCancelled()
+
+
+def _ask_choice(
+    payload: dict[str, Any], question_id: str, rounds: list[int]
+) -> tuple[str | None, str | None] | None | _ChoiceCancelled:
+    """发一次引导选择中断并解析恢复值；整次请求的轮次预算已用尽时返回 None（不发中断）。
+
+    关闭卡片提交的是 ``reject`` 这类取消值，先判取消再解析：否则会被当成用户补充的设备名，
+    带着 ``reject`` 重新识别并再次弹卡片。
+    """
 
     if rounds[0] >= MAX_CHOICE_ROUNDS:
         return None
     rounds[0] += 1
-    return _parse_choice(interrupt(payload), question_id)
+    raw = interrupt(payload)
+    if is_question_cancel(raw):
+        return CHOICE_CANCELLED
+    return _parse_choice(raw, question_id)
 
 
 async def _locate_device(
@@ -329,14 +359,47 @@ async def _locate_device(
     model_call: Callable[[str], Awaitable[str]] | None,
     rounds: list[int],
     emitter: ThinkingEmitter,
+    graph_key: str = "",
 ) -> tuple[PlanQuery, DeviceCandidate] | str:
-    """检索设备并由用户确认；用户补充文字后带上上一轮结果重新检索。"""
+    """检索设备并由用户确认；用户补充文字后带上上一轮结果重新检索。
+
+    多候选（含词元/索引兜底召回）时先用模型在候选内选一次，选中项排到第一位并标记推荐；
+    无论候选多少都由用户确认，模型选择不替代人工确认。
+    """
 
     while True:
-        candidates = await asyncio.to_thread(_graph_plan().search_devices, client, query)
+        candidates = await asyncio.to_thread(
+            _graph_plan().search_devices,
+            client,
+            query,
+            graph_key=graph_key,
+        )
         if not candidates:
+            logger.warning(
+                f"处置方案设备召回为空: device_name={query.device_name!r} "
+                f"device_type={query.device_type!r} location={query.location_hint!r}"
+            )
             return NO_DEVICE_MESSAGE
-        picked = _pick_device(candidates, query, rounds, emitter=emitter)
+        recommended_id: str | None = None
+        selection: dict[str, Any] | None = None
+        if len(candidates) > 1:
+            recommended_id, selection = await _select_device_candidate(
+                candidates,
+                query=query,
+                model_call=model_call,
+            )
+        if recommended_id:
+            candidates = _promote_candidate(candidates, recommended_id)
+        picked = _pick_device(
+            candidates,
+            query,
+            rounds,
+            emitter=emitter,
+            recommended_id=recommended_id,
+            selection=selection,
+        )
+        if picked is CHOICE_CANCELLED:
+            return CHOICE_CANCELLED_MESSAGE
         if isinstance(picked, DeviceCandidate):
             return query, picked
         if picked:
@@ -346,25 +409,81 @@ async def _locate_device(
             return CHOICE_ABORTED_MESSAGE
 
 
+async def _select_device_candidate(
+    candidates: list[DeviceCandidate],
+    *,
+    query: PlanQuery,
+    model_call: Callable[[str], Awaitable[str]] | None,
+) -> tuple[str | None, dict[str, Any] | None]:
+    """模型在候选内选择设备；返回 (推荐候选 id, 选择状态信息)。"""
+
+    options = [
+        DeviceOption(
+            device_id=candidate.device_id,
+            name=candidate.name,
+            device_type=candidate.device_type,
+            voltage_level=candidate.voltage_level,
+            path=candidate.path,
+            category=candidate.ledger_class,
+        )
+        for candidate in candidates
+    ]
+    selected_id, state = await select_device(
+        options,
+        user_text=query.raw_text,
+        intent={
+            "device_name": query.device_name,
+            "device_type": query.device_type,
+            "voltage_level": query.voltage_level,
+            "location_hint": query.location_hint,
+        },
+        model_call=model_call,
+    )
+    info = {"state": state, "candidate_count": len(options), "selected_id": selected_id}
+    return selected_id, info
+
+
+def _promote_candidate(candidates: list[DeviceCandidate], selected_id: str) -> list[DeviceCandidate]:
+    """把模型选中的候选挪到第一位，保证推荐项出现在卡片可见范围内。"""
+
+    picked = [candidate for candidate in candidates if candidate.device_id == selected_id]
+    if not picked:
+        return candidates
+    return picked + [candidate for candidate in candidates if candidate.device_id != selected_id]
+
+
 def _pick_device(
-    candidates: list[DeviceCandidate], query: PlanQuery, rounds: list[int], *, emitter: ThinkingEmitter
-) -> DeviceCandidate | str | None:
+    candidates: list[DeviceCandidate],
+    query: PlanQuery,
+    rounds: list[int],
+    *,
+    emitter: ThinkingEmitter,
+    recommended_id: str | None = None,
+    selection: dict[str, Any] | None = None,
+) -> DeviceCandidate | str | None | _ChoiceCancelled:
     """每次都由用户确认目标设备，唯一候选或名称正好命中也不自动采用。
 
     图谱里存在同名/同前缀设备，自动确认一旦选错，后续场景、分支和人员都会按错误设备生成，
     用户很难从结果里发现。卡片允许用户改选候选或自行填写设备名。
     """
 
-    if not candidates:
-        return None
-
     emitter.emit(
         "retrieve_graph",
         "waiting",
         content="等待用户选择目标设备。",
-        data={"source": DEVICE_CHOICE_SOURCE, "candidate_count": len(candidates)},
+        data={
+            "source": DEVICE_CHOICE_SOURCE,
+            "candidate_count": len(candidates),
+            "device_selection": selection,
+        },
     )
-    answer = _ask_choice(_device_payload(query, candidates), DEVICE_QUESTION_ID, rounds)
+    answer = _ask_choice(
+        _device_payload(query, candidates, recommended_id=recommended_id),
+        DEVICE_QUESTION_ID,
+        rounds,
+    )
+    if answer is CHOICE_CANCELLED:
+        return CHOICE_CANCELLED
     if answer is None:
         return None
     selected, free_text = answer
@@ -377,11 +496,26 @@ def _pick_device(
     return selected or None
 
 
-def _device_payload(query: PlanQuery, candidates: list[DeviceCandidate]) -> dict[str, Any]:
+def _device_choice_error_code(message: str) -> str:
+    """设备选择终止文案 → 思考步骤错误码：区分用户取消、轮次用尽与真的没找到。"""
+
+    if message == CHOICE_CANCELLED_MESSAGE:
+        return "device_choice_cancelled"
+    if message == CHOICE_ABORTED_MESSAGE:
+        return "choice_aborted"
+    return "device_not_found"
+
+
+def _device_payload(
+    query: PlanQuery,
+    candidates: list[DeviceCandidate],
+    *,
+    recommended_id: str | None = None,
+) -> dict[str, Any]:
     """设备选择卡片：展示前 MAX_DEVICE_CANDIDATES 个候选，value 用设备 id 便于回填。
 
     选项 label 只放设备名/类型/电压，层级路径作为 description 供同名设备区分，避免把
-    “目标设备”显示成一长串路径。
+    “目标设备”显示成一长串路径；模型选中的候选在 label 末尾标记“（推荐）”。
     """
 
     return {
@@ -391,7 +525,11 @@ def _device_payload(query: PlanQuery, candidates: list[DeviceCandidate]) -> dict
                 "question_id": DEVICE_QUESTION_ID,
                 "question": DEVICE_CHOICE_QUESTION,
                 "options": [
-                    {"label": candidate.label(), "value": candidate.device_id, "description": candidate.location()}
+                    {
+                        "label": candidate.label() + ("（推荐）" if candidate.device_id == recommended_id else ""),
+                        "value": candidate.device_id,
+                        "description": candidate.location(),
+                    }
                     for candidate in candidates[:MAX_DEVICE_CANDIDATES]
                 ],
                 "multi_select": False,
@@ -425,6 +563,8 @@ def _choose_scene(
             data={"source": SCENE_CHOICE_SOURCE, "candidate_count": len(ranked)},
         )
         answer = _ask_choice(_scene_payload(query, ranked), SCENE_QUESTION_ID, rounds)
+        if answer is CHOICE_CANCELLED:
+            return CHOICE_CANCELLED_MESSAGE
         if answer is None:
             return CHOICE_ABORTED_MESSAGE
         selected, free_text = answer

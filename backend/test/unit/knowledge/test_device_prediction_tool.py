@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +13,7 @@ from yuxi.knowledge.device_prediction import graph as graph_module
 from yuxi.knowledge.device_prediction import tool as tool_module
 from yuxi.knowledge.device_prediction.contracts import (
     CHOICE_ABORTED_MESSAGE,
+    CHOICE_CANCELLED_MESSAGE,
     DEVICE_CHOICE_SOURCE,
     DEVICE_ID_UNRESOLVED_MESSAGE,
     HEALTH_SERVICE_UNAVAILABLE_MESSAGE,
@@ -32,7 +34,6 @@ from yuxi.knowledge.device_prediction.services import PredictionServiceError
 pytestmark = pytest.mark.unit
 
 PREDICT = getattr(tool_module.predict_device, "coroutine", None) or tool_module.predict_device
-
 KG_OPTION = {
     "server_url": "bolt://fake:7688",
     "graph": "kg3",
@@ -156,7 +157,7 @@ def _install(
     monkeypatch.setattr(
         graph_module,
         "search_devices",
-        lambda client, query, limit=8: candidates if candidates is not None else [DEVICE],
+        lambda client, query, limit=8, graph_key="": candidates if candidates is not None else [DEVICE],
     )
     monkeypatch.setattr(graph_module, "resolve_device_id", fake_resolve)
     calls: list[dict] = []
@@ -216,7 +217,7 @@ def test_graph_name_falls_back_to_default_when_option_key_missing(monkeypatch):
     option.pop("device_prediction_graph")
     _install(monkeypatch)
     monkeypatch.setattr(tool_module, "fault_trace_opts", _FakeOption(option))
-    monkeypatch.setattr(graph_module, "search_devices", lambda client, query, limit=8: [])
+    monkeypatch.setattr(graph_module, "search_devices", lambda client, query, limit=8, graph_key="": [])
 
     assert _run(monkeypatch) == NO_DEVICE_MESSAGE
     assert _FakeClient.instances[0].config.graph == "kg5"
@@ -291,7 +292,7 @@ def test_graph_query_failure_returns_fixed_message_and_closes_client(monkeypatch
 
     _install(monkeypatch)
 
-    def failing(client, query, limit=8):
+    def failing(client, query, limit=8, graph_key=""):
         raise TuGraphError("database does not exist")
 
     monkeypatch.setattr(graph_module, "search_devices", failing)
@@ -412,3 +413,53 @@ def test_free_text_choice_retries_with_previous_query(monkeypatch):
 
     assert seen[-1][0] == "2号主变"
     assert seen[-1][1] is not None
+
+
+def test_device_card_close_cancels(monkeypatch):
+    """关闭设备卡片是取消：不能把 reject 当补充设备名再识别一次。"""
+
+    other = DeviceCandidate("LGR#tr2", "2号主变", device_type="变压器", voltage_level="110kV")
+    _install(monkeypatch, candidates=[DEVICE, other])
+    monkeypatch.setattr(tool_module, "interrupt", lambda payload: "reject")
+    seen: list[tuple] = []
+
+    async def fake_intent(text, *, model_call, previous=None):
+        seen.append((text, previous))
+        return PredictionQuery(raw_text=text, device_name="1号主变")
+
+    monkeypatch.setattr(tool_module, "extract_prediction_intent", fake_intent)
+
+    assert _run(monkeypatch) == CHOICE_CANCELLED_MESSAGE
+    # 只有最初的意图识别；关闭卡片不再触发一次“补充设备名”的重新识别。
+    assert len(seen) == 1
+
+
+def test_model_selection_marks_recommended_candidate(monkeypatch):
+    """模型在候选内选中设备只决定推荐位，用户仍需在卡片上确认。"""
+
+    other = DeviceCandidate("LGR#tr2", "2号主变", device_type="变压器", voltage_level="110kV")
+    monkeypatch.setattr(
+        graph_module,
+        "search_devices",
+        lambda client, query, limit=8, graph_key="": [DEVICE, other],
+    )
+    recorder = _InterruptRecorder([{"device_prediction_device": other.device_id}])
+    monkeypatch.setattr(tool_module, "interrupt", recorder)
+
+    async def choosing(_prompt):
+        return json.dumps({"device_id": other.device_id})
+
+    located = asyncio.run(
+        tool_module._locate_device(
+            object(),
+            PredictionQuery(raw_text="2号主变健康状态"),
+            model_call=choosing,
+            emitter=_Emitter(),
+            graph_key="",
+        )
+    )
+
+    assert located[1] is other
+    options = recorder.payloads[0]["questions"][0]["options"]
+    assert options[0]["value"] == other.device_id
+    assert options[0]["label"].endswith("（推荐）")

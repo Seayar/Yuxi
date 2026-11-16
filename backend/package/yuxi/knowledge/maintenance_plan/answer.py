@@ -81,6 +81,7 @@ def assemble_report(
     return ScenarioPlanReport(
         title=f"{evidence.device.name} {evidence.scenario.name}处置方案",
         device_label=evidence.device.label(),
+        device_location=evidence.device.location(),
         scenario_name=evidence.scenario.name,
         level=evidence.scenario.level,
         branch_dimension=branch.dimension if branch is not None else "",
@@ -106,6 +107,7 @@ def build_plan_markdown(report: ScenarioPlanReport) -> str:
         f"# {report.title}",
         "",
         f"- 目标设备：{report.device_label}",
+        f"- 设备位置：{report.device_location}" if report.device_location else "- 设备位置：—",
         f"- 检修作业场景：{report.scenario_name}" + (f"（{report.level}）" if report.level else ""),
         f"- 执行分支：{report.branch_dimension} = {report.branch_condition}（{report.branch}）"
         if report.branch_dimension

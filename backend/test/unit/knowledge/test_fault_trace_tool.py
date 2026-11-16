@@ -130,7 +130,7 @@ def _evidence(*, with_chain: bool = True) -> FaultGraphEvidence:
 def _patch_success(monkeypatch, *, values: dict | None = None):
     monkeypatch.setattr(tool_module, "fault_trace_opts", _FakeOption(_kg_option()))
 
-    def fake_find(_client, _names):
+    def fake_find(_client, _names, **_kwargs):
         return [DEVICE]
 
     def fake_resolve(_client, _device):
@@ -718,7 +718,7 @@ async def test_trace_fault_supports_type_level_phenomena_without_mode(monkeypatc
 async def test_trace_fault_asks_for_device_when_not_found(monkeypatch):
     _patch_success(monkeypatch)
 
-    def fake_find(_client, _names):
+    def fake_find(_client, _names, **_kwargs):
         return []
 
     monkeypatch.setattr(workflow_module, "find_devices", fake_find)
@@ -741,7 +741,7 @@ async def test_trace_fault_returns_candidates_when_ambiguous(monkeypatch):
         "properties": {**DEVICE["properties"], "台账ID列表": "other"},
     }
 
-    def fake_find(_client, _names):
+    def fake_find(_client, _names, **_kwargs):
         return [DEVICE, second]
 
     monkeypatch.setattr(workflow_module, "find_devices", fake_find)
@@ -761,7 +761,7 @@ async def test_trace_fault_maps_graph_error_without_leaking_address(monkeypatch)
     events: list[dict] = []
     monkeypatch.setattr(thinking_module, "get_stream_writer", lambda: events.append)
 
-    def fake_find(_client, _names):
+    def fake_find(_client, _names, **_kwargs):
         raise TuGraphError("boom at bolt://192.168.138.10:7688")
 
     monkeypatch.setattr(workflow_module, "find_devices", fake_find)
@@ -844,7 +844,7 @@ async def test_trace_fault_merges_realtime_values_across_ledger_ids(monkeypatch)
     }
     calls: list[str] = []
 
-    def fake_find(_client, _names):
+    def fake_find(_client, _names, **_kwargs):
         return [device]
 
     async def fake_values(device_id, _attributes):
@@ -861,6 +861,76 @@ async def test_trace_fault_merges_realtime_values_across_ledger_ids(monkeypatch)
     assert calls == ["old-id", "3b7y"]
     steps = {step["step_id"]: step for step in result["thinking_steps"]}
     assert steps["match_causal_chain"]["data"]["causes"][0]["status"] == "established"
+
+
+@pytest.mark.asyncio
+async def test_trace_fault_uses_model_selected_device(monkeypatch):
+    """多候选时模型在候选内选中一台：收敛为该设备并继续展示确认卡片。"""
+
+    _patch_success(monkeypatch)
+    other = {
+        **DEVICE,
+        "id": "LGR#3b7z",
+        "name": "3B-7Z",
+        "properties": {**DEVICE["properties"], "名称": "3B-7Z"},
+    }
+    monkeypatch.setattr(workflow_module, "find_devices", lambda _client, _names, **_kwargs: [DEVICE, other])
+
+    async def passthrough(_client, devices, _text):
+        return devices
+
+    async def selecting(options, *, user_text, intent=None, model_call=None):
+        assert [option.device_id for option in options] == ["LGR#3b7y", "LGR#3b7z"]
+        return DEVICE["id"], "selected"
+
+    monkeypatch.setattr(workflow_module, "_disambiguate_devices", passthrough)
+    monkeypatch.setattr(workflow_module, "select_device", selecting)
+    asked: list[dict] = []
+
+    def confirming(payload):
+        asked.append(payload)
+        return {payload["questions"][0]["question_id"]: payload["questions"][0]["options"][0]["value"]}
+
+    monkeypatch.setattr(workflow_module, "interrupt", confirming)
+
+    result = await FAULT_FN(query_text="3B-7Y 通道内树木倒伏压覆导线", runtime=_runtime())
+
+    assert "report" in result
+    assert asked[0]["intent_plan"]["device_name"] == "3B-7Y"
+
+
+@pytest.mark.asyncio
+async def test_trace_fault_keeps_ambiguous_clarification_when_model_returns_null(monkeypatch):
+    """模型返回 null（不确定）时保留多候选澄清，不猜设备。"""
+
+    _patch_success(monkeypatch)
+    other = {
+        **DEVICE,
+        "id": "LGR#3b7z",
+        "name": "3B-7Z",
+        "properties": {**DEVICE["properties"], "名称": "3B-7Z"},
+    }
+    monkeypatch.setattr(workflow_module, "find_devices", lambda _client, _names, **_kwargs: [DEVICE, other])
+
+    async def passthrough(_client, devices, _text):
+        return devices
+
+    async def not_selecting(_options, *, user_text, intent=None, model_call=None):
+        return None, "no_selection"
+
+    monkeypatch.setattr(workflow_module, "_disambiguate_devices", passthrough)
+    monkeypatch.setattr(workflow_module, "select_device", not_selecting)
+
+    def unexpected(_payload):
+        raise AssertionError("不应发确认卡片")
+
+    monkeypatch.setattr(workflow_module, "interrupt", unexpected)
+
+    result = await FAULT_FN(query_text="3B-7Y 通道内树木倒伏压覆导线", runtime=_runtime())
+
+    assert result["clarification"] == DEVICE_AMBIGUOUS_MESSAGE
+    assert result["needs_clarification"] is True
+    assert len(result["candidates"]) == 2
 
 
 @pytest.mark.asyncio

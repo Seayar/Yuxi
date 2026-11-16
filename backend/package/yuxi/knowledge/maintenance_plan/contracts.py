@@ -31,6 +31,8 @@ PLAN_VERIFICATION_FAILED_MESSAGE = "处置方案证据校验未通过，无法�
 CLARIFY_ALL_MESSAGE = "未能识别完整的任务信息，请明确目标设备和检修作业场景"
 CLARIFY_DEVICE_MESSAGE = "请明确目标设备（设备名称），例如：#3开闭所 3k18、35kV#1变电站 991SVG开关"
 CHOICE_ABORTED_MESSAGE = "交互次数过多，未完成处置方案生成，请补充完整信息后重新提交"
+# 用户关闭设备/场景选择卡片：按取消结束本次生成，不把关闭值当成补充内容重新识别。
+CHOICE_CANCELLED_MESSAGE = "已取消本次处置方案生成，请重新提交任务"
 BRANCH_UNRESOLVED_MESSAGE = "未读取到该设备的检修分支判定值，无法生成标准化处置方案"
 NO_PERMISSION_MESSAGE = "无法获取当前用户的知识库权限"
 PLAIN_TOOL_MESSAGES = frozenset(
@@ -42,6 +44,7 @@ PLAIN_TOOL_MESSAGES = frozenset(
         CLARIFY_ALL_MESSAGE,
         CLARIFY_DEVICE_MESSAGE,
         CHOICE_ABORTED_MESSAGE,
+        CHOICE_CANCELLED_MESSAGE,
         BRANCH_UNRESOLVED_MESSAGE,
         NO_PERMISSION_MESSAGE,
     }
@@ -316,6 +319,7 @@ class ScenarioPlanReport:
 
     title: str
     device_label: str
+    device_location: str
     scenario_name: str
     level: str
     branch_dimension: str
