@@ -5,19 +5,20 @@ from __future__ import annotations
 import asyncio
 import json
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
 from yuxi.agents.toolkits.tugraph import TuGraphError
 from yuxi.knowledge.device_prediction import graph as graph_module
 from yuxi.knowledge.device_prediction import tool as tool_module
+from yuxi.knowledge.fault_trace.ledger import LedgerDevice
 from yuxi.knowledge.device_prediction.contracts import (
     CHOICE_ABORTED_MESSAGE,
     CHOICE_CANCELLED_MESSAGE,
     DEVICE_CHOICE_SOURCE,
     DEVICE_ID_UNRESOLVED_MESSAGE,
     HEALTH_SERVICE_UNAVAILABLE_MESSAGE,
-    NO_DEVICE_MESSAGE,
     NO_PERMISSION_MESSAGE,
     PREDICTION_GRAPH_NOT_CONFIGURED_MESSAGE,
     PREDICTION_SERVICE_UNAVAILABLE_MESSAGE,
@@ -42,6 +43,16 @@ KG_OPTION = {
     "username": "u",
     "password": "p",
 }
+
+
+@pytest.fixture(autouse=True)
+def empty_ledger_candidates(monkeypatch):
+    async def search(*args, **kwargs):
+        del args, kwargs
+        return []
+
+    monkeypatch.setattr(tool_module.ledger_repository, "search_devices", search)
+
 
 DEVICE = DeviceCandidate(
     "LGR#tr1",
@@ -90,7 +101,7 @@ class _FakeOption:
 
 
 class _FakeClient:
-    instances: list["_FakeClient"] = []
+    instances: list[_FakeClient] = []
 
     def __init__(self, config) -> None:
         self.config = config
@@ -137,7 +148,8 @@ def _install(
     monkeypatch.setattr(tool_module, "TuGraphClient", _FakeClient)
     _FakeClient.instances = []
 
-    async def fake_intent(text, *, model_call, previous=None):
+    async def fake_intent(text, *, model_call, previous=None, device_override=None):
+        del device_override
         return PredictionQuery(raw_text=text, device_name="1号主变", device_type="变压器")
 
     async def fake_resolve(device):
@@ -157,9 +169,19 @@ def _install(
     monkeypatch.setattr(
         graph_module,
         "search_devices",
-        lambda client, query, limit=8, graph_key="": candidates if candidates is not None else [DEVICE],
+        lambda client, query, limit=24, graph_key="", ledger_candidates=(): (
+            candidates if candidates is not None else [DEVICE]
+        ),
     )
     monkeypatch.setattr(graph_module, "resolve_device_id", fake_resolve)
+
+    def confirm_first_option(payload):
+        question = payload["questions"][0]
+        if not question["options"]:
+            return None
+        return {question["question_id"]: question["options"][0]["value"]}
+
+    monkeypatch.setattr(tool_module, "interrupt", confirm_first_option)
     calls: list[dict] = []
 
     def fake_guidance(client, *, fault_type, device_type="", limit=20):
@@ -217,9 +239,13 @@ def test_graph_name_falls_back_to_default_when_option_key_missing(monkeypatch):
     option.pop("device_prediction_graph")
     _install(monkeypatch)
     monkeypatch.setattr(tool_module, "fault_trace_opts", _FakeOption(option))
-    monkeypatch.setattr(graph_module, "search_devices", lambda client, query, limit=8, graph_key="": [])
+    monkeypatch.setattr(
+        graph_module,
+        "search_devices",
+        lambda client, query, limit=24, graph_key="", ledger_candidates=(): [],
+    )
 
-    assert _run(monkeypatch) == NO_DEVICE_MESSAGE
+    assert _run(monkeypatch) == CHOICE_ABORTED_MESSAGE
     assert _FakeClient.instances[0].config.graph == "kg5"
 
 
@@ -281,10 +307,72 @@ def test_missing_permission_context_returns_fixed_message(monkeypatch):
     assert asyncio.run(PREDICT("评估1号主变的健康状态", runtime=SimpleNamespace(context=None))) == NO_PERMISSION_MESSAGE
 
 
-def test_unknown_device_returns_fixed_message(monkeypatch):
+def test_unknown_device_opens_free_text_card_and_then_aborts(monkeypatch):
+    """零候选不能直接终止，应让用户填写新设备名；持续为空才按轮次预算终止。"""
+
+    recorder = _InterruptRecorder()
+    _install(monkeypatch, candidates=[])
+    monkeypatch.setattr(tool_module, "interrupt", recorder)
+
+    assert _run(monkeypatch) == CHOICE_ABORTED_MESSAGE
+    assert len(recorder.payloads) == 4
+    assert recorder.payloads[0]["questions"][0]["options"] == []
+
+
+def test_missing_device_fields_also_open_free_text_card(monkeypatch):
+    """设备字段完全缺失时同样进入设备卡片，而不是直接返回普通澄清。"""
+
+    recorder = _InterruptRecorder()
     _install(monkeypatch, candidates=[])
 
-    assert _run(monkeypatch) == NO_DEVICE_MESSAGE
+    async def unclear(text, *, model_call, previous=None, device_override=None):
+        del model_call, previous, device_override
+        return PredictionQuery(
+            raw_text=text,
+            clarification_required=True,
+            clarification_message="未能识别设备",
+        )
+
+    monkeypatch.setattr(tool_module, "extract_prediction_intent", unclear)
+    monkeypatch.setattr(tool_module, "interrupt", recorder)
+
+    assert _run(monkeypatch, query="帮我看看这个设备") == CHOICE_ABORTED_MESSAGE
+    assert recorder.payloads[0]["questions"][0]["options"] == []
+    assert "填写正确的设备名称" in recorder.payloads[0]["questions"][0]["question"]
+
+
+def test_missing_device_fields_still_use_raw_text_for_ledger_recall(monkeypatch):
+    """设备字段缺失时，台账按完整原文召回并映射图谱后进入卡片。"""
+
+    _install(monkeypatch)
+    captured: dict[str, Any] = {}
+
+    async def unclear(text, *, model_call, previous=None, device_override=None):
+        del model_call, previous, device_override
+        return PredictionQuery(raw_text=text, clarification_required=True, clarification_message="未能识别设备")
+
+    async def ledger_search(text, **kwargs):
+        captured["text"] = text
+        captured["kwargs"] = kwargs
+        return [LedgerDevice("ledger-line", "银开线", "输电线路", "110kV", ("输电设施",), score=92.0)]
+
+    def graph_search(client, query, *, graph_key="", ledger_candidates=(), limit=24):
+        del client, query, graph_key, limit
+        captured["ledger_count"] = len(ledger_candidates)
+        return [DEVICE]
+
+    recorder = _InterruptRecorder([{"device_prediction_device": DEVICE.device_id}])
+    monkeypatch.setattr(tool_module, "extract_prediction_intent", unclear)
+    monkeypatch.setattr(tool_module.ledger_repository, "search_devices", ledger_search)
+    monkeypatch.setattr(graph_module, "search_devices", graph_search)
+    monkeypatch.setattr(tool_module, "interrupt", recorder)
+
+    result = _run(monkeypatch, query="评估110kV银开线未来故障风险")
+
+    assert result["answer_verified"] is True
+    assert captured["text"] == "评估110kV银开线未来故障风险"
+    assert captured["kwargs"]["minimum_score"] == 60.0
+    assert captured["ledger_count"] == 1
 
 
 def test_graph_query_failure_returns_fixed_message_and_closes_client(monkeypatch):
@@ -292,7 +380,7 @@ def test_graph_query_failure_returns_fixed_message_and_closes_client(monkeypatch
 
     _install(monkeypatch)
 
-    def failing(client, query, limit=8, graph_key=""):
+    def failing(client, query, limit=24, graph_key="", ledger_candidates=()):
         raise TuGraphError("database does not exist")
 
     monkeypatch.setattr(graph_module, "search_devices", failing)
@@ -331,6 +419,7 @@ def test_health_service_failure_skips_prediction_step(monkeypatch):
     assert _run(monkeypatch) == HEALTH_SERVICE_UNAVAILABLE_MESSAGE
     assert emitters[0].events == [
         ("load_device", "started"),
+        ("load_device", "waiting"),
         ("load_device", "completed"),
         ("health_assessment", "started"),
         ("fault_prediction", "started"),
@@ -366,6 +455,20 @@ def test_unverified_report_is_not_returned(monkeypatch):
 # ---------------------------------------------------------------------------
 # 设备选择中断
 # ---------------------------------------------------------------------------
+def test_single_candidate_still_requires_user_confirmation(monkeypatch):
+    """唯一候选仍弹设备确认卡片，由用户确认后才执行。"""
+
+    recorder = _InterruptRecorder([{"device_prediction_device": DEVICE.device_id}])
+    _install(monkeypatch, candidates=[DEVICE])
+    monkeypatch.setattr(tool_module, "interrupt", recorder)
+
+    result = _run(monkeypatch)
+
+    assert result["answer_verified"] is True
+    assert len(recorder.payloads) == 1
+    assert recorder.payloads[0]["questions"][0]["options"][0]["value"] == DEVICE.device_id
+
+
 def test_ambiguous_device_choice_uses_selected_candidate(monkeypatch):
     """候选同分时发选择卡片，用户选中哪个就用哪个。"""
 
@@ -394,8 +497,8 @@ def test_choice_budget_exhausted_returns_fixed_message(monkeypatch):
     assert len(recorder.payloads) == 4
 
 
-def test_free_text_choice_retries_with_previous_query(monkeypatch):
-    """自由输入时把补充文字交给意图解析，并带上上一轮结果重新检索。"""
+def test_free_text_choice_replaces_previous_device(monkeypatch):
+    """自由输入时把新设备交给意图解析，旧设备不能作为兜底再次命中。"""
 
     other = DeviceCandidate("LGR#tr2", "2号主变", device_type="变压器", voltage_level="110kV")
     recorder = _InterruptRecorder([{"device_prediction_device": {"text": "2号主变"}}])
@@ -403,9 +506,9 @@ def test_free_text_choice_retries_with_previous_query(monkeypatch):
     monkeypatch.setattr(tool_module, "interrupt", recorder)
     seen: list[tuple] = []
 
-    async def fake_intent(text, *, model_call, previous=None):
-        seen.append((text, previous))
-        return PredictionQuery(raw_text=text, device_name="1号主变", device_type="变压器")
+    async def fake_intent(text, *, model_call, previous=None, device_override=None):
+        seen.append((text, previous, device_override))
+        return PredictionQuery(raw_text=text, device_name=device_override or "1号主变", device_type="变压器")
 
     monkeypatch.setattr(tool_module, "extract_prediction_intent", fake_intent)
 
@@ -413,6 +516,7 @@ def test_free_text_choice_retries_with_previous_query(monkeypatch):
 
     assert seen[-1][0] == "2号主变"
     assert seen[-1][1] is not None
+    assert seen[-1][2] == "2号主变"
 
 
 def test_device_card_close_cancels(monkeypatch):
@@ -423,7 +527,8 @@ def test_device_card_close_cancels(monkeypatch):
     monkeypatch.setattr(tool_module, "interrupt", lambda payload: "reject")
     seen: list[tuple] = []
 
-    async def fake_intent(text, *, model_call, previous=None):
+    async def fake_intent(text, *, model_call, previous=None, device_override=None):
+        del device_override
         seen.append((text, previous))
         return PredictionQuery(raw_text=text, device_name="1号主变")
 
@@ -441,7 +546,7 @@ def test_model_selection_marks_recommended_candidate(monkeypatch):
     monkeypatch.setattr(
         graph_module,
         "search_devices",
-        lambda client, query, limit=8, graph_key="": [DEVICE, other],
+        lambda client, query, limit=24, graph_key="", ledger_candidates=(): [DEVICE, other],
     )
     recorder = _InterruptRecorder([{"device_prediction_device": other.device_id}])
     monkeypatch.setattr(tool_module, "interrupt", recorder)

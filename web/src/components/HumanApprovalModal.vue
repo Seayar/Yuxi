@@ -161,7 +161,9 @@
                   class="option-label"
                   :class="{
                     recommended:
-                      optionIndex === 0 && String(optionItem.label).includes('(Recommended)')
+                      optionIndex === 0 &&
+                      (String(optionItem.label).includes('(Recommended)') ||
+                        String(optionItem.label).includes('（推荐）'))
                   }"
                 >
                   {{ optionItem.label }}
@@ -995,10 +997,16 @@ const formattedToolArgs = computed(() => formatToolApprovalArgs(activeToolReques
   display: flex;
   flex-direction: column;
   gap: 2px;
+  max-height: min(48vh, 420px);
+  padding-right: 4px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
 }
 
 .option-item {
   display: flex;
+  flex: 0 0 auto;
   align-items: center;
   gap: 12px;
   box-sizing: border-box;

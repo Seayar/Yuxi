@@ -25,8 +25,10 @@ from yuxi.knowledge.device_selection import (
     STATE_NO_SELECTION,
     STATE_SELECTED,
     DeviceOption,
+    build_device_choice_payload,
     build_candidate_payload,
     build_selection_prompt,
+    parse_device_choice,
     parse_selection,
     select_device,
 )
@@ -123,6 +125,30 @@ def test_candidate_payload_trims_path_and_dedupes():
     assert [item["id"] for item in payload] == ["a", "b"]
     assert payload[0]["path"] == "站3 > 设备A"
     assert "type" not in payload[1]
+
+
+def test_device_choice_payload_is_shared_and_parses_free_text():
+    """三个工具共用同一卡片协议；自由输入与取消不会被误认为候选 id。"""
+
+    options = [DeviceOption("id-a", "设备A", "开关柜", "10kV", "站 > 间隔 > 设备A")]
+    payload = build_device_choice_payload(
+        source="test",
+        question_id="device",
+        question="请选择设备",
+        options=options,
+        recommended_id="id-a",
+    )
+
+    option = payload["questions"][0]["options"][0]
+    assert option == {
+        "label": "设备A（开关柜，10kV）（推荐）",
+        "value": "id-a",
+        "description": "站 > 间隔 > 设备A",
+    }
+    assert parse_device_choice({"device": "id-a"}, "device").selected_id == "id-a"
+    assert parse_device_choice({"device": {"type": "other", "text": "设备B"}}, "device").free_text == "设备B"
+    assert parse_device_choice("reject", "device").cancelled is True
+    assert parse_device_choice(None, "device").empty is True
 
 
 def test_selection_prompt_contains_rules_and_candidates():

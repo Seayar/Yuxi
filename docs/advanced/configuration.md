@@ -91,19 +91,21 @@ kg5 的 `设备实例.台账ID列表` 为 `补充数据` 等占位时，`sources
 | `DEVICE_HEALTH_BASE_URL` | `device_prediction_opts` 的 `health_base_url` → `device_prediction/services.py` | 系统配置优先；系统配置与环境变量都未填时工具返回“设备健康评估服务未配置”；请求路径 `GET /api/device-health/{deviceId}` |
 | `DEVICE_PREDICTION_INTENT_ENABLED` | `device_prediction/intent.py` | 缺省 `true`；设为 `0`/`false`/`no` 时设备语义解析与状态解读都走确定性路径 |
 
-走管理员系统配置时不需要环境变量；环境变量只在对应配置项字段留空时兜底，已保存的配置不会被环境变量覆盖。`kg5` 不可达或未建图时，图连接失败在设备检索阶段返回“设备预测维护知识图谱未配置或不可用”；图可达但没有匹配设备时返回“未在设备台账中找到该设备”；设备节点没有可用 `台账ID列表` 且三区台账里也没有精确同名行时返回“未找到该设备的台账 ID”。设备类型下没有匹配的故障现象时，报告只标注所需资源与注意事项未匹配。三区台账由运维更新到 MinIO，进程内缓存 5 分钟。字段口径、服务响应与未联调范围见[设备预测维护智能体](../develop-guides/decisions/implemented/2026-11-09-device-prediction-agent.md)。
+走管理员系统配置时不需要环境变量；环境变量只在对应配置项字段留空时兜底，已保存的配置不会被环境变量覆盖。`kg5` 不可达或未建图时，图连接失败在设备检索阶段返回“设备预测维护知识图谱未配置或不可用”；图可达但没有匹配设备时打开允许自由输入的设备确认卡片，由用户补写设备名；设备节点没有可用 `台账ID列表` 且三区台账里也没有精确同名行时返回“未找到该设备的台账 ID”。设备类型下没有匹配的故障现象时，报告只标注所需资源与注意事项未匹配。三区台账由运维更新到 MinIO，进程内缓存 5 分钟。字段口径、服务响应与未联调范围见[设备预测维护智能体](../develop-guides/decisions/implemented/2026-11-09-device-prediction-agent.md)。
 
 ### 设备识别与候选选择（三个智能体共用）
 
-故障溯源、处置方案与设备预测维护共用同一套“候选召回 → 模型在候选内选择”逻辑：先按名称精确/写法变体、包含、词元、设备类型/位置、设备名索引逐级召回有界候选，再由当前 Agent 模型在候选内选择目标设备（目标不在候选中时返回 `null`，不做猜测）。模型不可用或返回非法结果时回退规则排序。设备确认环节保持各智能体的既有约束：处置方案每次弹设备确认卡片；故障溯源保留确认卡片；设备预测维护唯一候选直接采用、多候选（>1）弹卡片，不再按“名称精确匹配”静默采用。设备名索引按 `{服务地址}|{图名}` 在进程内缓存，只用于召回。
+故障溯源、处置方案与设备预测维护共用同一套“图谱 + 台账召回 → 有界候选 → 用户确认”逻辑。知识图谱的 `设备实例` 节点拥有可执行设备与后续证据；MinIO 台账 `fault-assets/ledger/devices.json` 提供更完整的设备名、类型、电压和层级召回。名称精确/写法变体、包含、设备名索引和台账近似命中始终合并，不因已有精确命中而短路；词元与设备类型查询只在名称召回为空时补充。台账命中按名称或台账 ID 映射回图谱节点，无法映射的行不进入候选。
+
+三个模块每次都弹设备确认卡片，唯一候选也不自动采用；零候选时卡片允许用户直接填写设备名。当前 Agent 模型只能在最多 24 个候选中返回推荐 id，推荐项排在首位并标记“（推荐）”，不能代替用户确认。用户在卡片自由填写设备名时，本轮输入替换旧设备名、类型、电压和位置，只继承任务和故障现象等非设备上下文。
 
 | 变量 | 读取者 | 缺省与条件 |
 |---|---|---|
 | `DEVICE_SELECTION_ENABLED` | `knowledge/device_selection.py` | 缺省 `true`；设为 `0`/`false`/`no` 时跳过模型选择，只用规则排序 |
-| `DEVICE_SELECTION_MAX_CANDIDATES` | `device_selection.py` | 缺省 `24`；交给模型的候选上限，按调用方现有排序截断 |
+| `DEVICE_SELECTION_MAX_CANDIDATES` | `device_selection.py` | 缺省 `24`；模型提示词与三个模块确认卡片的统一候选上限 |
 | `DEVICE_SELECTION_PATH_SEGMENTS` | `device_selection.py` | 缺省 `3`；提示词里层级路径只保留末尾段数 |
 | `DEVICE_NAME_INDEX_TTL_SECONDS`、`DEVICE_NAME_INDEX_MAX_ENTRIES` | `device_index.py` | 缺省 `600` 秒与 `5000` 条；索引一次读取 `设备实例` 后在进程内复用 |
-| `DEVICE_NAME_INDEX_CANDIDATES`、`DEVICE_NAME_TOKEN_RECALL_LIMIT`、`DEVICE_RECALL_MAX_RECORDS` | `device_index.py` | 缺省 `8`、`3` 与 `24`；索引逐个名称返回的候选数、词元召回最多使用的词元数、兜底召回最多交给后续步骤的记录数 |
+| `DEVICE_NAME_INDEX_CANDIDATES`、`DEVICE_NAME_TOKEN_RECALL_LIMIT`、`DEVICE_RECALL_MAX_RECORDS` | `device_index.py` | 缺省 `24`、`3` 与 `24`；索引单个名称查询返回数、词元召回最多使用的词元数、合并召回最多交给后续步骤的记录数；最终仍受 `DEVICE_SELECTION_MAX_CANDIDATES` 限制 |
 
 ## 电力规范问答图谱
 

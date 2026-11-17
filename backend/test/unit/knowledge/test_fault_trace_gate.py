@@ -89,10 +89,7 @@ def test_unverified_report_is_not_published(gate: dict, payload: dict) -> None:
 
     messages = [_message("human", "3B-7Y 通道内树木倒伏"), _message("tool", _report(**payload))]
 
-    assert (
-        gate["_resolve_fault_trace_output"](messages, "模型内容")
-        == contracts.REPORT_VERIFICATION_FAILED_MESSAGE
-    )
+    assert gate["_resolve_fault_trace_output"](messages, "模型内容") == contracts.REPORT_VERIFICATION_FAILED_MESSAGE
 
 
 def test_report_from_other_source_is_not_published(gate: dict) -> None:
@@ -109,10 +106,7 @@ def test_report_from_other_source_is_not_published(gate: dict) -> None:
         ),
     ]
 
-    assert (
-        gate["_resolve_fault_trace_output"](messages, "模型内容")
-        == contracts.REPORT_VERIFICATION_FAILED_MESSAGE
-    )
+    assert gate["_resolve_fault_trace_output"](messages, "模型内容") == contracts.REPORT_VERIFICATION_FAILED_MESSAGE
 
 
 def test_plain_fixed_message_passes_through(gate: dict) -> None:
@@ -142,20 +136,15 @@ def test_plain_text_not_in_whitelist_falls_back(gate: dict) -> None:
 def test_clarification_payload_publishes_fixed_question(gate: dict) -> None:
     """工具真实返回的澄清载荷必须发布固定问句，不回退成模型自由文本。"""
 
-    from yuxi.agents.thinking import ThinkingEmitter
-    from yuxi.knowledge.fault_trace.workflow import _clarify
-
-    payload = _clarify(
-        ThinkingEmitter(agent_slug=contracts.FAULT_TRACE_AGENT_SLUG, steps=contracts.FAULT_TRACE_THINKING_STEPS),
-        query=contracts.FaultTraceQuery(device_name="3B-7Y", phenomena=["通道异常"]),
-        fallback=contracts.DEVICE_NOT_FOUND_MESSAGE,
-    )
+    payload = {
+        "query": contracts.FaultTraceQuery(device_name="3B-7Y", phenomena=["通道异常"]).model_dump(),
+        "clarification": contracts.DEVICE_NOT_FOUND_MESSAGE,
+        "needs_clarification": True,
+        "thinking_steps": [],
+    }
     messages = [
         _message("human", "3B-7Y 通道异常"),
         _message("tool", json.dumps(payload, ensure_ascii=False), tool_call_id="call-1"),
     ]
 
-    assert (
-        gate["_resolve_fault_trace_output"](messages, "模型自己编的一段结论")
-        == contracts.DEVICE_NOT_FOUND_MESSAGE
-    )
+    assert gate["_resolve_fault_trace_output"](messages, "模型自己编的一段结论") == contracts.DEVICE_NOT_FOUND_MESSAGE

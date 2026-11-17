@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from yuxi.knowledge.device_selection import DEVICE_SELECTION_MAX_CANDIDATES
 from yuxi.thinking import ThinkingStepSpec, register_thinking_steps
 
 MAINTENANCE_PLAN_AGENT_SLUG = "maintenance-plan-agent"
@@ -96,8 +97,8 @@ DEVICE_TYPES = (
     "隔离开关",
 )
 
-# 设备候选超过该数量时只展示前 N 个供用户选择
-MAX_DEVICE_CANDIDATES = 8
+# 设备候选统一召回与展示上限；与设备模型选择的有界候选保持一致。
+MAX_DEVICE_CANDIDATES = DEVICE_SELECTION_MAX_CANDIDATES
 # 场景候选超过该数量时只展示前 N 个供用户选择
 MAX_SCENE_CANDIDATES = 8
 # 一次请求内最多的引导选择/补充轮次（设备/场景共用），超过返回 CHOICE_ABORTED_MESSAGE

@@ -6,17 +6,18 @@ import asyncio
 import json
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
 from yuxi.knowledge.maintenance_plan import graph_plan as graph_plan_module
 from yuxi.knowledge.maintenance_plan import tool as tool_module
+from yuxi.knowledge.fault_trace.ledger import LedgerDevice
 from yuxi.knowledge.maintenance_plan.branch import BranchLookup
 from yuxi.knowledge.maintenance_plan.contracts import (
     BRANCH_UNRESOLVED_MESSAGE,
     CHOICE_ABORTED_MESSAGE,
     CHOICE_CANCELLED_MESSAGE,
-    NO_DEVICE_MESSAGE,
     NO_SCENE_MESSAGE,
     PLAN_GRAPH_NOT_CONFIGURED_MESSAGE,
     PLAN_VERIFICATION_FAILED_MESSAGE,
@@ -46,6 +47,15 @@ KG_OPTION = {
 }
 
 
+@pytest.fixture(autouse=True)
+def empty_ledger_candidates(monkeypatch):
+    async def search(*args, **kwargs):
+        del args, kwargs
+        return []
+
+    monkeypatch.setattr(tool_module.ledger_repository, "search_devices", search)
+
+
 class _FakeOption:
     def __init__(self, value: dict) -> None:
         self._value = value
@@ -55,7 +65,7 @@ class _FakeOption:
 
 
 class _FakeClient:
-    instances: list["_FakeClient"] = []
+    instances: list[_FakeClient] = []
 
     def __init__(self, config) -> None:
         self.config = config
@@ -127,14 +137,17 @@ def _install(monkeypatch, *, branch=None, evidence=None, tools=None, personnel=N
     monkeypatch.setattr(tool_module, "fault_trace_opts", _FakeOption(KG_OPTION))
     monkeypatch.setattr(tool_module, "TuGraphClient", _FakeClient)
 
-    async def fake_intent(text, *, model_call, previous=None, feedback=None):
+    async def fake_intent(text, *, model_call, previous=None, feedback=None, device_override=None):
+        del device_override
         return PlanQuery(device_name="3k18")
 
     monkeypatch.setattr(tool_module, "extract_plan_intent", fake_intent)
     monkeypatch.setattr(
         graph_plan_module,
         "search_devices",
-        lambda client, query, limit=8, graph_key="": candidates if candidates is not None else [DEVICE],
+        lambda client, query, limit=24, graph_key="", ledger_candidates=(): (
+            candidates if candidates is not None else [DEVICE]
+        ),
     )
     monkeypatch.setattr(
         graph_plan_module, "find_scenes", lambda client, device: scenes if scenes is not None else [SCENE]
@@ -150,6 +163,8 @@ def _install(monkeypatch, *, branch=None, evidence=None, tools=None, personnel=N
         """设备卡片每次都会弹；测试里默认选第一个候选，等价于用户点了首项。"""
 
         question = payload["questions"][0]
+        if not question["options"]:
+            return None
         return {question["question_id"]: question["options"][0]["value"]}
 
     monkeypatch.setattr(tool_module, "interrupt", confirm_first_option)
@@ -220,12 +235,76 @@ def test_full_flow_returns_verified_plan(monkeypatch):
     assert _FakeClient.instances[-1].config.graph == "kg5"
 
 
-def test_device_not_found_returns_fixed_message(monkeypatch):
+def test_device_not_found_opens_free_text_card_then_aborts(monkeypatch):
+    """零候选仍显示自由输入卡片，持续没有输入才按交互预算终止。"""
+
     _install(monkeypatch, candidates=[])
+    recorder = _InterruptRecorder()
+    monkeypatch.setattr(tool_module, "interrupt", recorder)
 
     result = asyncio.run(GENERATE("不存在设备", runtime=_context()))
 
-    assert result == NO_DEVICE_MESSAGE
+    assert result == CHOICE_ABORTED_MESSAGE
+    assert len(recorder.payloads) == 4
+    assert recorder.payloads[0]["questions"][0]["options"] == []
+
+
+def test_missing_device_fields_also_open_free_text_card(monkeypatch):
+    """意图完全没抽出设备时也进入设备卡片，不直接结束为普通澄清文案。"""
+
+    _install(monkeypatch, candidates=[])
+
+    async def unclear(text, *, model_call, previous=None, feedback=None, device_override=None):
+        del model_call, previous, feedback, device_override
+        return PlanQuery(
+            raw_text=text,
+            clarification_required=True,
+            clarification_message="未能识别设备",
+        )
+
+    recorder = _InterruptRecorder()
+    monkeypatch.setattr(tool_module, "extract_plan_intent", unclear)
+    monkeypatch.setattr(tool_module, "interrupt", recorder)
+
+    result = asyncio.run(GENERATE("帮我看看这个设备", runtime=_context()))
+
+    assert result == CHOICE_ABORTED_MESSAGE
+    assert recorder.payloads[0]["questions"][0]["options"] == []
+    assert "填写正确的设备名称" in recorder.payloads[0]["questions"][0]["question"]
+
+
+def test_missing_device_fields_still_use_raw_text_for_ledger_recall(monkeypatch):
+    """意图字段为空时，台账可从完整原文召回，映射图谱后直接进入确认卡片。"""
+
+    _install(monkeypatch)
+    captured: dict[str, Any] = {}
+
+    async def unclear(text, *, model_call, previous=None, feedback=None, device_override=None):
+        del model_call, previous, feedback, device_override
+        return PlanQuery(raw_text=text, clarification_required=True, clarification_message="未能识别设备")
+
+    async def ledger_search(text, **kwargs):
+        captured["text"] = text
+        captured["kwargs"] = kwargs
+        return [LedgerDevice("ledger-line", "银开线", "输电线路", "110kV", ("输电设施",), score=92.0)]
+
+    def graph_search(client, query, *, graph_key="", ledger_candidates=(), limit=24):
+        del client, query, graph_key, limit
+        captured["ledger_count"] = len(ledger_candidates)
+        return [DEVICE]
+
+    recorder = _InterruptRecorder([{"maintenance_plan_device": DEVICE.device_id}])
+    monkeypatch.setattr(tool_module, "extract_plan_intent", unclear)
+    monkeypatch.setattr(tool_module.ledger_repository, "search_devices", ledger_search)
+    monkeypatch.setattr(graph_plan_module, "search_devices", graph_search)
+    monkeypatch.setattr(tool_module, "interrupt", recorder)
+
+    result = asyncio.run(GENERATE("110kV银开线故障，请出处置方案", runtime=_context()))
+
+    assert "report" in result
+    assert captured["text"] == "110kV银开线故障，请出处置方案"
+    assert captured["kwargs"]["minimum_score"] == 60.0
+    assert captured["ledger_count"] == 1
 
 
 def test_scene_not_found_returns_fixed_message(monkeypatch):
@@ -319,9 +398,7 @@ def test_tie_of_top_scores_asks_user(monkeypatch):
         lambda items, query: [replace(items[0], score=100.0), replace(items[1], score=100.0)],
     )
 
-    result = tool_module._choose_scene(
-        [first, second], PlanQuery(raw_text="开关柜整柜更换"), [0], emitter=_Emitter()
-    )
+    result = tool_module._choose_scene([first, second], PlanQuery(raw_text="开关柜整柜更换"), [0], emitter=_Emitter())
 
     assert result.scene_id == "SCENE_B4"
     assert recorder.payloads[0]["source"] == SCENE_CHOICE_SOURCE
@@ -412,7 +489,8 @@ def test_device_card_close_cancels_without_reintent(monkeypatch):
     _install(monkeypatch)
     calls: list[int] = []
 
-    async def counting(text, *, model_call, previous=None, feedback=None):
+    async def counting(text, *, model_call, previous=None, feedback=None, device_override=None):
+        del device_override
         calls.append(1)
         return PlanQuery(device_name="3k18")
 
@@ -450,7 +528,7 @@ def test_locate_device_uses_model_selection_as_recommendation(monkeypatch):
     monkeypatch.setattr(
         graph_plan_module,
         "search_devices",
-        lambda client, query, limit=8, graph_key="": candidates,
+        lambda client, query, limit=24, graph_key="", ledger_candidates=(): candidates,
     )
     recorder = _InterruptRecorder([{"maintenance_plan_device": other.device_id}])
     monkeypatch.setattr(tool_module, "interrupt", recorder)
@@ -474,6 +552,53 @@ def test_locate_device_uses_model_selection_as_recommendation(monkeypatch):
     assert [item["value"] for item in options] == [other.device_id, DEVICE.device_id]
     assert options[0]["label"].endswith("（推荐）")
     assert not options[1]["label"].endswith("（推荐）")
+
+
+def test_free_text_replaces_previous_device_instead_of_backfilling(monkeypatch):
+    """设备卡片改填后，旧设备名不能通过上一轮合并再次成为检索条件。"""
+
+    other = DeviceCandidate(
+        "LGR#kbs1",
+        "#1开闭所",
+        "开闭所",
+        "10kV",
+        "变电设施 > 110kV变电站 > #1开闭所",
+    )
+    monkeypatch.setattr(
+        graph_plan_module,
+        "search_devices",
+        lambda client, query, limit=24, graph_key="", ledger_candidates=(): (
+            [DEVICE] if query.device_name == "3k18" else [other]
+        ),
+    )
+    calls: list[str | None] = []
+
+    async def fake_extract(text, *, model_call, previous=None, feedback=None, device_override=None):
+        del model_call, previous
+        calls.append(device_override)
+        return PlanQuery(raw_text=text, device_name=device_override or "3k18", device_type="开闭所")
+
+    monkeypatch.setattr(tool_module, "extract_plan_intent", fake_extract)
+    recorder = _InterruptRecorder(
+        [
+            {"maintenance_plan_device": {"type": "other", "text": "#1开闭所"}},
+            {"maintenance_plan_device": other.device_id},
+        ]
+    )
+    monkeypatch.setattr(tool_module, "interrupt", recorder)
+
+    result = asyncio.run(
+        tool_module._locate_device(
+            object(),
+            PlanQuery(raw_text="3k18 检修", device_name="3k18"),
+            model_call=None,
+            rounds=[0],
+            emitter=_Emitter(),
+        )
+    )
+
+    assert calls == ["#1开闭所"]
+    assert result[1] is other
 
 
 def test_single_candidate_does_not_call_model(monkeypatch):
@@ -513,7 +638,7 @@ def test_cache_is_scoped_per_query_text(monkeypatch):
     assert second is first
     assert calls == [1]
 
-    third = asyncio.run(GENERATE("991SVG 开关柜柜内检修", runtime=runtime))
+    asyncio.run(GENERATE("991SVG 开关柜柜内检修", runtime=runtime))
     assert len(calls) == 2
     cache = getattr(runtime.context, tool_module.RESULT_ATTR)
     assert set(cache) == {"3k18 开关柜整柜更换", "991SVG 开关柜柜内检修"}
@@ -535,6 +660,8 @@ def test_choice_budget_aborts(monkeypatch):
     recorder = _InterruptRecorder([])
     monkeypatch.setattr(tool_module, "interrupt", recorder)
 
-    result = tool_module._choose_scene([SCENE, SCENE], PlanQuery(raw_text="3k18"), [tool_module.MAX_CHOICE_ROUNDS], emitter=_Emitter())
+    result = tool_module._choose_scene(
+        [SCENE, SCENE], PlanQuery(raw_text="3k18"), [tool_module.MAX_CHOICE_ROUNDS], emitter=_Emitter()
+    )
 
     assert result == CHOICE_ABORTED_MESSAGE

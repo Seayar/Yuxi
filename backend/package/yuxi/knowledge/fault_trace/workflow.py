@@ -22,7 +22,13 @@ from langgraph.types import interrupt
 
 from yuxi.agents.thinking import ThinkingEmitter
 from yuxi.knowledge.device_index import graph_key as device_graph_key
-from yuxi.knowledge.device_selection import DeviceOption, select_device
+from yuxi.knowledge.device_selection import (
+    DeviceOption,
+    build_device_choice_payload,
+    parse_device_choice,
+    promote_option,
+    select_device,
+)
 from yuxi.knowledge.fault_trace.answer import (
     build_fault_trace_payload,
     build_summary_text,
@@ -30,8 +36,7 @@ from yuxi.knowledge.fault_trace.answer import (
     supporting_phenomena,
 )
 from yuxi.knowledge.fault_trace.contracts import (
-    DEVICE_AMBIGUOUS_MESSAGE,
-    DEVICE_NOT_FOUND_MESSAGE,
+    DEVICE_CHOICE_SOURCE,
     DEVICE_TYPE_MISSING_MESSAGE,
     ENTITY_CAUSE,
     ENTITY_PHENOMENON,
@@ -42,6 +47,7 @@ from yuxi.knowledge.fault_trace.contracts import (
     IMAGE_SERVICE_UNAVAILABLE_MESSAGE,
     INTENT_ATTEMPTS_EXHAUSTED_MESSAGE,
     INTENT_CANCELLED_MESSAGE,
+    MAX_DEVICE_CANDIDATES,
     NO_FAULT_GRAPH_MESSAGE,
     REALTIME_UNAVAILABLE_STATUSES,
     REL_CAUSE_TYPE,
@@ -65,18 +71,13 @@ from yuxi.knowledge.fault_trace.graph_kg3 import (
 )
 from yuxi.knowledge.fault_trace.images import DeviceImageError, resolve_device_image
 from yuxi.knowledge.fault_trace.intent import (
+    FAULT_QUESTION_ID_CANDIDATE,
     MAX_INTENT_ATTEMPTS,
-    build_confirmation_payload,
-    build_correction_payload,
-    build_intent_plan,
-    extract_correction_text,
     extract_fault_trace_intent,
-    parse_intent_confirmation,
 )
 from yuxi.knowledge.fault_trace.ledger import LedgerDevice, ledger_repository
 from yuxi.knowledge.fault_trace.realtime import read_realtime_values
 from yuxi.knowledge.fault_trace.report_text import compose_location_reasoning, compose_summary_text
-from yuxi.utils.question_utils import is_question_cancel
 from yuxi.knowledge.fault_trace.rules import (
     evaluate_causes,
     located_causes,
@@ -112,6 +113,8 @@ class _PreparedDevice:
     device_type_name: str
     device_type_node: dict[str, Any]
     ledger_device: LedgerDevice | None
+    effective_query_text: str
+    discarded_device_names: tuple[str, ...]
 
 
 @dataclass
@@ -119,7 +122,6 @@ class FaultTraceState:
     """一次故障溯源工作流的显式状态；四个步骤只读写这里。"""
 
     query_text: str
-    confirmed_intent: bool
     context: Any
     runtime: ToolRuntime | None
     config: TuGraphConfig
@@ -144,6 +146,7 @@ class FaultTraceState:
     matched_phenomena: list[dict[str, Any]] = field(default_factory=list)
     reasoning_rows: list[dict[str, Any]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    discarded_device_names: tuple[str, ...] = ()
     located_all: list[Any] = field(default_factory=list)
     located: Any = None
     supporting: list[str] = field(default_factory=list)
@@ -158,6 +161,13 @@ class _WorkflowExit(Exception):
     def __init__(self, result: Any) -> None:
         super().__init__("workflow exited")
         self.result = result
+
+
+class _ChoiceCancelled:
+    """用户关闭设备确认卡片。"""
+
+
+CHOICE_CANCELLED = _ChoiceCancelled()
 
 
 async def run_fault_trace(state: FaultTraceState) -> Any:
@@ -192,7 +202,6 @@ async def _parse_fault(state: FaultTraceState, client: TuGraphClient) -> None:
         image_payload=state.image_payload,
         context=state.context,
         emitter=state.emitter,
-        confirmed_intent=state.confirmed_intent,
         graph_key=device_graph_key(state.config),
     )
     if isinstance(prepared, str):
@@ -212,6 +221,8 @@ async def _parse_fault(state: FaultTraceState, client: TuGraphClient) -> None:
         raise _WorkflowExit(prepared)
 
     state.query = prepared.query
+    state.query_text = prepared.effective_query_text
+    state.discarded_device_names = prepared.discarded_device_names
     state.device = prepared.device
     state.device_type_name = prepared.device_type_name
     state.device_type_node = prepared.device_type_node
@@ -263,6 +274,15 @@ async def _parse_fault(state: FaultTraceState, client: TuGraphClient) -> None:
         image_fault_name=state.query.image_fault_name,
         model_call=state.model_call,
     )
+    if _uses_discarded_device(state.summary_text, state.discarded_device_names):
+        state.summary_text = await compose_summary_text(
+            query_text=state.query_text,
+            device_name=str(state.device.get("name") or state.query.device_name or ""),
+            device_type=state.device_type_name,
+            phenomena=list(state.query.phenomena),
+            image_fault_name=state.query.image_fault_name,
+            model_call=None,
+        )
     state.emitter.emit(
         "parse_fault",
         "completed",
@@ -402,6 +422,15 @@ async def _generate_report(state: FaultTraceState) -> dict[str, Any]:
         phenomena=state.supporting,
         model_call=state.model_call,
     )
+    if _uses_discarded_device(location_reasoning, state.discarded_device_names):
+        location_reasoning = await compose_location_reasoning(
+            query_text=state.query_text,
+            device_name=str(state.device.get("name") or ""),
+            located_causes=state.located_all,
+            causes=report_causes,
+            phenomena=state.supporting,
+            model_call=None,
+        )
     matched_names = [str(node.get("name") or "").strip() for node in state.matched_phenomena]
     matched_names = [name for name in matched_names if name]
     summary_phenomenon = state.supporting[0] if state.supporting else (matched_names[0] if matched_names else None)
@@ -447,62 +476,16 @@ async def _generate_report(state: FaultTraceState) -> dict[str, Any]:
     return payload
 
 
-def _clarify(
-    emitter: ThinkingEmitter,
-    query: FaultTraceQuery,
-    fallback: str,
-    image_payload: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    message = query.clarification_message or fallback
-    emitter.emit(
-        "parse_fault",
-        "waiting",
-        content=message,
-        data={
-            "reason": "needs_clarification",
-            "question": message,
-            "clarification": message,
-            "needs_clarification": True,
-            "device": _fault_device_data(query),
-            "image": _intent_image_data(image_payload),
-        },
-    )
-    return {
-        "query": query.model_dump(),
-        "clarification": message,
-        "needs_clarification": True,
-        "thinking_steps": emitter.snapshot(),
-    }
-
-
-def _fault_device_data(query: FaultTraceQuery) -> dict[str, Any]:
-    return {
-        "name": query.device_name,
-        "device_type": query.device_type,
-        "voltage_level": query.voltage_level,
-    }
-
-
 async def _select_device_candidate(
     devices: list[dict[str, Any]],
     *,
     query: FaultTraceQuery,
     query_text: str,
     model_call: Callable[[str], Awaitable[str]] | None,
-) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
-    """多候选设备用模型在候选内选择；选中则收敛为该设备，否则保留澄清路径。"""
+) -> tuple[str | None, dict[str, Any] | None]:
+    """多候选设备用模型给出推荐 id；推荐不替代用户的设备确认。"""
 
-    options = [
-        DeviceOption(
-            device_id=str(device.get("id") or ""),
-            name=str(device.get("name") or ""),
-            voltage_level=str((device.get("properties") or {}).get("电压等级") or "") or None,
-            path=str((device.get("properties") or {}).get("层级路径") or ""),
-            category=str((device.get("properties") or {}).get("设备分类") or "") or None,
-        )
-        for device in devices
-        if str(device.get("id") or "")
-    ]
+    options = _device_options(devices)
     selected_id, state = await select_device(
         options,
         user_text=query_text,
@@ -514,27 +497,98 @@ async def _select_device_candidate(
         model_call=model_call,
     )
     info = {"state": state, "candidate_count": len(options), "selected_id": selected_id}
-    if selected_id:
-        picked = [device for device in devices if str(device.get("id") or "") == selected_id]
-        if picked:
-            return picked, info
-    return devices, info
+    return selected_id, info
 
 
-async def _disambiguate_devices(
-    client: TuGraphClient,
-    devices: list[dict[str, Any]],
-    query_text: str,
-) -> list[dict[str, Any]]:
-    """同名设备按上级变电站名称在问题中的出现消歧。"""
+def _device_options(devices: list[dict[str, Any]]) -> list[DeviceOption]:
+    """把故障图设备映射成共享设备选项。"""
 
-    text = "".join(str(query_text).split())
-    matched: list[dict[str, Any]] = []
+    options: list[DeviceOption] = []
     for device in devices:
-        ancestors = await asyncio.to_thread(device_ancestors, client, device)
-        if any(ancestor and "".join(ancestor.split()) in text for ancestor in ancestors):
-            matched.append(device)
-    return matched if len(matched) == 1 else devices
+        properties = device.get("properties") or {}
+        device_id = str(device.get("id") or "").strip()
+        name = str(device.get("name") or "").strip()
+        if not device_id or not name:
+            continue
+        options.append(
+            DeviceOption(
+                device_id=device_id,
+                name=name,
+                device_type=str(properties.get("台账设备类型") or properties.get("设备分类") or "") or None,
+                voltage_level=str(properties.get("电压等级") or "") or None,
+                path=str(properties.get("层级路径") or ""),
+                category=str(properties.get("设备分类") or "") or None,
+            )
+        )
+    return options
+
+
+def _confirm_device(
+    devices: list[dict[str, Any]],
+    query: FaultTraceQuery,
+    *,
+    recommended_id: str | None,
+    emitter: ThinkingEmitter,
+    selection: dict[str, Any] | None,
+) -> dict[str, Any] | str | None | _ChoiceCancelled:
+    """始终让用户确认设备；零候选时保留自由输入入口。"""
+
+    options = promote_option(_device_options(devices), recommended_id)
+    details = []
+    if query.device_name:
+        details.append(f"当前识别为“{query.device_name}”")
+    if query.phenomena:
+        details.append(f"故障现象“{'、'.join(query.phenomena)}”")
+    suffix = f"（{'；'.join(details)}）" if details else ""
+    question = (
+        f"请确认目标设备{suffix}。候选没有正确设备时，请直接填写设备名称。"
+        if options
+        else "未召回到候选设备，请直接填写正确的设备名称。"
+    )
+    payload = build_device_choice_payload(
+        source=DEVICE_CHOICE_SOURCE,
+        question_id=FAULT_QUESTION_ID_CANDIDATE,
+        question=question,
+        options=options,
+        recommended_id=recommended_id,
+        limit=MAX_DEVICE_CANDIDATES,
+    )
+    payload["intent_plan"] = {
+        "device_name": query.device_name,
+        "device_type": query.device_type,
+        "voltage_level": query.voltage_level,
+        "phenomena": list(query.phenomena),
+    }
+    emitter.emit(
+        "parse_fault",
+        "waiting",
+        content="等待用户确认目标设备。",
+        data={
+            "reason": "device_confirmation",
+            "candidate_count": len(options),
+            "candidates": [
+                {
+                    "device_id": option.device_id,
+                    "name": option.name,
+                    "device_type": option.device_type,
+                    "voltage_level": option.voltage_level,
+                    "path": option.path,
+                }
+                for option in options
+            ],
+            "device_selection": selection,
+        },
+    )
+    choice = parse_device_choice(interrupt(payload), FAULT_QUESTION_ID_CANDIDATE)
+    if choice.cancelled:
+        return CHOICE_CANCELLED
+    if choice.selected_id:
+        device = next((item for item in devices if str(item.get("id") or "") == choice.selected_id), None)
+        if device is not None:
+            return device
+    if choice.free_text:
+        return choice.free_text
+    return choice.selected_id
 
 
 def _ledger_ids(device: dict[str, Any]) -> list[str]:
@@ -683,6 +737,13 @@ def _fault_intent_summary(
     image_name = str((image_payload or {}).get("fault_name") or "").strip()
     suffix = f"，图片识别到{image_name}" if image_name else ""
     return f"识别到 {name}：{phenomena}{suffix}。"
+
+
+def _uses_discarded_device(text: str | None, discarded_names: tuple[str, ...]) -> bool:
+    """模型文本是否重新带回了用户已经替换掉的设备名。"""
+
+    normalized = "".join(str(text or "").split()).casefold()
+    return any((name := "".join(str(item).split()).casefold()) and name in normalized for item in discarded_names)
 
 
 def _referenced_attributes(trigger_nodes: list[dict[str, Any]]) -> list[str]:
@@ -873,103 +934,97 @@ async def _prepare_device(
     image_payload: dict[str, Any] | None,
     context: Any,
     emitter: ThinkingEmitter,
-    confirmed_intent: bool,
     graph_key: str = "",
 ) -> _PreparedDevice | dict[str, Any] | str:
-    """先校验设备存在且可解析类型，再请用户通过选项卡确认；返回澄清载荷或固定文案表示未通过。"""
+    """召回并确认一台图谱设备；用户改填设备时只替换设备身份后重新召回。"""
 
     model_call = _context_model_call(context) if FAULT_TRACE_INTENT_ENABLED else None
-    feedback: str | None = None
     previous: FaultTraceQuery | None = None
+    device_override: str | None = None
+    discarded_device_names: list[str] = []
     for _ in range(MAX_INTENT_ATTEMPTS):
         query = await extract_fault_trace_intent(
             query_text,
             image_result=image_payload,
             model_call=model_call,
             previous=previous,
-            feedback=feedback,
+            device_override=device_override,
         )
-        if query.clarification_required:
-            return _clarify(emitter, query, DEVICE_NOT_FOUND_MESSAGE, image_payload)
-        try:
-            devices = await asyncio.to_thread(
-                find_devices,
-                client,
-                [query.device_name or ""],
-                graph_key=graph_key,
-            )
-        except TuGraphError as exc:
-            logger.warning(f"故障溯源设备查询失败: {exc}")
-            emitter.emit(
-                "parse_fault",
-                "failed",
-                content=FAULT_GRAPH_UNAVAILABLE_MESSAGE,
-                error={"code": "graph_unavailable", "message": FAULT_GRAPH_UNAVAILABLE_MESSAGE},
-            )
-            return FAULT_GRAPH_UNAVAILABLE_MESSAGE
+        recall_text = query.device_name or query_text
+        ledger_candidates = await ledger_repository.search_devices(
+            recall_text,
+            device_type=query.device_type,
+            voltage_level=query.voltage_level,
+            location_hint=query.location_hint,
+            limit=MAX_DEVICE_CANDIDATES,
+            minimum_score=0.0 if query.device_name else 60.0,
+        )
+        if query.clarification_required and not ledger_candidates:
+            devices = []
+        else:
+            try:
+                devices = await asyncio.to_thread(
+                    find_devices,
+                    client,
+                    [recall_text],
+                    graph_key=graph_key,
+                    ledger_candidates=ledger_candidates,
+                    limit=MAX_DEVICE_CANDIDATES * 2,
+                )
+            except TuGraphError as exc:
+                logger.warning(f"故障溯源设备查询失败: {exc}")
+                emitter.emit(
+                    "parse_fault",
+                    "failed",
+                    content=FAULT_GRAPH_UNAVAILABLE_MESSAGE,
+                    error={"code": "graph_unavailable", "message": FAULT_GRAPH_UNAVAILABLE_MESSAGE},
+                )
+                return FAULT_GRAPH_UNAVAILABLE_MESSAGE
         if not devices:
-            logger.warning(f"故障溯源设备召回为空: device_name={query.device_name!r} device_type={query.device_type!r}")
-            emitter.emit(
-                "parse_fault",
-                "waiting",
-                content=DEVICE_NOT_FOUND_MESSAGE,
-                data={
-                    "reason": "device_not_found",
-                    "question": DEVICE_NOT_FOUND_MESSAGE,
-                    "needs_clarification": True,
-                    "device": _fault_device_data(query),
-                    "image": _intent_image_data(image_payload),
-                },
+            logger.warning(
+                f"故障溯源设备召回为空: device_name={query.device_name!r} "
+                f"device_type={query.device_type!r} ledger_candidates={len(ledger_candidates)}"
             )
-            return {
-                "query": query.model_dump(),
-                "clarification": DEVICE_NOT_FOUND_MESSAGE,
-                "needs_clarification": True,
-                "thinking_steps": emitter.snapshot(),
-            }
-        if len(devices) > 1:
-            devices = await _disambiguate_devices(client, devices, query_text)
+
+        devices = devices[:MAX_DEVICE_CANDIDATES]
+        recommended_id: str | None = None
         selection: dict[str, Any] | None = None
         if len(devices) > 1:
-            devices, selection = await _select_device_candidate(
+            recommended_id, selection = await _select_device_candidate(
                 devices,
                 query=query,
                 query_text=query_text,
                 model_call=model_call,
             )
-        if len(devices) > 1:
-            candidates = [
-                {
-                    "device_id": _ledger_id(item),
-                    "name": str(item.get("name") or ""),
-                    "device_type": str((item.get("properties") or {}).get("设备分类") or "") or None,
-                    "voltage_level": str((item.get("properties") or {}).get("电压等级") or "") or None,
-                }
-                for item in devices[:10]
-            ]
-            emitter.emit(
-                "parse_fault",
-                "waiting",
-                content=DEVICE_AMBIGUOUS_MESSAGE,
-                data={
-                    "reason": "device_ambiguous",
-                    "question": DEVICE_AMBIGUOUS_MESSAGE,
-                    "needs_clarification": True,
-                    "candidates": candidates,
-                    "device": _fault_device_data(query),
-                    "image": _intent_image_data(image_payload),
-                    "device_selection": selection,
-                },
-            )
-            return {
-                "query": query.model_dump(),
-                "clarification": DEVICE_AMBIGUOUS_MESSAGE,
-                "candidates": candidates,
-                "needs_clarification": True,
-                "thinking_steps": emitter.snapshot(),
-            }
+            if recommended_id:
+                picked = [device for device in devices if str(device.get("id") or "") == recommended_id]
+                devices = picked + [device for device in devices if str(device.get("id") or "") != recommended_id]
 
-        device = devices[0]
+        picked_device = _confirm_device(
+            devices,
+            query,
+            recommended_id=recommended_id,
+            emitter=emitter,
+            selection=selection,
+        )
+        if picked_device is CHOICE_CANCELLED:
+            return INTENT_CANCELLED_MESSAGE
+        if isinstance(picked_device, dict):
+            device = picked_device
+        elif picked_device:
+            logger.info(f"故障溯源用户改填设备，清除上一轮设备身份: {picked_device!r}")
+            if query.device_name and query.device_name not in discarded_device_names:
+                discarded_device_names.append(query.device_name)
+            previous = query
+            device_override = str(picked_device)
+            continue
+        else:
+            continue
+
+        properties = device.get("properties") or {}
+        query.device_name = str(device.get("name") or query.device_name or "")
+        query.device_type = str(properties.get("台账设备类型") or properties.get("设备分类") or "") or query.device_type
+        query.voltage_level = str(properties.get("电压等级") or query.voltage_level or "") or None
         try:
             device_type_name, device_type_node = await asyncio.to_thread(resolve_device_type, client, device)
             ancestors = await asyncio.to_thread(device_ancestors, client, device)
@@ -993,59 +1048,15 @@ async def _prepare_device(
                 error={"code": "device_type_missing", "message": DEVICE_TYPE_MISSING_MESSAGE},
             )
             return DEVICE_TYPE_MISSING_MESSAGE
-        prepared = _PreparedDevice(
+        return _PreparedDevice(
             query=query,
             device=device,
             device_type_name=device_type_name,
             device_type_node=device_type_node,
             ledger_device=ledger_device,
+            effective_query_text=device_override or query_text,
+            discarded_device_names=tuple(discarded_device_names),
         )
-
-        intent_plan = build_intent_plan(query)
-        intent_plan.update(
-            {
-                "device_name": str(device.get("name") or query.device_name or ""),
-                # 设备类型保留模型/用户确认的识别结果；图谱归类单独展示，溯源证据按图谱归类取。
-                "graph_device_type": device_type_name,
-                "voltage_level": query.voltage_level or str(getattr(ledger_device, "voltage_level", "") or "") or None,
-            }
-        )
-        if confirmed_intent:
-            return prepared
-
-        if feedback:
-            # 重新识别的卡片要显示上一轮补充，用户才能确认输入已被采用。
-            intent_plan["correction"] = feedback
-        emitter.emit(
-            "parse_fault",
-            "waiting",
-            content="等待用户确认故障设备与现象。",
-            data={
-                "reason": "needs_confirmation",
-                "question": "请确认故障设备与故障现象。",
-                "needs_confirmation": True,
-                "device": device_data,
-                "image": _intent_image_data(image_payload),
-                "phenomena": list(query.phenomena),
-                "device_selection": selection,
-            },
-        )
-        answer = interrupt(build_confirmation_payload(intent_plan))
-        decision, correction = parse_intent_confirmation(answer)
-        if decision == "cancel":
-            return INTENT_CANCELLED_MESSAGE
-        if decision == "confirm":
-            # 用户确认即最终口径：直接按已校验的设备继续，不拿模型重算的计划做一致性校验。
-            return prepared
-        if decision == "invalid" or not correction:
-            correction_answer = interrupt(build_correction_payload(intent_plan))
-            if is_question_cancel(correction_answer):
-                return INTENT_CANCELLED_MESSAGE
-            correction = extract_correction_text(correction_answer)
-        if not correction:
-            return INTENT_ATTEMPTS_EXHAUSTED_MESSAGE
-        previous = query
-        feedback = correction
     return INTENT_ATTEMPTS_EXHAUSTED_MESSAGE
 
 

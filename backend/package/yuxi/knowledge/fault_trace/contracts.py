@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from yuxi.knowledge.device_selection import DEVICE_SELECTION_MAX_CANDIDATES
 from yuxi.thinking import ThinkingStepSpec, register_thinking_steps
 
 FAULT_TRACE_THINKING_STEPS = (
@@ -163,6 +164,8 @@ REALTIME_ATTRIBUTE_UNITS = {
 MAX_REALTIME_ATTRIBUTES = 20
 MAX_REPORT_DEVICES = 20
 MAX_REPORT_PATHS = 20
+MAX_DEVICE_CANDIDATES = DEVICE_SELECTION_MAX_CANDIDATES
+DEVICE_CHOICE_SOURCE = "fault_trace_device_choice"
 
 
 @dataclass(frozen=True)
@@ -217,6 +220,7 @@ class FaultTraceQuery:
     device_name: str | None = None
     device_type: str | None = None
     voltage_level: str | None = None
+    location_hint: str | None = None
     phenomena: list[str] = field(default_factory=list)
     image_fault_type: str | None = None
     image_fault_name: str | None = None
@@ -236,6 +240,7 @@ class FaultTraceQuery:
             "device_name": self.device_name,
             "device_type": self.device_type,
             "voltage_level": self.voltage_level,
+            "location_hint": self.location_hint,
             "phenomena": list(self.phenomena),
             "image_fault_type": self.image_fault_type,
             "image_fault_name": self.image_fault_name,

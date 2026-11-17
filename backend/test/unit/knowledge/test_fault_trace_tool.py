@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import base64
+import inspect
 from types import SimpleNamespace
+from typing import Any, TypedDict
 
 import pytest
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import END, START, StateGraph
+from langgraph.types import Command, interrupt
 from yuxi.agents import thinking as thinking_module
 from yuxi.knowledge.fault_trace import tool as tool_module
 from yuxi.knowledge.fault_trace import workflow as workflow_module
 from yuxi.knowledge.fault_trace.contracts import (
-    DEVICE_AMBIGUOUS_MESSAGE,
+    DEVICE_CHOICE_SOURCE,
     DEVICE_NOT_FOUND_MESSAGE,
     FAULT_GRAPH_NOT_CONFIGURED_MESSAGE,
     FAULT_GRAPH_UNAVAILABLE_MESSAGE,
@@ -153,6 +158,9 @@ def _patch_success(monkeypatch, *, values: dict | None = None):
         del ancestors
         return None
 
+    async def fake_ledger_search(*_args, **_kwargs):
+        return []
+
     async def fake_image(_name):
         return None
 
@@ -167,6 +175,15 @@ def _patch_success(monkeypatch, *, values: dict | None = None):
     monkeypatch.setattr(workflow_module, "resolve_device_image", fake_image)
     monkeypatch.setattr(workflow_module, "detect_fault_image", fake_detect)
     monkeypatch.setattr(workflow_module.ledger_repository, "find_device", fake_ledger)
+    monkeypatch.setattr(workflow_module.ledger_repository, "search_devices", fake_ledger_search)
+
+    def confirm_first_option(payload):
+        question = payload["questions"][0]
+        if not question["options"]:
+            return "reject"
+        return {question["question_id"]: question["options"][0]["value"]}
+
+    monkeypatch.setattr(workflow_module, "interrupt", confirm_first_option)
 
 
 def _runtime() -> SimpleNamespace:
@@ -198,9 +215,10 @@ async def test_resolve_kg_config_returns_none_when_incomplete(monkeypatch):
 
 
 def test_tool_schema_hides_confirmation_from_model():
-    """模型不能通过工具参数自行确认意图；确认结论只来自确认卡片。"""
+    """模型和普通调用方都不能通过工具输入跳过设备确认。"""
 
     assert "confirmed_intent" not in tool_module.FaultTraceInput.model_fields
+    assert "confirmed_intent" not in inspect.signature(FAULT_FN).parameters
     assert "image_result" not in tool_module.FaultTraceInput.model_fields
     # 即便调用参数里塞了这两个键，schema 校验也会丢弃它们，服务端函数拿不到。
     parsed = tool_module.FaultTraceInput.model_validate(
@@ -224,7 +242,6 @@ async def test_trace_fault_emits_four_steps_with_fault_graph_data(monkeypatch):
 
     result = await FAULT_FN(
         query_text="3B-7Y 通道内树木倒伏压覆导线",
-        confirmed_intent=True,
         runtime=_runtime(),
     )
 
@@ -293,7 +310,7 @@ async def test_trace_fault_prefers_ledger_device_id(monkeypatch):
     monkeypatch.setattr(workflow_module.ledger_repository, "find_device", fake_ledger)
     monkeypatch.setattr(workflow_module, "read_realtime_values", fake_values)
 
-    result = await FAULT_FN(query_text="3B-7Y 故障", confirmed_intent=True, runtime=_runtime())
+    result = await FAULT_FN(query_text="3B-7Y 故障", runtime=_runtime())
 
     assert called == ["f531"]
     intent = result["thinking_steps"][0]["data"]
@@ -400,7 +417,7 @@ async def test_trace_fault_scopes_location_to_matched_phenomenon(monkeypatch):
     monkeypatch.setattr(workflow_module, "extract_fault_trace_intent", fake_extract)
     monkeypatch.setattr(workflow_module, "read_realtime_values", fake_values)
 
-    result = await FAULT_FN(query_text="3B-7Y 燃烧起火", confirmed_intent=True, runtime=_runtime())
+    result = await FAULT_FN(query_text="3B-7Y 燃烧起火", runtime=_runtime())
 
     report = result["report"]
     assert report["summary"]["phenomenon"] == "燃烧起火"
@@ -448,7 +465,7 @@ async def test_trace_fault_reasoning_keeps_only_yolo_phenomenon(monkeypatch):
     monkeypatch.setattr(workflow_module, "detect_fault_image", fake_detect)
     monkeypatch.setattr(workflow_module, "read_realtime_values", fake_values)
 
-    result = await FAULT_FN(query_text="3B-7Y 通道异常", confirmed_intent=True, runtime=_runtime())
+    result = await FAULT_FN(query_text="3B-7Y 通道异常", runtime=_runtime())
 
     report = result["report"]
     assert [row["phenomenon"] for row in report["reasoning"]] == ["燃烧起火"]
@@ -491,7 +508,7 @@ async def test_trace_fault_reasoning_prefers_yolo_over_text(monkeypatch):
     monkeypatch.setattr(workflow_module, "detect_fault_image", fake_detect)
     monkeypatch.setattr(workflow_module, "read_realtime_values", fake_values)
 
-    result = await FAULT_FN(query_text="3B-7Y 冒烟异常", confirmed_intent=True, runtime=_runtime())
+    result = await FAULT_FN(query_text="3B-7Y 冒烟异常", runtime=_runtime())
 
     report = result["report"]
     assert [row["phenomenon"] for row in report["reasoning"]] == ["燃烧起火"]
@@ -581,7 +598,7 @@ async def test_trace_fault_scopes_verdict_and_evidence_to_matched_phenomenon(mon
     monkeypatch.setattr(workflow_module, "extract_fault_trace_intent", fake_extract)
     monkeypatch.setattr(workflow_module, "read_realtime_values", fake_values)
 
-    result = await FAULT_FN(query_text="3B-7Y 燃烧起火", confirmed_intent=True, runtime=_runtime())
+    result = await FAULT_FN(query_text="3B-7Y 燃烧起火", runtime=_runtime())
 
     report = result["report"]
     assert report["summary"]["phenomenon"] == "燃烧起火"
@@ -660,7 +677,7 @@ async def test_trace_fault_matched_phenomenon_without_causes_keeps_empty_scope(m
     monkeypatch.setattr(workflow_module, "extract_fault_trace_intent", fake_extract)
     monkeypatch.setattr(workflow_module, "read_realtime_values", fake_values)
 
-    result = await FAULT_FN(query_text="3B-7Y 燃烧起火", confirmed_intent=True, runtime=_runtime())
+    result = await FAULT_FN(query_text="3B-7Y 燃烧起火", runtime=_runtime())
 
     location = result["report"]["location"]
     assert location["verdict"] == "none"
@@ -692,7 +709,7 @@ async def test_trace_fault_falls_back_to_phenomena_of_located_causes_when_no_mat
     monkeypatch.setattr(workflow_module, "extract_fault_trace_intent", fake_extract)
     monkeypatch.setattr(workflow_module, "read_realtime_values", fake_values)
 
-    result = await FAULT_FN(query_text="3B-7Y 异物搭挂", confirmed_intent=True, runtime=_runtime())
+    result = await FAULT_FN(query_text="3B-7Y 异物搭挂", runtime=_runtime())
 
     causal = next(step for step in result["thinking_steps"] if step["step_id"] == "match_causal_chain")
     assert any("未匹配到用户描述中的故障现象" in warning for warning in causal["data"]["warnings"])
@@ -706,7 +723,7 @@ async def test_trace_fault_supports_type_level_phenomena_without_mode(monkeypatc
     _patch_success(monkeypatch)
     monkeypatch.setattr(workflow_module, "collect_kg3_evidence", lambda *_args, **_kwargs: _evidence_type_level())
 
-    result = await FAULT_FN(query_text="3B-7Y 故障", confirmed_intent=True, runtime=_runtime())
+    result = await FAULT_FN(query_text="3B-7Y 故障", runtime=_runtime())
 
     steps = {step["step_id"]: step for step in result["thinking_steps"]}
     assert "fault_modes" not in steps["match_causal_chain"]["data"]
@@ -715,25 +732,188 @@ async def test_trace_fault_supports_type_level_phenomena_without_mode(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_trace_fault_asks_for_device_when_not_found(monkeypatch):
+async def test_trace_fault_not_found_opens_cancellable_device_card(monkeypatch):
     _patch_success(monkeypatch)
 
     def fake_find(_client, _names, **_kwargs):
         return []
 
     monkeypatch.setattr(workflow_module, "find_devices", fake_find)
+    asked: list[dict] = []
 
-    result = await FAULT_FN(query_text="未知设备故障", confirmed_intent=True, runtime=_runtime())
+    def cancelling(payload):
+        asked.append(payload)
+        return "reject"
 
-    assert result["clarification"] == DEVICE_NOT_FOUND_MESSAGE
-    steps = result["thinking_steps"]
-    assert [step["step_id"] for step in steps] == ["parse_fault"]
-    assert steps[0]["state"] == "waiting"
-    assert steps[0]["data"]["reason"] == "device_not_found"
+    monkeypatch.setattr(workflow_module, "interrupt", cancelling)
+
+    result = await FAULT_FN(query_text="未知设备故障", runtime=_runtime())
+
+    assert result == INTENT_CANCELLED_MESSAGE
+    assert asked[0]["questions"][0]["options"] == []
 
 
 @pytest.mark.asyncio
-async def test_trace_fault_returns_candidates_when_ambiguous(monkeypatch):
+async def test_trace_fault_missing_device_fields_open_free_text_card(monkeypatch):
+    """意图未识别具体设备时，生产流程仍显示设备卡片并允许自由输入。"""
+
+    _patch_success(monkeypatch)
+
+    async def unclear(*_args, **_kwargs):
+        return FaultTraceQuery(
+            phenomena=["树木倒伏枝干压覆导线"],
+            clarification_required=True,
+            clarification_message=DEVICE_NOT_FOUND_MESSAGE,
+        )
+
+    asked: list[dict] = []
+
+    def cancelling(payload):
+        asked.append(payload)
+        return "reject"
+
+    monkeypatch.setattr(workflow_module, "extract_fault_trace_intent", unclear)
+    monkeypatch.setattr(workflow_module, "interrupt", cancelling)
+
+    result = await FAULT_FN(query_text="帮我看看这个设备", runtime=_runtime())
+
+    assert result == INTENT_CANCELLED_MESSAGE
+    assert asked[0]["source"] == DEVICE_CHOICE_SOURCE
+    assert asked[0]["questions"][0]["options"] == []
+
+
+@pytest.mark.asyncio
+async def test_trace_fault_missing_fields_use_raw_text_for_ledger_recall(monkeypatch):
+    """故障字段缺失时仍按完整原文查台账，并把映射后的图谱设备交给用户确认。"""
+
+    _patch_success(monkeypatch)
+    captured: dict[str, Any] = {}
+
+    async def unclear(*_args, **_kwargs):
+        return FaultTraceQuery(
+            phenomena=["树木倒伏枝干压覆导线"],
+            clarification_required=True,
+            clarification_message=DEVICE_NOT_FOUND_MESSAGE,
+        )
+
+    async def ledger_search(text, **kwargs):
+        captured["text"] = text
+        captured["kwargs"] = kwargs
+        return [LedgerDevice("ledger-line", "3B-7Y", "中压线路", "10kV", ("输电设施",), score=92.0)]
+
+    def fake_find(_client, names, **kwargs):
+        captured["names"] = names
+        captured["ledger_count"] = len(kwargs["ledger_candidates"])
+        return [DEVICE]
+
+    asked: list[dict] = []
+
+    def confirming(payload):
+        asked.append(payload)
+        question_id = payload["questions"][0]["question_id"]
+        return {question_id: DEVICE["id"]}
+
+    monkeypatch.setattr(workflow_module, "extract_fault_trace_intent", unclear)
+    monkeypatch.setattr(workflow_module.ledger_repository, "search_devices", ledger_search)
+    monkeypatch.setattr(workflow_module, "find_devices", fake_find)
+    monkeypatch.setattr(workflow_module, "interrupt", confirming)
+
+    result = await FAULT_FN(query_text="110kV银开线故障", runtime=_runtime())
+
+    assert "report" in result
+    assert captured["text"] == "110kV银开线故障"
+    assert captured["names"] == ["110kV银开线故障"]
+    assert captured["ledger_count"] == 1
+    assert asked[0]["questions"][0]["options"][0]["value"] == DEVICE["id"]
+
+
+@pytest.mark.asyncio
+async def test_trace_fault_does_not_prefilter_candidates_by_old_text(monkeypatch):
+    """用户重新召回后，旧原文中的站点不能把其他候选提前过滤掉。"""
+
+    _patch_success(monkeypatch)
+    other = {**DEVICE, "id": "LGR#other-station", "name": "3B-7Y", "properties": {**DEVICE["properties"]}}
+    monkeypatch.setattr(workflow_module, "find_devices", lambda *_args, **_kwargs: [DEVICE, other])
+
+    def unexpected_ancestor_query(*_args, **_kwargs):
+        raise AssertionError("用户确认前不能按旧原文查询并收窄候选")
+
+    monkeypatch.setattr(workflow_module, "device_ancestors", unexpected_ancestor_query)
+    asked: list[dict] = []
+
+    def cancelling(payload):
+        asked.append(payload)
+        return "reject"
+
+    monkeypatch.setattr(workflow_module, "interrupt", cancelling)
+
+    result = await FAULT_FN(query_text="StationA 3B-7Y 故障", runtime=_runtime())
+
+    assert result == INTENT_CANCELLED_MESSAGE
+    assert [option["value"] for option in asked[0]["questions"][0]["options"]] == [
+        "LGR#3b7y",
+        "LGR#other-station",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_trace_fault_zero_candidates_allows_user_to_replace_device(monkeypatch):
+    """空召回卡片允许用户填写新设备；下一轮只按新输入召回，不保留旧设备。"""
+
+    _patch_success(monkeypatch)
+    replacement = {
+        **DEVICE,
+        "id": "LGR#tr1",
+        "name": "#1主变压器",
+        "properties": {
+            **DEVICE["properties"],
+            "名称": "#1主变压器",
+            "台账ID列表": "tr1",
+            "设备分类": "主变压器",
+        },
+    }
+    overrides: list[str | None] = []
+
+    async def fake_extract(*_args, **kwargs):
+        overrides.append(kwargs.get("device_override"))
+        name = kwargs.get("device_override") or "3B-7Y"
+        return FaultTraceQuery(device_name=name, voltage_level="10kV", phenomena=["树木倒伏枝干压覆导线"])
+
+    def fake_find(_client, names, **_kwargs):
+        return [replacement] if names == ["#1主变压器"] else []
+
+    asked: list[dict] = []
+
+    def answering(payload):
+        asked.append(payload)
+        question_id = payload["questions"][0]["question_id"]
+        if not payload["questions"][0]["options"]:
+            return {question_id: {"type": "other", "text": "#1主变压器"}}
+        return {question_id: payload["questions"][0]["options"][0]["value"]}
+
+    monkeypatch.setattr(workflow_module, "extract_fault_trace_intent", fake_extract)
+    monkeypatch.setattr(workflow_module, "find_devices", fake_find)
+
+    async def stale_model(prompt: str) -> str:
+        if "故障现象简述" in prompt:
+            return "3B-7Z 与 3B-7Y 通道内树木倒伏。"
+        return "3B-7Z 泄漏电流超过判据，应定位到 3B-7Y。"
+
+    monkeypatch.setattr(workflow_module, "_context_model_call", lambda _context: stale_model)
+    monkeypatch.setattr(workflow_module, "interrupt", answering)
+
+    result = await FAULT_FN(query_text="3B-7Y 树木倒伏枝干压覆导线", runtime=_runtime())
+
+    assert "report" in result
+    assert overrides == [None, "#1主变压器"]
+    assert asked[0]["questions"][0]["options"] == []
+    assert asked[1]["questions"][0]["options"][0]["value"] == "LGR#tr1"
+
+
+@pytest.mark.asyncio
+async def test_trace_fault_confirms_all_ambiguous_candidates(monkeypatch):
+    """多候选必须全部出现在设备确认卡片，用户选择后才继续溯源。"""
+
     _patch_success(monkeypatch)
     second = {
         **DEVICE,
@@ -745,14 +925,25 @@ async def test_trace_fault_returns_candidates_when_ambiguous(monkeypatch):
         return [DEVICE, second]
 
     monkeypatch.setattr(workflow_module, "find_devices", fake_find)
+    asked: list[dict] = []
 
-    result = await FAULT_FN(query_text="3B-7Y 故障", confirmed_intent=True, runtime=_runtime())
+    def confirming(payload):
+        asked.append(payload)
+        return {payload["questions"][0]["question_id"]: DEVICE["id"]}
 
-    assert result["clarification"] == DEVICE_AMBIGUOUS_MESSAGE
-    assert len(result["candidates"]) == 2
-    steps = result["thinking_steps"]
-    assert steps[0]["data"]["reason"] == "device_ambiguous"
-    assert steps[0]["data"]["candidates"][0]["device_id"] == "3b7y"
+    monkeypatch.setattr(workflow_module, "interrupt", confirming)
+
+    result = await FAULT_FN(query_text="3B-7Y 故障", runtime=_runtime())
+
+    assert "report" in result
+    assert asked[0]["source"] == DEVICE_CHOICE_SOURCE
+    assert [option["value"] for option in asked[0]["questions"][0]["options"]] == ["LGR#3b7y", "LGR#other"]
+    assert [step["step_id"] for step in result["thinking_steps"]] == [
+        "parse_fault",
+        "match_causal_chain",
+        "trace_topology",
+        "generate_report",
+    ]
 
 
 @pytest.mark.asyncio
@@ -766,7 +957,7 @@ async def test_trace_fault_maps_graph_error_without_leaking_address(monkeypatch)
 
     monkeypatch.setattr(workflow_module, "find_devices", fake_find)
 
-    result = await FAULT_FN(query_text="3B-7Y 故障", confirmed_intent=True, runtime=_runtime())
+    result = await FAULT_FN(query_text="3B-7Y 故障", runtime=_runtime())
 
     assert result == FAULT_GRAPH_UNAVAILABLE_MESSAGE
     failed = next(
@@ -789,34 +980,11 @@ async def test_trace_fault_fails_causal_chain_without_evidence(monkeypatch):
 
     monkeypatch.setattr(workflow_module, "collect_kg3_evidence", fake_collect)
 
-    result = await FAULT_FN(query_text="3B-7Y 故障", confirmed_intent=True, runtime=_runtime())
+    result = await FAULT_FN(query_text="3B-7Y 故障", runtime=_runtime())
 
     assert result == NO_FAULT_GRAPH_MESSAGE
     states = [event["thinking"]["state"] for event in events if event["thinking"]["step_id"] == "match_causal_chain"]
     assert states == ["started", "failed"]
-
-
-@pytest.mark.asyncio
-async def test_trace_fault_keeps_waiting_on_clarification(monkeypatch):
-    monkeypatch.setattr(tool_module, "fault_trace_opts", _FakeOption(_kg_option()))
-
-    async def fake_extract(*_args, **_kwargs):
-        return FaultTraceQuery(
-            device_type="变压器",
-            phenomena=["过热"],
-            clarification_required=True,
-            clarification_message="未能识别故障设备，请明确设备名称后重新提交。",
-        )
-
-    monkeypatch.setattr(workflow_module, "extract_fault_trace_intent", fake_extract)
-
-    result = await FAULT_FN(query_text="变压器过热", confirmed_intent=True, runtime=_runtime())
-
-    assert result["clarification"] == "未能识别故障设备，请明确设备名称后重新提交。"
-    steps = result["thinking_steps"]
-    assert [step["step_id"] for step in steps] == ["parse_fault"]
-    assert steps[0]["state"] == "waiting"
-    assert steps[0]["data"]["reason"] == "needs_clarification"
 
 
 @pytest.mark.asyncio
@@ -826,7 +994,7 @@ async def test_trace_fault_marks_unknown_when_realtime_unavailable(monkeypatch):
         values={"leakage_current": RealtimeValue("leakage_current", "unavailable")},
     )
 
-    result = await FAULT_FN(query_text="3B-7Y 故障", confirmed_intent=True, runtime=_runtime())
+    result = await FAULT_FN(query_text="3B-7Y 故障", runtime=_runtime())
 
     steps = {step["step_id"]: step for step in result["thinking_steps"]}
     assert steps["match_causal_chain"]["data"]["causes"][0]["status"] == "unknown"
@@ -856,7 +1024,7 @@ async def test_trace_fault_merges_realtime_values_across_ledger_ids(monkeypatch)
     monkeypatch.setattr(workflow_module, "find_devices", fake_find)
     monkeypatch.setattr(workflow_module, "read_realtime_values", fake_values)
 
-    result = await FAULT_FN(query_text="3B-7Y 故障", confirmed_intent=True, runtime=_runtime())
+    result = await FAULT_FN(query_text="3B-7Y 故障", runtime=_runtime())
 
     assert calls == ["old-id", "3b7y"]
     steps = {step["step_id"]: step for step in result["thinking_steps"]}
@@ -865,7 +1033,7 @@ async def test_trace_fault_merges_realtime_values_across_ledger_ids(monkeypatch)
 
 @pytest.mark.asyncio
 async def test_trace_fault_uses_model_selected_device(monkeypatch):
-    """多候选时模型在候选内选中一台：收敛为该设备并继续展示确认卡片。"""
+    """多候选时模型只把候选排到推荐位，用户仍在完整卡片里确认。"""
 
     _patch_success(monkeypatch)
     other = {
@@ -876,14 +1044,10 @@ async def test_trace_fault_uses_model_selected_device(monkeypatch):
     }
     monkeypatch.setattr(workflow_module, "find_devices", lambda _client, _names, **_kwargs: [DEVICE, other])
 
-    async def passthrough(_client, devices, _text):
-        return devices
-
     async def selecting(options, *, user_text, intent=None, model_call=None):
         assert [option.device_id for option in options] == ["LGR#3b7y", "LGR#3b7z"]
         return DEVICE["id"], "selected"
 
-    monkeypatch.setattr(workflow_module, "_disambiguate_devices", passthrough)
     monkeypatch.setattr(workflow_module, "select_device", selecting)
     asked: list[dict] = []
 
@@ -896,12 +1060,15 @@ async def test_trace_fault_uses_model_selected_device(monkeypatch):
     result = await FAULT_FN(query_text="3B-7Y 通道内树木倒伏压覆导线", runtime=_runtime())
 
     assert "report" in result
-    assert asked[0]["intent_plan"]["device_name"] == "3B-7Y"
+    options = asked[0]["questions"][0]["options"]
+    assert options[0]["value"] == DEVICE["id"]
+    assert options[0]["label"].endswith("（推荐）")
+    assert len(options) == 2
 
 
 @pytest.mark.asyncio
-async def test_trace_fault_keeps_ambiguous_clarification_when_model_returns_null(monkeypatch):
-    """模型返回 null（不确定）时保留多候选澄清，不猜设备。"""
+async def test_trace_fault_keeps_all_candidates_when_model_returns_null(monkeypatch):
+    """模型返回 null（不确定）时不猜设备，完整候选仍交给用户确认。"""
 
     _patch_success(monkeypatch)
     other = {
@@ -912,25 +1079,23 @@ async def test_trace_fault_keeps_ambiguous_clarification_when_model_returns_null
     }
     monkeypatch.setattr(workflow_module, "find_devices", lambda _client, _names, **_kwargs: [DEVICE, other])
 
-    async def passthrough(_client, devices, _text):
-        return devices
-
     async def not_selecting(_options, *, user_text, intent=None, model_call=None):
         return None, "no_selection"
 
-    monkeypatch.setattr(workflow_module, "_disambiguate_devices", passthrough)
     monkeypatch.setattr(workflow_module, "select_device", not_selecting)
 
-    def unexpected(_payload):
-        raise AssertionError("不应发确认卡片")
+    asked: list[dict] = []
 
-    monkeypatch.setattr(workflow_module, "interrupt", unexpected)
+    def confirming(payload):
+        asked.append(payload)
+        return {payload["questions"][0]["question_id"]: DEVICE["id"]}
+
+    monkeypatch.setattr(workflow_module, "interrupt", confirming)
 
     result = await FAULT_FN(query_text="3B-7Y 通道内树木倒伏压覆导线", runtime=_runtime())
 
-    assert result["clarification"] == DEVICE_AMBIGUOUS_MESSAGE
-    assert result["needs_clarification"] is True
-    assert len(result["candidates"]) == 2
+    assert "report" in result
+    assert [option["value"] for option in asked[0]["questions"][0]["options"]] == ["LGR#3b7y", "LGR#3b7z"]
 
 
 @pytest.mark.asyncio
@@ -949,7 +1114,6 @@ async def test_trace_fault_confirms_after_device_validation(monkeypatch):
 
     result = await FAULT_FN(
         query_text="3B-7Y 通道内树木倒伏压覆导线",
-        confirmed_intent=False,
         runtime=_runtime(),
     )
 
@@ -960,8 +1124,8 @@ async def test_trace_fault_confirms_after_device_validation(monkeypatch):
         for event in events
         if event["thinking"]["step_id"] == "parse_fault" and event["thinking"]["state"] == "waiting"
     )
-    assert waiting["reason"] == "needs_confirmation"
-    assert waiting["device"]["device_id"] == "3b7y"
+    assert waiting["reason"] == "device_confirmation"
+    assert waiting["candidates"][0]["device_id"] == "LGR#3b7y"
     assert [step["step_id"] for step in result["thinking_steps"]] == [
         "parse_fault",
         "match_causal_chain",
@@ -992,7 +1156,6 @@ async def test_trace_fault_ignores_image_json_in_user_text(monkeypatch):
 
     result = await FAULT_FN(
         query_text='3B-7Y 通道内树木倒伏压覆导线 {"fault": false, "fault_name": "无故障"}',
-        confirmed_intent=True,
         runtime=_runtime(),
     )
 
@@ -1025,7 +1188,7 @@ async def test_trace_fault_loads_device_image_and_detects(monkeypatch):
     monkeypatch.setattr(workflow_module, "resolve_device_image", fake_image)
     monkeypatch.setattr(workflow_module, "detect_fault_image", fake_detect)
 
-    result = await FAULT_FN(query_text="3B-7Y 通道异常", confirmed_intent=True, runtime=_runtime())
+    result = await FAULT_FN(query_text="3B-7Y 通道异常", runtime=_runtime())
 
     image = result["thinking_steps"][0]["data"]["image"]
     assert calls == ["3B-7Y"]
@@ -1055,7 +1218,7 @@ async def test_trace_fault_recognizes_uploaded_image_from_state(monkeypatch):
 
     monkeypatch.setattr(workflow_module, "detect_fault_image", fake_detect)
 
-    result = await FAULT_FN(query_text="3B-7Y 通道异常", confirmed_intent=True, runtime=runtime)
+    result = await FAULT_FN(query_text="3B-7Y 通道异常", runtime=runtime)
 
     image = result["thinking_steps"][0]["data"]["image"]
     assert calls == [b"jpeg"]
@@ -1072,7 +1235,7 @@ async def test_trace_fault_clarifies_when_no_image_and_no_phenomenon(monkeypatch
 
     monkeypatch.setattr(workflow_module, "extract_fault_trace_intent", fake_extract)
 
-    result = await FAULT_FN(query_text="3B-7Y 通道异常", confirmed_intent=True, runtime=_runtime())
+    result = await FAULT_FN(query_text="3B-7Y 通道异常", runtime=_runtime())
 
     assert result["clarification"] == IMAGE_NOT_FOUND_MESSAGE
     steps = result["thinking_steps"]
@@ -1093,7 +1256,6 @@ async def test_trace_fault_uses_model_summary_and_reasoning(monkeypatch):
 
     result = await FAULT_FN(
         query_text="3B-7Y 通道内树木倒伏压覆导线",
-        confirmed_intent=True,
         runtime=_runtime(),
     )
 
@@ -1129,8 +1291,8 @@ async def test_trace_fault_continues_when_replay_reidentifies_differently(monkey
 
 
 @pytest.mark.asyncio
-async def test_trace_fault_confirmation_shows_identified_type_with_graph_classification(monkeypatch):
-    """模型识别设备类型与图谱归类不同时并列展示，溯源证据仍按图谱归类读取。"""
+async def test_trace_fault_device_confirmation_keeps_graph_type_as_evidence(monkeypatch):
+    """设备确认后，溯源证据使用图谱归类，不把用户侧类型文本当作图谱事实。"""
 
     _patch_success(monkeypatch)
     asked: list[dict] = []
@@ -1153,14 +1315,15 @@ async def test_trace_fault_confirmation_shows_identified_type_with_graph_classif
     result = await FAULT_FN(query_text="3B-7Y 通道内树木倒伏压覆导线", runtime=_runtime())
 
     question = asked[0]["questions"][0]["question"]
-    assert "设备类型=输电线路（图谱归类：架空线路）" in question
+    assert "当前识别为“3B-7Y”" in question
+    assert asked[0]["questions"][0]["options"][0]["value"] == "LGR#3b7y"
     # 证据按图谱归类取：报告元数据使用图谱解析出的设备类型，而不是模型文本。
     assert result["report"]["meta"]["device_type"] == "架空线路"
 
 
 @pytest.mark.asyncio
-async def test_trace_fault_cancel_on_correction_card_stops(monkeypatch):
-    """关闭“补充修正”卡片按取消结束，不能把取消哨兵当成用户补充重新识别。"""
+async def test_trace_fault_cancel_on_device_card_stops(monkeypatch):
+    """关闭设备确认卡片按取消结束，不能把取消哨兵当成新设备重新识别。"""
 
     _patch_success(monkeypatch)
     payloads: list[dict] = []
@@ -1169,7 +1332,7 @@ async def test_trace_fault_cancel_on_correction_card_stops(monkeypatch):
 
     def answering(payload):
         payloads.append(payload)
-        return "correct" if len(payloads) == 1 else "reject"
+        return "reject"
 
     async def counting_extract(*_args, **_kwargs):
         intent_calls.append(1)
@@ -1182,10 +1345,7 @@ async def test_trace_fault_cancel_on_correction_card_stops(monkeypatch):
     result = await FAULT_FN(query_text="3B-7Y 通道内树木倒伏枝干压覆导线", runtime=_runtime())
 
     assert result == INTENT_CANCELLED_MESSAGE
-    assert [payload["source"] for payload in payloads] == [
-        "fault_trace_intent_confirmation",
-        "fault_trace_intent_correction",
-    ]
+    assert [payload["source"] for payload in payloads] == [DEVICE_CHOICE_SOURCE]
     assert len(intent_calls) == 1
     # 取消要给解析步骤一个终态，历史回显不能一直停在 waiting。
     parse_states = [event["thinking"]["state"] for event in events if event["thinking"]["step_id"] == "parse_fault"]
@@ -1193,8 +1353,8 @@ async def test_trace_fault_cancel_on_correction_card_stops(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_trace_fault_confirmation_value_is_plain_confirm(monkeypatch):
-    """确认卡片的“正确”选项就是普通确认值，不再携带需要比对的信息。"""
+async def test_trace_fault_device_confirmation_value_is_candidate_id(monkeypatch):
+    """设备确认卡片的取值是图谱设备 id，恢复后直接校验该设备。"""
 
     _patch_success(monkeypatch)
     asked: list[dict] = []
@@ -1208,4 +1368,80 @@ async def test_trace_fault_confirmation_value_is_plain_confirm(monkeypatch):
     result = await FAULT_FN(query_text="3B-7Y 通道内树木倒伏压覆导线", runtime=_runtime())
 
     assert "report" in result
-    assert asked[0]["questions"][0]["options"][0]["value"] == "confirm"
+    assert asked[0]["questions"][0]["options"][0]["value"] == "LGR#3b7y"
+
+
+class _ReplayState(TypedDict, total=False):
+    query: str
+    result: dict[str, Any]
+
+
+@pytest.mark.asyncio
+async def test_trace_fault_reexecutes_user_replacement_through_real_graph_replay(monkeypatch):
+    """真实工具节点重放时，先自由输入新设备再确认第二张卡，最终执行用户设备。"""
+
+    _patch_success(monkeypatch)
+    monkeypatch.setattr(workflow_module, "interrupt", interrupt)
+    other = {
+        **DEVICE,
+        "id": "LGR#other",
+        "name": "3B-7Z",
+        "properties": {**DEVICE["properties"], "名称": "3B-7Z", "台账ID列表": "other"},
+    }
+    overrides: list[str | None] = []
+
+    async def fake_extract(*_args, **kwargs):
+        override = kwargs.get("device_override")
+        overrides.append(override)
+        return FaultTraceQuery(
+            device_name=override or "3B-7Z",
+            voltage_level="10kV",
+            phenomena=["树木倒伏枝干压覆导线"],
+        )
+
+    def fake_find(_client, names, **_kwargs):
+        return [DEVICE] if names == ["3B-7Y"] else [other, DEVICE]
+
+    monkeypatch.setattr(workflow_module, "extract_fault_trace_intent", fake_extract)
+    monkeypatch.setattr(workflow_module, "find_devices", fake_find)
+
+    async def run_tool(state: _ReplayState):
+        runtime = SimpleNamespace(
+            context=SimpleNamespace(model=None, skills=["fault-trace"]),
+            tool_call_id="replay-tool",
+            state={},
+        )
+        return {"result": await FAULT_FN(query_text=state["query"], runtime=runtime)}
+
+    builder = StateGraph(_ReplayState)
+    builder.add_node("trace", run_tool)
+    builder.add_edge(START, "trace")
+    builder.add_edge("trace", END)
+    graph = builder.compile(checkpointer=InMemorySaver())
+    config = {"configurable": {"thread_id": "fault-device-replay"}}
+
+    first = await graph.ainvoke({"query": "3B-7Z 树木倒伏枝干压覆导线"}, config=config)
+    first_question = first["__interrupt__"][0].value["questions"][0]
+    second = await graph.ainvoke(
+        Command(
+            resume={
+                first_question["question_id"]: {
+                    "type": "other",
+                    "text": "3B-7Y",
+                }
+            }
+        ),
+        config=config,
+    )
+    second_question = second["__interrupt__"][0].value["questions"][0]
+    final = await graph.ainvoke(
+        Command(resume={second_question["question_id"]: DEVICE["id"]}),
+        config=config,
+    )
+
+    assert overrides[0] is None
+    assert overrides[-1] == "3B-7Y"
+    assert final["result"]["thinking_steps"][0]["data"]["device"]["graph_id"] == DEVICE["id"]
+    assert "3B-7Z" not in final["result"]["answer_markdown"]
+    assert "3B-7Z" not in final["result"]["thinking_steps"][0]["data"]["summary"]
+    assert "3B-7Z" not in final["result"]["report"]["location"]["reasoning"]

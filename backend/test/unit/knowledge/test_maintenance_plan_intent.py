@@ -587,6 +587,38 @@ def test_follow_up_overrides_previous_values():
     assert query.device_name == "3k18"
 
 
+def test_device_override_clears_previous_device_identity():
+    """设备卡片自由输入只替换设备身份，旧设备名/类型/位置不能续用。"""
+
+    previous = PlanQuery(
+        raw_text="检修991SVG开关",
+        task_type="检修",
+        device_name="991SVG开关",
+        device_type="开关柜",
+        voltage_level="35kV",
+        location_hint="35kV#1变电站",
+        scene_hint="柜内检修",
+    )
+
+    query = _run(
+        extract_plan_intent(
+            "设备名写错了，是#1开闭所",
+            model_call=None,
+            previous=previous,
+            feedback="设备名写错了，是#1开闭所",
+            device_override="设备名写错了，是#1开闭所",
+        )
+    )
+
+    assert query.device_name == "#1开闭所"
+    assert query.device_type == "开闭所"
+    assert query.voltage_level is None
+    assert query.location_hint == "#1开闭所"
+    assert query.task_type == "检修"
+    assert query.scene_hint == "柜内检修"
+    assert query.raw_text == "设备名写错了，是#1开闭所"
+
+
 def test_previous_merge_combines_raw_text():
     previous = PlanQuery(raw_text="更换#3开闭所断路器", task_type="更换")
 

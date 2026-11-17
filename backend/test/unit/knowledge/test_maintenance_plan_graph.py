@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 from yuxi.agents.toolkits.tugraph import TuGraphError
+from yuxi.knowledge.fault_trace.ledger import LedgerDevice
 from yuxi.knowledge.maintenance_plan.contracts import (
     BranchSelection,
     DeviceCandidate,
@@ -208,6 +209,83 @@ def test_search_devices_falls_back_to_device_name_index():
 
     assert [item.name for item in candidates] == ["#1开闭所"]
     assert candidates[0].device_type == "开闭所"
+
+
+def test_exact_hit_keeps_similar_ledger_candidate_in_recall():
+    """图谱已有精确命中时，台账命中的近似设备仍必须进入同一候选列表。"""
+
+    similar = {
+        "id": "LGR#3k18-backup",
+        "名称": "3k18备用柜",
+        "层级路径": "变电设施 > 35kV#3变电站 > #3开闭所 > 3k18备用柜",
+        "电压等级": "10kV",
+        "设备分类": "开关柜",
+    }
+
+    class _LedgerRecallClient:
+        def run(self, cypher, **params):
+            if params.get("rel") == "属于":
+                return [
+                    {"a": {"id": "LGR#3k18"}, "b": {"名称": "开关柜"}},
+                    {"a": {"id": "LGR#3k18-backup"}, "b": {"名称": "开关柜"}},
+                ]
+            if "names" in params:
+                return [{"n": similar}]
+            if "= $name" in cypher or "CONTAINS $kw" in cypher:
+                return [{"n": DEVICE_3K18}]
+            return []
+
+    candidates = search_devices(
+        _LedgerRecallClient(),
+        PlanQuery(raw_text="3k18开关柜检修", device_name="3k18"),
+        ledger_candidates=[
+            LedgerDevice(
+                device_id="ledger-3k18-backup",
+                name="3k18备用柜",
+                device_type="开关柜",
+                voltage_level="10kV",
+                path=("变电设施", "35kV#3变电站", "#3开闭所"),
+            )
+        ],
+    )
+
+    assert [item.name for item in candidates] == ["3k18", "3k18备用柜"]
+
+
+def test_ledger_candidate_can_recover_device_when_intent_fields_are_empty():
+    """意图字段缺失时仍允许台账从完整原文召回并映射到图谱。"""
+
+    line = {
+        "id": "LGR#SUPLINEYK",
+        "名称": "银开线",
+        "层级路径": "输电设施 > 银开线",
+        "设备分类": "输电线路",
+    }
+
+    class _RawTextClient:
+        def run(self, cypher, **params):
+            if params.get("rel") == "属于":
+                return [{"a": {"id": "LGR#SUPLINEYK"}, "b": {"名称": "架空线路"}}]
+            if "names" in params:
+                return [{"n": line}]
+            return []
+
+    candidates = search_devices(
+        _RawTextClient(),
+        PlanQuery(raw_text="110kV银开线故障，请出处置方案"),
+        ledger_candidates=[
+            LedgerDevice(
+                "ledger-line",
+                "银开线",
+                "输电线路",
+                "110kV",
+                ("输电设施",),
+                score=92.0,
+            )
+        ],
+    )
+
+    assert [item.name for item in candidates] == ["银开线"]
 
 
 def test_device_candidate_label_hides_the_path():

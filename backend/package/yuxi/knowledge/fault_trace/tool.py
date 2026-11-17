@@ -45,13 +45,11 @@ class FaultTraceInput(BaseModel):
 )
 async def trace_fault(
     query_text: str,
-    confirmed_intent: bool = False,
     runtime: ToolRuntime = None,
 ) -> dict[str, Any] | str:
     """结合用户描述与图片识别结果，沿故障知识图谱生成五段式溯源报告。
 
-    ``confirmed_intent`` 不在 ``FaultTraceInput`` 里：模型无法通过工具参数跳过确认卡片，
-    确认结论只来自 ``interrupt`` 返回的用户选择；该形参仅供测试模拟已确认的用户动作。
+    确认结论只来自 ``interrupt`` 返回的用户选择，模型无法通过工具参数跳过设备确认卡片。
     """
 
     if not query_text.strip():
@@ -78,7 +76,6 @@ async def trace_fault(
     emitter.emit("parse_fault", "started", content="正在解析故障描述与图片结果。")
     state = FaultTraceState(
         query_text=query_text,
-        confirmed_intent=confirmed_intent,
         context=context,
         runtime=runtime,
         config=config,

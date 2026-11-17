@@ -20,9 +20,10 @@ from typing import Any
 import json_repair
 
 from yuxi.utils import logger
+from yuxi.utils.question_utils import is_question_cancel
 
 DEVICE_SELECTION_ENABLED = os.getenv("DEVICE_SELECTION_ENABLED", "true").strip().lower() not in {"0", "false", "no"}
-DEVICE_SELECTION_MAX_CANDIDATES = int(os.getenv("DEVICE_SELECTION_MAX_CANDIDATES", "24"))
+DEVICE_SELECTION_MAX_CANDIDATES = max(1, int(os.getenv("DEVICE_SELECTION_MAX_CANDIDATES", "24")))
 DEVICE_SELECTION_PATH_SEGMENTS = int(os.getenv("DEVICE_SELECTION_PATH_SEGMENTS", "3"))
 
 DeviceModelCall = Callable[[str], Awaitable[str]]
@@ -35,6 +36,8 @@ STATE_NO_SELECTION = "no_selection"
 STATE_INVALID_OUTPUT = "invalid_output"
 STATE_ERROR = "error"
 
+OTHER_VALUES = frozenset({"__other__", "other", "其他"})
+
 
 @dataclass(frozen=True)
 class DeviceOption:
@@ -46,6 +49,107 @@ class DeviceOption:
     voltage_level: str | None = None
     path: str = ""
     category: str | None = None
+
+    def label(self) -> str:
+        """返回卡片标题：设备名（类型，电压）。"""
+
+        meta = "，".join(item for item in (self.device_type, self.voltage_level) if item)
+        return f"{self.name}（{meta}）" if meta else self.name
+
+
+@dataclass(frozen=True)
+class DeviceChoice:
+    """设备卡片恢复值的业务解释。"""
+
+    selected_id: str | None = None
+    free_text: str | None = None
+    cancelled: bool = False
+    empty: bool = False
+
+
+def build_device_choice_payload(
+    *,
+    source: str,
+    question_id: str,
+    question: str,
+    options: Sequence[DeviceOption],
+    recommended_id: str | None = None,
+    limit: int = DEVICE_SELECTION_MAX_CANDIDATES,
+) -> dict[str, Any]:
+    """构造三个模块共用的设备确认卡片。"""
+
+    return {
+        "source": source,
+        "questions": [
+            {
+                "question_id": question_id,
+                "question": question,
+                "options": [
+                    {
+                        "label": option.label() + ("（推荐）" if option.device_id == recommended_id else ""),
+                        "value": option.device_id,
+                        "description": option.path,
+                    }
+                    for option in options[: max(0, limit)]
+                ],
+                "multi_select": False,
+                "allow_other": True,
+            }
+        ],
+    }
+
+
+def parse_device_choice(value: Any, question_id: str) -> DeviceChoice:
+    """解析设备卡片恢复值，区分候选 id、自由文本、取消与空回答。"""
+
+    if is_question_cancel(value):
+        return DeviceChoice(cancelled=True)
+    if isinstance(value, dict):
+        if question_id in value:
+            return parse_device_choice(value[question_id], question_id)
+        text = str(value.get("text") or "").strip()
+        if text:
+            return DeviceChoice(free_text=text) if not _is_other(text) else DeviceChoice(empty=True)
+        selected = value.get("selected")
+        if isinstance(selected, (list, tuple)) and selected:
+            return parse_device_choice(selected[0], question_id)
+        picked = value.get("value")
+        if picked is not None and str(picked).strip():
+            picked_text = str(picked).strip()
+            if _is_other(picked_text):
+                return DeviceChoice(empty=True)
+            return DeviceChoice(selected_id=picked_text)
+        return DeviceChoice(empty=True)
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            choice = parse_device_choice(item, question_id)
+            if not choice.empty:
+                return choice
+        return DeviceChoice(empty=True)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text or _is_other(text):
+            return DeviceChoice(empty=True)
+        return DeviceChoice(selected_id=text)
+    return DeviceChoice(empty=True)
+
+
+def _is_other(text: str) -> bool:
+    """判断是否为“其他（自由输入）”占位值。"""
+
+    return text.strip().lower() in OTHER_VALUES
+
+
+def promote_option(options: Sequence[DeviceOption], selected_id: str | None) -> list[DeviceOption]:
+    """把推荐候选移到第一位；未知 id 不改变顺序。"""
+
+    values = list(options)
+    if not selected_id:
+        return values
+    picked = [option for option in values if option.device_id == selected_id]
+    if not picked:
+        return values
+    return picked + [option for option in values if option.device_id != selected_id]
 
 
 def build_candidate_payload(

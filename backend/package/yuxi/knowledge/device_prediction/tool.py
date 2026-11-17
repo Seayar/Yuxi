@@ -4,9 +4,10 @@
 外部服务调用在 ``services``，报告装配与校验在 ``answer``，跨模块流动的数据形状由
 ``contracts`` 拥有。
 
-设备候选不唯一时走 LangGraph ``interrupt``（载荷沿用 Yuxi 既有选择卡片格式
-``source + questions[]``）。``interrupt`` 会让工具从头重放，因此中断之前只做确定性只读
-查询，不写图、不写外部服务。所有同步图查询一律放到 ``asyncio.to_thread`` 执行。
+每次请求都通过 LangGraph ``interrupt`` 确认目标设备（载荷沿用 Yuxi 既有选择卡片格式
+``source + questions[]``），零候选时允许自由输入。``interrupt`` 会让工具从头重放，
+因此中断之前只做确定性只读查询，不写图、不写外部服务。所有同步图查询一律放到
+``asyncio.to_thread`` 执行。
 """
 
 from __future__ import annotations
@@ -27,7 +28,13 @@ from yuxi.agents.toolkits.registry import tool
 from yuxi.agents.toolkits.tugraph import TuGraphClient, TuGraphConfig, TuGraphError
 from yuxi.config.options import fault_trace_opts
 from yuxi.knowledge.device_index import graph_key as device_graph_key
-from yuxi.knowledge.device_selection import DeviceOption, select_device
+from yuxi.knowledge.device_selection import (
+    DeviceOption,
+    build_device_choice_payload,
+    parse_device_choice,
+    select_device,
+)
+from yuxi.knowledge.fault_trace.ledger import ledger_repository
 from yuxi.knowledge.device_prediction import graph as kg5
 from yuxi.knowledge.device_prediction.answer import generate_status_readout, produce_prediction_answer
 from yuxi.knowledge.device_prediction.contracts import (
@@ -42,9 +49,7 @@ from yuxi.knowledge.device_prediction.contracts import (
     DEVICE_QUESTION_ID,
     MAX_CHOICE_ROUNDS,
     MAX_DEVICE_CANDIDATES,
-    NO_DEVICE_MESSAGE,
     NO_PERMISSION_MESSAGE,
-    OTHER_VALUES,
     PREDICTION_GRAPH_NOT_CONFIGURED_MESSAGE,
     REPORT_VERIFICATION_FAILED_MESSAGE,
     DeviceCandidate,
@@ -65,7 +70,6 @@ from yuxi.knowledge.device_prediction.services import (
     fetch_health_assessment,
 )
 from yuxi.utils import logger
-from yuxi.utils.question_utils import is_question_cancel
 
 # 最终结果在对话上下文上的缓存属性名，防止模型在同一轮内重复调用工具。
 # 缓存按规范化后的问题文本分组：用户补充设备后重新提问不能被上一次的结果挡住。
@@ -116,14 +120,6 @@ async def predict_device(query_text: str, runtime: ToolRuntime = None) -> dict[s
     start = time.monotonic()
     model_call = context_model_call(context)
     query = await extract_prediction_intent(query_text, model_call=model_call)
-    if query.clarification_required:
-        emitter.emit(
-            "load_device",
-            "failed",
-            content=query.clarification_message,
-            error={"code": "clarification_required", "message": query.clarification_message},
-        )
-        return query.clarification_message
 
     client = TuGraphClient(config)
     try:
@@ -329,18 +325,31 @@ async def _locate_device(
 
     rounds = [0]
     while True:
-        candidates = await asyncio.to_thread(
-            kg5.search_devices,
-            client,
-            query,
-            graph_key=graph_key,
+        recall_text = query.device_name or query.location_hint or query.raw_text
+        ledger_candidates = await ledger_repository.search_devices(
+            recall_text,
+            device_type=query.device_type,
+            voltage_level=query.voltage_level,
+            location_hint=query.location_hint,
+            limit=MAX_DEVICE_CANDIDATES,
+            minimum_score=0.0 if (query.device_name or query.location_hint or query.device_type) else 60.0,
         )
+        if query.clarification_required and not ledger_candidates:
+            candidates = []
+        else:
+            candidates = await asyncio.to_thread(
+                kg5.search_devices,
+                client,
+                query,
+                graph_key=graph_key,
+                ledger_candidates=ledger_candidates,
+            )
         if not candidates:
             logger.warning(
                 f"设备预测维护设备召回为空: device_name={query.device_name!r} "
-                f"device_type={query.device_type!r} location={query.location_hint!r}"
+                f"device_type={query.device_type!r} location={query.location_hint!r} "
+                f"ledger_candidates={len(ledger_candidates)}"
             )
-            return NO_DEVICE_MESSAGE
         recommended_id: str | None = None
         selection: dict[str, Any] | None = None
         if len(candidates) > 1:
@@ -357,7 +366,13 @@ async def _locate_device(
         if isinstance(picked, DeviceCandidate):
             return query, picked
         if picked:
-            query = await extract_prediction_intent(picked, model_call=model_call, previous=query)
+            logger.info(f"设备预测用户改填设备，清除上一轮设备身份: {picked!r}")
+            query = await extract_prediction_intent(
+                picked,
+                model_call=model_call,
+                previous=query,
+                device_override=picked,
+            )
             continue
         if rounds[0] >= MAX_CHOICE_ROUNDS:
             return CHOICE_ABORTED_MESSAGE
@@ -414,10 +429,7 @@ def _pick_device(
     emitter: ThinkingEmitter,
     selection: dict[str, Any] | None = None,
 ) -> DeviceCandidate | str | None | _ChoiceCancelled:
-    """从候选中定设备：唯一候选直接采用；多个候选发卡片让用户选择（模型选择只做排序）。"""
-
-    if len(candidates) == 1:
-        return candidates[0]
+    """每次都让用户确认设备；零候选也发卡片允许直接填写新设备名。"""
 
     emitter.emit(
         "load_device",
@@ -429,19 +441,20 @@ def _pick_device(
             "device_selection": selection,
         },
     )
-    answer = _ask_choice(_device_payload(query, candidates, recommended_id=_recommended_id(selection)), rounds)
-    if answer is CHOICE_CANCELLED:
-        return CHOICE_CANCELLED
-    if answer is None:
+    if rounds[0] >= MAX_CHOICE_ROUNDS:
         return None
-    selected, free_text = answer
-    if selected:
-        matched = next((candidate for candidate in candidates if candidate.device_id == selected), None)
+    rounds[0] += 1
+    answer = interrupt(_device_payload(query, candidates, recommended_id=_recommended_id(selection)))
+    choice = parse_device_choice(answer, DEVICE_QUESTION_ID)
+    if choice.cancelled:
+        return CHOICE_CANCELLED
+    if choice.selected_id:
+        matched = next((candidate for candidate in candidates if candidate.device_id == choice.selected_id), None)
         if matched is not None:
             return matched
-    if free_text:
-        return free_text
-    return selected or None
+    if choice.free_text:
+        return choice.free_text
+    return choice.selected_id
 
 
 def _device_choice_error_code(message: str) -> str:
@@ -472,25 +485,25 @@ def _device_payload(
     模型选中的候选在 label 末尾标记“（推荐）”，仍由用户点击确认。
     """
 
-    return {
-        "source": DEVICE_CHOICE_SOURCE,
-        "questions": [
-            {
-                "question_id": DEVICE_QUESTION_ID,
-                "question": DEVICE_CHOICE_QUESTION,
-                "options": [
-                    {
-                        "label": candidate.label() + ("（推荐）" if candidate.device_id == recommended_id else ""),
-                        "value": candidate.device_id,
-                    }
-                    for candidate in candidates[:MAX_DEVICE_CANDIDATES]
-                ],
-                "multi_select": False,
-                "allow_other": True,
-            }
+    payload = build_device_choice_payload(
+        source=DEVICE_CHOICE_SOURCE,
+        question_id=DEVICE_QUESTION_ID,
+        question=DEVICE_CHOICE_QUESTION if candidates else "未召回到候选设备，请直接填写正确的设备名称。",
+        options=[
+            DeviceOption(
+                device_id=candidate.device_id,
+                name=candidate.name,
+                device_type=candidate.device_type,
+                voltage_level=candidate.voltage_level,
+                path=candidate.path,
+            )
+            for candidate in candidates
         ],
-        "query": query.model_dump(),
-    }
+        recommended_id=recommended_id,
+        limit=MAX_DEVICE_CANDIDATES,
+    )
+    payload["query"] = query.model_dump()
+    return payload
 
 
 class _ChoiceCancelled:
@@ -498,63 +511,6 @@ class _ChoiceCancelled:
 
 
 CHOICE_CANCELLED = _ChoiceCancelled()
-
-
-def _ask_choice(payload: dict[str, Any], rounds: list[int]) -> tuple[str | None, str | None] | None | _ChoiceCancelled:
-    """发一次引导选择中断并解析恢复值；整次请求的轮次预算已用尽时返回 None（不发中断）。
-
-    关闭卡片提交的是 ``reject`` 这类取消值，先判取消再解析：否则会被当成用户补充的设备名，
-    带着 ``reject`` 重新识别并再次弹卡片。
-    """
-
-    if rounds[0] >= MAX_CHOICE_ROUNDS:
-        return None
-    rounds[0] += 1
-    raw = interrupt(payload)
-    if is_question_cancel(raw):
-        return CHOICE_CANCELLED
-    return _parse_choice(raw)
-
-
-def _parse_choice(value: Any) -> tuple[str | None, str | None]:
-    """解析 interrupt 恢复值，返回 ``(选中值, 自由文字)``。
-
-    兼容 ``{question_id: ...}`` 嵌套、``{"selected": [...]}``、``{"value": ...}``、
-    ``{"text": ...}``、列表与纯字符串；``"__other__" / "other" / "其他"`` 视为未选中。
-    """
-
-    if isinstance(value, dict):
-        if DEVICE_QUESTION_ID in value:
-            return _parse_choice(value[DEVICE_QUESTION_ID])
-        text = str(value.get("text") or "").strip()
-        if text:
-            return (None, None) if _is_other(text) else (None, text)
-        selected = value.get("selected")
-        if isinstance(selected, (list, tuple)) and selected:
-            return _parse_choice(selected[0])
-        picked = value.get("value")
-        if picked is not None and str(picked).strip():
-            picked_text = str(picked).strip()
-            return (None, None) if _is_other(picked_text) else (picked_text, None)
-        return None, None
-    if isinstance(value, (list, tuple)):
-        for item in value:
-            selected, text = _parse_choice(item)
-            if selected or text:
-                return selected, text
-        return None, None
-    if isinstance(value, str):
-        text = value.strip()
-        if not text or _is_other(text):
-            return None, None
-        return text, None
-    return None, None
-
-
-def _is_other(text: str) -> bool:
-    """判断是否为“其他（自由输入）”占位取值。"""
-
-    return text.strip().lower() in OTHER_VALUES
 
 
 def _normalize_text(value: str | None) -> str:

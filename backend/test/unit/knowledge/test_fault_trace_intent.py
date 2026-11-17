@@ -5,15 +5,11 @@ from __future__ import annotations
 import json
 
 import pytest
-from yuxi.knowledge.fault_trace import intent as intent_module
 from yuxi.knowledge.fault_trace.contracts import DEVICE_NOT_FOUND_MESSAGE, FaultTraceQuery
 from yuxi.knowledge.fault_trace.intent import (
     apply_input_constraints,
-    build_confirmation_payload,
-    extract_correction_text,
     extract_fault_trace_intent,
     parse_fault_trace_query,
-    parse_intent_confirmation,
 )
 
 pytestmark = pytest.mark.unit
@@ -53,6 +49,12 @@ def test_rule_parse_extracts_device_and_phenomena():
     assert "积尘" not in query.phenomena  # 规则词表只收录定义的现象词
 
 
+def test_rule_parse_extracts_station_location_for_ledger_disambiguation():
+    query = parse_fault_trace_query("35kV#1变电站 #1主变压器 过热")
+
+    assert query.location_hint == "35kV#1变电站"
+
+
 @pytest.mark.asyncio
 async def test_model_extraction_merges_image_result():
     query = await extract_fault_trace_intent(
@@ -64,6 +66,72 @@ async def test_model_extraction_merges_image_result():
     assert query.device_name == "1号主变"
     assert query.image_fault_name == "冒烟/着火"
     assert "冷却器风扇停转" in query.phenomena
+
+
+@pytest.mark.asyncio
+async def test_device_override_removes_previous_device_identity():
+    """设备卡片的自由输入是直接替换，不继承上一轮设备名、类型或电压。"""
+
+    previous = FaultTraceQuery(
+        device_name="991SVG开关",
+        device_type="开关柜",
+        voltage_level="35kV",
+        phenomena=["触头烧蚀"],
+    )
+
+    query = await extract_fault_trace_intent(
+        "991SVG开关触头烧蚀",
+        image_result=None,
+        previous=previous,
+        device_override="#2主变",
+    )
+
+    assert query.device_name == "#2主变"
+    assert query.device_type is None
+    assert query.voltage_level is None
+    assert query.phenomena == ["触头烧蚀"]
+
+
+@pytest.mark.asyncio
+async def test_device_override_does_not_backfill_old_type_or_voltage_from_original_text():
+    """故障现象为空时也不能从旧原文补回旧设备类型和电压。"""
+
+    query = await extract_fault_trace_intent(
+        "991SVG开关故障",
+        image_result=None,
+        previous=FaultTraceQuery(device_name="991SVG开关", device_type="开关柜", voltage_level="35kV"),
+        device_override="某新设备",
+    )
+
+    assert query.device_name == "某新设备"
+    assert query.device_type is None
+    assert query.voltage_level is None
+
+
+@pytest.mark.asyncio
+async def test_feedback_specific_device_overrides_model_and_rule_result():
+    """首次规则命中时修正文本仍进入解析，并覆盖模型返回的旧设备。"""
+
+    model = _FakeModelCall(
+        _intent_json(
+            device_name="991SVG开关",
+            device_type="开关柜",
+            voltage="35kV",
+            phenomena=["触头烧蚀"],
+        )
+    )
+
+    query = await extract_fault_trace_intent(
+        "991SVG开关触头烧蚀",
+        image_result=None,
+        previous=FaultTraceQuery(device_name="991SVG开关", phenomena=["触头烧蚀"]),
+        feedback="设备选错了，应该是#1主变",
+        model_call=model,
+    )
+
+    assert model.prompts
+    assert query.device_name == "#1主变"
+    assert query.phenomena == ["触头烧蚀"]
 
 
 @pytest.mark.asyncio
@@ -100,83 +168,6 @@ def test_input_constraint_image_only_still_needs_text():
 
     # 图片结果也算现象，但设备必须具体；此例设备具体且现象存在，无需澄清。
     assert applied.clarification_required is False
-
-
-def test_confirmation_payload_uses_plain_confirm_value():
-    """确认卡片的“正确”选项就是普通确认值，恢复时不需要再和重算结果比对。"""
-
-    payload = intent_module.build_confirmation_payload(
-        {
-            "device_name": "3B-7Y",
-            "device_type": "架空线路",
-            "voltage_level": "10kV",
-            "phenomena": ["树木倒伏"],
-            "image_fault_name": None,
-        }
-    )
-
-    option = payload["questions"][0]["options"][0]
-    assert option["label"] == "正确，继续溯源"
-    assert option["value"] == intent_module.CONFIRM_VALUE
-    assert intent_module.parse_intent_confirmation({payload["questions"][0]["question_id"]: option["value"]}) == (
-        "confirm",
-        None,
-    )
-
-
-def test_confirmation_payload_and_parse():
-    query = FaultTraceQuery(device_name="1号主变", phenomena=["过热"], image_fault_name="冒烟/着火")
-    payload = build_confirmation_payload(intent_module.build_intent_plan(query))
-
-    assert payload["source"] == "fault_trace_intent_confirmation"
-    assert "1号主变" in payload["questions"][0]["question"]
-    assert (
-        parse_intent_confirmation({"fault_trace_intent_confirm": {"selected": [{"value": "confirm"}]}})[0] == "confirm"
-    )
-    assert parse_intent_confirmation({"fault_trace_intent_confirm": {"text": "设备是2号主变"}}) == (
-        "reject",
-        "设备是2号主变",
-    )
-
-
-def test_confirmation_payload_shows_applied_correction():
-    """重新识别后的卡片必须显示上一轮补充，否则用户无法判断输入是否被采用。"""
-
-    plan = intent_module.build_intent_plan(FaultTraceQuery(device_name="1号主变", phenomena=["过热"]))
-    plan["correction"] = "设备是2号主变"
-    payload = build_confirmation_payload(plan)
-
-    assert "已按您的补充「设备是2号主变」重新识别" in payload["questions"][0]["question"]
-
-
-def test_confirmation_payload_shows_identified_type_and_graph_classification():
-    """设备类型以识别结果为主体；图谱归类不同时并列展示，不静默覆盖用户补充。"""
-
-    plan = intent_module.build_intent_plan(FaultTraceQuery(device_name="银开线", phenomena=["故障"]))
-    plan["device_type"] = "输电线路"
-    plan["graph_device_type"] = "架空线路"
-    question = build_confirmation_payload(plan)["questions"][0]["question"]
-    assert "设备类型=输电线路（图谱归类：架空线路）" in question
-
-    # 识别结果缺失时才用图谱归类补位；两者一致时不重复展示。
-    missing = intent_module.build_intent_plan(FaultTraceQuery(device_name="银开线"))
-    missing["graph_device_type"] = "架空线路"
-    assert "设备类型=架空线路" in build_confirmation_payload(missing)["questions"][0]["question"]
-
-    same = intent_module.build_intent_plan(FaultTraceQuery(device_name="3B-7Y"))
-    same["device_type"] = "架空线路"
-    same["graph_device_type"] = "架空线路"
-    assert build_confirmation_payload(same)["questions"][0]["question"].count("设备类型=架空线路") == 1
-
-
-def test_cancel_values_are_never_correction_text():
-    """关闭卡片的取消值必须按取消处理，不能被当成用户补充的设备或现象。"""
-
-    for value in ("reject", {"fault_trace_intent_correction": "reject"}):
-        assert parse_intent_confirmation(value) == ("cancel", None)
-        assert extract_correction_text(value) is None
-    assert extract_correction_text({"fault_trace_intent_correction": "设备是2号主变"}) == "设备是2号主变"
-    assert extract_correction_text("设备是2号主变") == "设备是2号主变"
 
 
 @pytest.mark.asyncio

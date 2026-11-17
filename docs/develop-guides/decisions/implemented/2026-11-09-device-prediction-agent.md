@@ -4,6 +4,8 @@
 类型：feature
 Owner：backend/package/yuxi/knowledge/device_prediction/tool.py
 
+> 设备识别与设备确认由[图谱与台账合并召回及用户优先覆盖](./2026-11-17-device-recall-ledger-and-user-override.md)更新；本记录保留预测服务、维护知识与报告契约。
+
 > 现状：2026-11-13 起故障溯源与处置方案也默认读取 `kg5`，见[故障溯源与处置方案统一读取 kg5](./2026-11-13-unify-knowledge-graph-kg5.md)；本智能体仍只读 `kg5`，不读历史 `kg3`/`kg4`。
 
 ## 问题

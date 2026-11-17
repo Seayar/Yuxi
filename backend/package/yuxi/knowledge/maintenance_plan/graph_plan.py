@@ -13,17 +13,21 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import replace
 from typing import Any
 
 from yuxi.agents.toolkits.tugraph import TuGraphClient, TuGraphError
 from yuxi.knowledge.device_index import (
     DEVICE_RECALL_MAX_RECORDS,
+    DEVICE_INDEX_CANDIDATES,
     device_recall_tokens,
     fallback_score,
     get_device_name_index,
+    normalize_device_text,
 )
+from yuxi.knowledge.fault_trace.ledger import LedgerDevice, match_ledger_candidate
+from yuxi.knowledge.maintenance_plan.intent import normalize_device_type
 from yuxi.knowledge.maintenance_plan.contracts import (
     BRANCH_VALUES,
     COMMON_YES,
@@ -72,6 +76,8 @@ VOLTAGE_MATCH_SCORE = 10.0
 # 文本命中不叠加名称精确分：短名往往同时命中“精确相等”和“原文包含”，叠加后反而压过完整名称。
 TEXT_NAME_SCORE = 120.0
 TEXT_NAME_LENGTH_WEIGHT = 10.0
+LEDGER_NAME_SCORE = 80.0
+LEDGER_ID_PLACEHOLDERS = frozenset({"", "补充数据", "无", "null", "None", "未知"})
 
 VOLTAGE_PATTERN = re.compile(r"(?P<value>\d+(?:\.\d+)?)\s*[kK][vV]")
 
@@ -103,6 +109,7 @@ def search_devices(
     *,
     limit: int = MAX_DEVICE_CANDIDATES,
     graph_key: str = "",
+    ledger_candidates: Sequence[LedgerDevice] = (),
 ) -> list[DeviceCandidate]:
     """按设备名称/位置线索/设备类型在 ``设备实例`` 中召回，并用 ``属于`` 边补全类型。
 
@@ -129,13 +136,23 @@ def search_devices(
         records.extend(_query_devices_by_device_type(client, device_type=query.device_type))
 
     fallback_scores: dict[str, float] = {}
-    if not records:
-        records, fallback_scores = _recall_devices_by_fallback(client, query, graph_key=graph_key)
+    fallback_records, fallback_scores = _recall_devices_by_fallback(
+        client,
+        query,
+        graph_key=graph_key,
+        limit=limit,
+        include_tokens=bool(not records and (keywords or location_hint or query.device_type)),
+    )
+    records.extend(fallback_records)
+    ledger_matches = list(ledger_candidates)
+    for record in _query_devices_by_ledger_candidates(client, ledger_candidates=ledger_candidates, limit=limit):
+        records.append(record)
 
     candidates: dict[str, DeviceCandidate] = {}
     for record in records:
         props = record.get("n") or record.get("a") or {}
         candidate = _build_candidate(props, query=query, keywords=keywords)
+        candidate = _enrich_with_ledger(candidate, ledger_matches)
         fallback = fallback_scores.get(candidate.device_id)
         if fallback is not None and fallback > candidate.score:
             candidate = replace(candidate, score=fallback)
@@ -151,7 +168,10 @@ def search_devices(
 
     typed: list[DeviceCandidate] = []
     for candidate in top:
-        device_type = types.get(candidate.device_id) or DEVICE_TYPE_FALLBACKS.get(candidate.ledger_class or "")
+        ledger_type = normalize_device_type(candidate.device_type)
+        device_type = (
+            types.get(candidate.device_id) or DEVICE_TYPE_FALLBACKS.get(candidate.ledger_class or "") or ledger_type
+        )
         if not device_type:
             continue
         score = candidate.score
@@ -164,7 +184,12 @@ def search_devices(
 
 
 def _recall_devices_by_fallback(
-    client: TuGraphClient, query: PlanQuery, *, graph_key: str
+    client: TuGraphClient,
+    query: PlanQuery,
+    *,
+    graph_key: str,
+    limit: int,
+    include_tokens: bool,
 ) -> tuple[list[dict[str, Any]], dict[str, float]]:
     """名称/位置都没命中时的兜底召回：词元命中与设备名索引合并，按命中质量排序。
 
@@ -186,9 +211,10 @@ def _recall_devices_by_fallback(
         if current is None or score > current[0]:
             ranked[device_id] = (score, record)
 
-    for token in tokens:
-        for record in _query_devices_by_keyword(client, keyword=token):
-            _add(record)
+    if include_tokens:
+        for token in tokens:
+            for record in _query_devices_by_keyword(client, keyword=token):
+                _add(record)
 
     index = (
         get_device_name_index(
@@ -201,7 +227,10 @@ def _recall_devices_by_fallback(
         else None
     )
     if index is not None:
-        entries = index.search(query_text)
+        entries = index.search(
+            query_text,
+            limit=min(limit, DEVICE_RECALL_MAX_RECORDS, DEVICE_INDEX_CANDIDATES),
+        )
         rank_by_id = {entry.device_id: rank for rank, entry in enumerate(entries)}
         if rank_by_id:
             for record in _query_devices_by_ids(client, ids=list(rank_by_id)):
@@ -211,6 +240,31 @@ def _recall_devices_by_fallback(
     records = [record for _device_id, (_score, record) in ordered[:DEVICE_RECALL_MAX_RECORDS]]
     scores = {device_id: score for device_id, (score, _record) in ordered[:DEVICE_RECALL_MAX_RECORDS]}
     return records, scores
+
+
+def _query_devices_by_ledger_candidates(
+    client: TuGraphClient,
+    *,
+    ledger_candidates: Sequence[LedgerDevice],
+    limit: int,
+) -> list[dict[str, Any]]:
+    """把台账候选映射回图谱设备；先批量按名称，再逐个按台账 ID 补漏。"""
+
+    if not ledger_candidates:
+        return []
+    names = _dedup(candidate.name for candidate in ledger_candidates)
+    records = _query_devices_by_names(client, names=names)
+    found_ids = {_record_device_id(record) for record in records}
+    found_names = {normalize_device_text(_device_name(record.get("n") or record.get("a") or {})) for record in records}
+    for candidate in ledger_candidates[: max(1, limit)]:
+        if normalize_device_text(candidate.name) in found_names:
+            continue
+        for record in _query_devices_by_ledger_id(client, ledger_id=candidate.device_id):
+            device_id = _record_device_id(record)
+            if device_id and device_id not in found_ids:
+                found_ids.add(device_id)
+                records.append(record)
+    return records
 
 
 def _record_device_id(record: dict[str, Any]) -> str:
@@ -267,6 +321,38 @@ def _build_candidate(props: dict[str, Any], *, query: PlanQuery, keywords: list[
         ledger_class=_clean(props.get("台账分类")) or _clean(props.get("设备分类")),
         ledger_ids=_parse_ledger_ids(props.get("台账ID列表")),
         score=float(score),
+    )
+
+
+def _enrich_with_ledger(
+    candidate: DeviceCandidate,
+    ledger_candidates: list[LedgerDevice],
+) -> DeviceCandidate:
+    """用同名台账行补全展示字段和业务 ID，不改变图谱设备身份。"""
+
+    ledger = match_ledger_candidate(
+        name=candidate.name,
+        path=candidate.path,
+        ledger_ids=candidate.ledger_ids,
+        candidates=ledger_candidates,
+    )
+    if ledger is None:
+        return candidate
+    ledger_ids = tuple(
+        dict.fromkeys(
+            [
+                *(item for item in candidate.ledger_ids if item not in LEDGER_ID_PLACEHOLDERS),
+                ledger.device_id,
+            ]
+        )
+    )
+    return replace(
+        candidate,
+        device_type=candidate.device_type or normalize_device_type(ledger.device_type),
+        voltage_level=candidate.voltage_level or ledger.voltage_level,
+        ledger_class=candidate.ledger_class or ledger.device_type,
+        ledger_ids=ledger_ids,
+        score=max(candidate.score, ledger.score),
     )
 
 
@@ -543,6 +629,34 @@ def _query_devices_by_exact_name(client: TuGraphClient, *, name: str) -> list[di
         f"MATCH (n) WHERE labels(n)[0] = $label AND ({conditions}) RETURN n LIMIT $node_limit",
         label=LABEL_DEVICE,
         name=name,
+        node_limit=KG_QUERY_LIMIT,
+    )
+
+
+def _query_devices_by_names(client: TuGraphClient, *, names: list[str]) -> list[dict[str, Any]]:
+    """按台账候选名称批量回查图谱设备。"""
+
+    if not names:
+        return []
+    conditions = " OR ".join(f"coalesce(n.{prop}, '') IN $names" for prop in DEVICE_NAME_PROPS)
+    return client.run(
+        f"MATCH (n) WHERE labels(n)[0] = $label AND ({conditions}) RETURN n LIMIT $node_limit",
+        label=LABEL_DEVICE,
+        names=names,
+        node_limit=KG_QUERY_LIMIT,
+    )
+
+
+def _query_devices_by_ledger_id(client: TuGraphClient, *, ledger_id: str) -> list[dict[str, Any]]:
+    """按台账 ID 补查图谱节点，兼容 ``台账ID列表`` 中的多 ID 文本。"""
+
+    if not ledger_id:
+        return []
+    return client.run(
+        "MATCH (n) WHERE labels(n)[0] = $label "
+        "AND coalesce(n.台账ID列表, '') CONTAINS $ledger_id RETURN n LIMIT $node_limit",
+        label=LABEL_DEVICE,
+        ledger_id=ledger_id,
         node_limit=KG_QUERY_LIMIT,
     )
 

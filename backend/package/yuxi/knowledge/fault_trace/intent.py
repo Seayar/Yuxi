@@ -17,7 +17,6 @@ from yuxi.knowledge.fault_trace.contracts import (
     FaultTraceQuery,
 )
 from yuxi.utils import logger
-from yuxi.utils.question_utils import is_question_cancel
 
 # ---------------------------------------------------------------------------
 # 规则解析
@@ -25,6 +24,10 @@ from yuxi.utils.question_utils import is_question_cancel
 
 _DEVICE_TYPES = ("变压器", "开关柜", "断路器", "隔离开关", "电缆", "配电柜", "互感器", "避雷器", "母线", "线路")
 _VOLTAGE_PATTERN = re.compile(r"(?P<value>\d+(?:\.\d+)?)\s*[kKＫｋ][vVＶｖ]")
+_LOCATION_PATTERN = re.compile(
+    r"(?:\d+(?:\.\d+)?\s*[kKＫｋ][vVＶｖ]\s*)?"
+    r"(?:#\s*\d+\s*(?:变电站|开闭所|箱变)|开闭所|箱变)"
+)
 # SRS：设备名称应指向具体设备；只出现类型词（如“变压器”）不算具体设备。
 # 后缀按长度降序排列，保证“#1主变压器”整体命中而不是只截到“#1主变”。
 _DEVICE_SUFFIXES = tuple(
@@ -111,12 +114,15 @@ def parse_fault_trace_query(query: str) -> FaultTraceQuery:
     device_type = next((item for item in _DEVICE_TYPES if item in normalized_query), None)
     voltage_match = _VOLTAGE_PATTERN.search(normalized_query)
     voltage_level = f"{voltage_match.group('value')}kV" if voltage_match else None
+    location_match = _LOCATION_PATTERN.search(normalized_query)
+    location_hint = location_match.group(0).replace(" ", "") if location_match else None
     phenomena = [term for term in _PHENOMENON_TERMS if term in normalized_query]
 
     return FaultTraceQuery(
         device_name=device_name,
         device_type=device_type,
         voltage_level=voltage_level,
+        location_hint=location_hint,
         phenomena=phenomena,
     )
 
@@ -135,6 +141,7 @@ class FaultTraceIntentResult(BaseModel):
     device_name: str | None = None
     device_type: str | None = None
     voltage_level: str | None = None
+    location_hint: str | None = None
     phenomena: list[str] = Field(default_factory=list)
 
     @field_validator("phenomena", mode="before")
@@ -157,6 +164,7 @@ async def extract_fault_trace_intent(
     model_call: FaultTraceIntentModelCall | None = None,
     previous: FaultTraceQuery | None = None,
     feedback: str | None = None,
+    device_override: str | None = None,
 ) -> FaultTraceQuery:
     """优先由模型识别意图，规则能确定设备与现象时直接使用规则结果。
 
@@ -167,24 +175,40 @@ async def extract_fault_trace_intent(
     语义融合（SRS：统一语义表示层）；未传入时由工具读取会话中的上传图片。
     """
 
-    rule_query = parse_fault_trace_query(query_text)
-    rule_is_specific = rule_query.has_specific_device() and rule_query.has_phenomenon()
-    if model_call is None or rule_is_specific:
-        query = rule_query
+    if device_override is not None:
+        query = parse_fault_trace_query(device_override)
+        if not query.has_specific_device():
+            query.device_name = str(device_override).strip() or None
+        if previous is not None and not query.phenomena:
+            query.phenomena = list(previous.phenomena)
     else:
-        try:
-            raw = await model_call(
-                build_intent_prompt(query_text, image_result=image_result, previous=previous, feedback=feedback)
-            )
-            result = _parse_intent(raw)
-            query = build_fault_query(result)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"故障溯源意图识别失败，回退规则解析: {exc}")
-            query = parse_fault_trace_query(query_text)
+        rule_query = parse_fault_trace_query(query_text)
+        rule_is_specific = rule_query.has_specific_device() and rule_query.has_phenomenon()
+        if model_call is None or (rule_is_specific and not feedback):
+            query = rule_query
+        else:
+            try:
+                raw = await model_call(
+                    build_intent_prompt(query_text, image_result=image_result, previous=previous, feedback=feedback)
+                )
+                result = _parse_intent(raw)
+                query = build_fault_query(result)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"故障溯源意图识别失败，回退规则解析: {exc}")
+                query = parse_fault_trace_query(query_text)
+        if feedback:
+            correction_query = parse_fault_trace_query(feedback)
+            if correction_query.device_name:
+                query.device_name = correction_query.device_name
+                query.device_type = correction_query.device_type
+                query.voltage_level = correction_query.voltage_level
+                query.location_hint = correction_query.location_hint
+            if correction_query.phenomena:
+                query.phenomena = correction_query.phenomena
 
     query.image_fault_type = _clean_optional(image_result.get("fault_type")) if image_result else None
     query.image_fault_name = _clean_optional(image_result.get("fault_name")) if image_result else None
-    _merge_rule_fallback(query, query_text)
+    _merge_rule_fallback(query, device_override if device_override is not None else query_text)
     # 现象可以由图片识别补齐，第一步只要求设备具体；现象校验留到图片步骤之后。
     return apply_input_constraints(query, require_phenomenon=False)
 
@@ -199,6 +223,7 @@ def _merge_rule_fallback(query: FaultTraceQuery, query_text: str) -> None:
         query.device_name = fallback.device_name or query.device_name
     query.device_type = query.device_type or fallback.device_type
     query.voltage_level = query.voltage_level or fallback.voltage_level
+    query.location_hint = query.location_hint or fallback.location_hint
     if not query.phenomena:
         query.phenomena = fallback.phenomena
 
@@ -231,6 +256,7 @@ def build_intent_prompt(
                     "device_name": previous.device_name,
                     "device_type": previous.device_type,
                     "voltage_level": previous.voltage_level,
+                    "location_hint": previous.location_hint,
                     "phenomena": previous.phenomena,
                 },
                 ensure_ascii=False,
@@ -248,6 +274,7 @@ def build_fault_query(result: FaultTraceIntentResult) -> FaultTraceQuery:
         device_name=_clean_optional(result.device_name),
         device_type=_clean_optional(result.device_type),
         voltage_level=_clean_optional(result.voltage_level),
+        location_hint=_clean_optional(result.location_hint),
         phenomena=[str(item).strip() for item in result.phenomena if str(item).strip()],
     )
 
@@ -313,176 +340,8 @@ def apply_input_constraints(query: FaultTraceQuery, *, require_phenomenon: bool 
     return query
 
 
-def build_candidate_selection_payload(candidates: list[str]) -> dict[str, Any]:
-    """方案二：识别到设备类型但存在多个候选设备时，引导用户选择确认。"""
-
-    options = [{"label": f"{index + 1}）{name}", "value": name} for index, name in enumerate(candidates)]
-    question = "请选择具体设备：" + "；".join(f"{index + 1}）{name}" for index, name in enumerate(candidates))
-    return {
-        "source": "fault_trace_candidate_selection",
-        "questions": [
-            {
-                "question_id": FAULT_QUESTION_ID_CANDIDATE,
-                "question": question,
-                "options": options,
-                "multi_select": False,
-                "allow_other": True,
-            }
-        ],
-        "candidates": candidates,
-    }
-
-
-# ---------------------------------------------------------------------------
-# 意图确认卡片与用户修正
-# ---------------------------------------------------------------------------
-
 MAX_INTENT_ATTEMPTS = 3
-INTENT_QUESTION_ID = "fault_trace_intent_confirm"
-CORRECTION_QUESTION_ID = "fault_trace_intent_correction"
 FAULT_QUESTION_ID_CANDIDATE = "fault_trace_device_select"
-
-
-def build_intent_plan(query: FaultTraceQuery) -> dict[str, Any]:
-    """构造展示给用户的意图计划。"""
-
-    return {
-        "device_name": query.device_name,
-        "device_type": query.device_type,
-        "voltage_level": query.voltage_level,
-        "phenomena": list(query.phenomena),
-        "image_fault_type": query.image_fault_type,
-        "image_fault_name": query.image_fault_name,
-    }
-
-
-# 确认卡片的“正确”选项就是一个普通确认值。恢复时直接按已确认继续，不拿模型重算的
-# 计划做一致性校验：用户确认即最终口径，模型识别偏差由用户的修正流程处理。
-CONFIRM_VALUE = "confirm"
-
-
-def build_confirmation_payload(intent_plan: dict[str, Any]) -> dict[str, Any]:
-    """构造意图确认卡片，展示模型对设备与故障现象的理解。
-
-    设备类型以模型识别结果为主体；图谱归类与它不同时并列展示，避免用户的补充被图谱值
-    静默覆盖，同时让用户看到溯源实际使用的设备类型。
-    """
-
-    parts = []
-    if intent_plan.get("device_name"):
-        parts.append(f"设备={intent_plan['device_name']}")
-    device_type = intent_plan.get("device_type")
-    graph_device_type = intent_plan.get("graph_device_type")
-    if device_type and graph_device_type and graph_device_type != device_type:
-        parts.append(f"设备类型={device_type}（图谱归类：{graph_device_type}）")
-    elif device_type or graph_device_type:
-        parts.append(f"设备类型={device_type or graph_device_type}")
-    if intent_plan.get("voltage_level"):
-        parts.append(f"电压等级={intent_plan['voltage_level']}")
-    if intent_plan.get("phenomena"):
-        parts.append(f"故障现象={', '.join(intent_plan['phenomena'])}")
-    if intent_plan.get("image_fault_name"):
-        parts.append(f"图片识别={intent_plan['image_fault_name']}")
-    question = "我对故障现象的理解是：" + "；".join(parts) + "。是否正确？"
-    correction = str(intent_plan.get("correction") or "").strip()
-    if correction:
-        question = f"已按您的补充「{correction}」重新识别。{question}"
-    return {
-        "source": "fault_trace_intent_confirmation",
-        "questions": [
-            {
-                "question_id": INTENT_QUESTION_ID,
-                "question": question,
-                "options": [
-                    {"label": "正确，继续溯源", "value": CONFIRM_VALUE},
-                    {"label": "不正确，我要补充/修改", "value": "correct"},
-                ],
-                "multi_select": False,
-                "allow_other": True,
-            }
-        ],
-        "intent_plan": intent_plan,
-    }
-
-
-def build_correction_payload(intent_plan: dict[str, Any]) -> dict[str, Any]:
-    """用户只表示不正确时，追问需要修正的内容。"""
-
-    return {
-        "source": "fault_trace_intent_correction",
-        "questions": [
-            {
-                "question_id": CORRECTION_QUESTION_ID,
-                "question": "请补充需要修正的内容，例如设备名称、设备类型或具体故障现象。",
-                "options": [],
-                "multi_select": False,
-                "allow_other": True,
-            }
-        ],
-        "intent_plan": intent_plan,
-    }
-
-
-def parse_intent_confirmation(value: Any) -> tuple[str, str | None]:
-    """解析确认结果，返回 (决定, 用户修正文本)。决定取值 confirm、reject、cancel 或 invalid。"""
-
-    if is_question_cancel(value):
-        return "cancel", None
-    if isinstance(value, dict):
-        if INTENT_QUESTION_ID in value or CORRECTION_QUESTION_ID in value or FAULT_QUESTION_ID_CANDIDATE in value:
-            for key in (INTENT_QUESTION_ID, CORRECTION_QUESTION_ID, FAULT_QUESTION_ID_CANDIDATE):
-                if key in value:
-                    return parse_intent_confirmation(value[key])
-        text = str(value.get("text") or "").strip()
-        if text:
-            return "reject", text
-        selected = value.get("selected")
-        if isinstance(selected, (list, tuple)) and selected:
-            return parse_intent_confirmation(selected[0])
-        if value.get("value") is not None:
-            return "confirm", str(value["value"])
-        return "invalid", None
-    if isinstance(value, (list, tuple)):
-        for item in value:
-            decision, correction = parse_intent_confirmation(item)
-            if decision != "invalid":
-                return decision, correction
-        return "invalid", None
-    if isinstance(value, str):
-        text = value.strip()
-        if text.lower() in {"confirm", "confirmed"} or text in {"正确，继续溯源", "正确"}:
-            return "confirm", None
-        if text.lower() in {"correct"} or text in {"不正确，我要补充/修改", "不正确"}:
-            return "reject", None
-        return ("reject", text) if text else ("invalid", None)
-    return "invalid", None
-
-
-def extract_correction_text(value: Any) -> str | None:
-    """从修正追问或候选选择中取出用户文本；取消卡片返回 None。"""
-
-    if is_question_cancel(value):
-        return None
-    if isinstance(value, dict):
-        if CORRECTION_QUESTION_ID in value:
-            return extract_correction_text(value[CORRECTION_QUESTION_ID])
-        text = str(value.get("text") or "").strip()
-        if text:
-            return text
-        selected = value.get("selected")
-        if isinstance(selected, (list, tuple)) and selected:
-            return extract_correction_text(selected[0])
-        return None
-    if isinstance(value, (list, tuple)):
-        for item in value:
-            text = extract_correction_text(item)
-            if text:
-                return text
-        return None
-    if isinstance(value, str):
-        text = value.strip()
-        return text if text and text not in {"__other__", "other", "其他"} else None
-    return None
 
 
 INTENT_PROMPT = """你是配电网故障原因溯源系统的意图识别器。
@@ -492,6 +351,7 @@ INTENT_PROMPT = """你是配电网故障原因溯源系统的意图识别器。
   "device_name": "具体设备名称，如 1号主变；没有则 null",
   "device_type": "设备类型，如 变压器、开关柜；没有则 null",
   "voltage_level": "电压等级，如 110kV、35kV、10kV；没有则 null",
+  "location_hint": "位置线索，如 #3开闭所、35kV#1变电站；没有则 null",
   "phenomena": ["故障现象列表，如 冷却器风扇停转、散热片积尘"]
 }
 要求：

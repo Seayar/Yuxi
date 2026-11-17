@@ -12,8 +12,15 @@ from yuxi.knowledge.device_prediction.contracts import CLARIFY_DEVICE_MESSAGE
 pytestmark = pytest.mark.unit
 
 
-def _extract(text, *, model=None, previous=None):
-    return asyncio.run(intent.extract_prediction_intent(text, model_call=model, previous=previous))
+def _extract(text, *, model=None, previous=None, device_override=None):
+    return asyncio.run(
+        intent.extract_prediction_intent(
+            text,
+            model_call=model,
+            previous=previous,
+            device_override=device_override,
+        )
+    )
 
 
 def test_rule_extract_keeps_user_device_reference():
@@ -95,6 +102,24 @@ def test_previous_result_backfills_missing_fields():
 
     assert query.device_name == "9号馈线"
     assert query.raw_text == "9号馈线状态"
+
+
+def test_device_override_removes_previous_device_fields():
+    """用户填写新设备后，旧设备名、类型、位置与原始描述不参与重新召回。"""
+
+    previous = intent.apply_input_constraints(intent.rule_extract_prediction("评估991SVG开关的35kV柜内状态"))
+
+    query = _extract(
+        "其实是2号主变",
+        previous=previous,
+        device_override="其实是2号主变",
+    )
+
+    assert query.device_name == "2号主变"
+    assert query.device_type == "变压器"
+    assert query.voltage_level is None
+    assert query.location_hint is None
+    assert query.raw_text == "其实是2号主变"
 
 
 def test_context_model_call_requires_model():

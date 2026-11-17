@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 from yuxi.knowledge.device_index import reset_device_name_index
+from yuxi.knowledge.fault_trace.ledger import LedgerDevice
 from yuxi.knowledge.fault_trace.graph_kg3 import (
     collect_kg3_evidence,
     find_devices,
@@ -294,6 +295,76 @@ def test_find_devices_falls_back_to_name_index():
     devices = find_devices(_IndexClient(), ["一号开闭所"], graph_key="test-ft-index")
 
     assert [device["name"] for device in devices] == ["#1开闭所"]
+
+
+def test_exact_hit_keeps_similar_ledger_candidate():
+    """精确设备存在时，台账近似设备也要进入故障设备确认候选。"""
+
+    similar = {
+        "名称": "3B-7Y备用线路",
+        "id": "LGR#3b7y-backup",
+        "设备分类": "中压线路",
+        "层级路径": "输电设施 > 3B-7Y备用线路",
+    }
+
+    def responder(cypher: str, params: dict):
+        if "names" in params:
+            return [{"n": similar}]
+        if "= $name" in cypher or "CONTAINS $kw" in cypher:
+            return [{"n": DEVICE}]
+        return []
+
+    devices = find_devices(
+        _FakeClient(responder),
+        ["3B-7Y"],
+        ledger_candidates=[
+            LedgerDevice(
+                device_id="ledger-backup",
+                name="3B-7Y备用线路",
+                device_type="中压线路",
+                voltage_level="10kV",
+                path=("输电设施",),
+                score=90.0,
+            )
+        ],
+    )
+
+    assert [device["name"] for device in devices] == ["3B-7Y", "3B-7Y备用线路"]
+    assert devices[1]["properties"]["台账ID列表"] == "ledger-backup"
+
+
+def test_ledger_candidate_can_recover_device_from_raw_text():
+    """故障意图字段缺失时，台账仍可按原始描述召回并映射图谱设备。"""
+
+    line = {
+        "名称": "银开线",
+        "id": "LGR#SUPLINEYK",
+        "设备分类": "输电线路",
+        "层级路径": "输电设施 > 银开线",
+    }
+
+    def responder(cypher: str, params: dict):
+        if "names" in params:
+            return [{"n": line}]
+        return []
+
+    devices = find_devices(
+        _FakeClient(responder),
+        ["110kV银开线故障"],
+        ledger_candidates=[
+            LedgerDevice(
+                "ledger-line",
+                "银开线",
+                "输电线路",
+                "110kV",
+                ("输电设施",),
+                score=92.0,
+            )
+        ],
+    )
+
+    assert [device["name"] for device in devices] == ["银开线"]
+    assert devices[0]["properties"]["台账ID列表"] == "ledger-line"
 
 
 def test_find_devices_returns_empty_without_graph_key_when_all_stages_miss():

@@ -4,6 +4,8 @@
 类型：feature
 Owner：backend/package/yuxi/knowledge/device_selection.py
 
+> 设备召回、人工确认与用户覆盖口径由[图谱与台账合并召回及用户优先覆盖](./2026-11-17-device-recall-ledger-and-user-override.md)更新；本记录保留模型在候选内推荐与有界载荷的约束。
+
 > 消费方：`fault_trace/workflow.py`、`maintenance_plan/tool.py`、`device_prediction/tool.py` 的设备定位；召回增强落在各自的图谱适配器与 `device_index.py`。
 
 ## 问题

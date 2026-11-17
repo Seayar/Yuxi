@@ -7,6 +7,7 @@ import asyncio
 import pytest
 
 from yuxi.agents.toolkits.tugraph import TuGraphError
+from yuxi.knowledge.fault_trace.ledger import LedgerDevice
 from yuxi.knowledge.device_prediction import graph as graph_module
 from yuxi.knowledge.device_prediction.contracts import (
     GUIDANCE_NOT_MATCHED_NOTE,
@@ -158,6 +159,72 @@ def test_device_type_query_failure_keeps_candidates():
 
 def test_empty_recall_returns_no_candidates():
     assert graph_module.search_devices(_FakeClient(), _query(device_name="不存在设备")) == []
+
+
+def test_exact_hit_keeps_similar_ledger_candidate_and_business_id():
+    """精确命中不短路台账近似候选；台账 ID 在图谱节点缺 ID 时补入候选。"""
+
+    exact = {"id": "D1", "名称": "1号主变", "层级路径": "变电设施 > #1变电站 > 1号主变"}
+    similar = {"id": "D2", "名称": "1号主变间隔", "层级路径": "变电设施 > #1变电站 > 1号主变间隔"}
+
+    class _LedgerRecallClient:
+        def run(self, cypher, **params):
+            if params.get("rel") == "属于":
+                return []
+            if "names" in params:
+                return [{"n": similar}]
+            if "= $name" in cypher or "CONTAINS $kw" in cypher:
+                return [{"n": exact}]
+            return []
+
+    candidates = graph_module.search_devices(
+        _LedgerRecallClient(),
+        _query(device_name="1号主变"),
+        ledger_candidates=[
+            LedgerDevice(
+                device_id="ledger-2",
+                name="1号主变间隔",
+                device_type="变压器",
+                voltage_level="110kV",
+                path=("变电设施", "#1变电站"),
+            )
+        ],
+    )
+
+    assert [item.name for item in candidates] == ["1号主变", "1号主变间隔"]
+    assert candidates[1].ledger_ids == ("ledger-2",)
+    assert candidates[1].device_type == "变压器"
+
+
+def test_ledger_candidate_can_recover_device_when_intent_fields_are_empty():
+    """设备字段缺失时，台账从原文召回的设备仍可成为图谱候选。"""
+
+    line = {"id": "D-LINE", "名称": "银开线", "层级路径": "输电设施 > 银开线"}
+
+    class _RawTextClient:
+        def run(self, cypher, **params):
+            if params.get("rel") == "属于":
+                return []
+            if "names" in params:
+                return [{"n": line}]
+            return []
+
+    candidates = graph_module.search_devices(
+        _RawTextClient(),
+        PredictionQuery(raw_text="评估110kV银开线未来故障风险"),
+        ledger_candidates=[
+            LedgerDevice(
+                "ledger-line",
+                "银开线",
+                "输电线路",
+                "110kV",
+                ("输电设施",),
+                score=92.0,
+            )
+        ],
+    )
+
+    assert [item.name for item in candidates] == ["银开线"]
 
 
 # ---------------------------------------------------------------------------

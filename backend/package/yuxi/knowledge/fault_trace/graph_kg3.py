@@ -10,15 +10,18 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from typing import Any
 
 from yuxi.knowledge.device_index import (
     DEVICE_RECALL_MAX_RECORDS,
     DEVICE_RECALL_TOKEN_LIMIT,
+    DEVICE_INDEX_CANDIDATES,
     device_recall_tokens,
-    fallback_score,
     get_device_name_index,
+    normalize_device_text,
 )
+from yuxi.knowledge.fault_trace.ledger import LedgerDevice, match_ledger_candidate
 from yuxi.knowledge.fault_trace.contracts import (
     DEVICE_CLASS_TO_TYPE,
     ENTITY_CAUSE,
@@ -38,7 +41,14 @@ from yuxi.knowledge.fault_trace.graph import FaultGraphEvidence
 QUERY_LIMIT = 200
 
 
-def find_devices(client: Any, names: list[str], *, graph_key: str = "") -> list[dict[str, Any]]:
+def find_devices(
+    client: Any,
+    names: list[str],
+    *,
+    graph_key: str = "",
+    ledger_candidates: Sequence[LedgerDevice] = (),
+    limit: int = DEVICE_RECALL_MAX_RECORDS,
+) -> list[dict[str, Any]]:
     """按名称精确/包含匹配设备实例；都未命中时依次用词元与设备名索引扩大召回。
 
     用户与意图识别经常带电压等级前缀（``110kV银开线``）或序号口语写法（``1号主变``），
@@ -59,8 +69,6 @@ def find_devices(client: Any, names: list[str], *, graph_key: str = "") -> list[
             node_limit=QUERY_LIMIT,
         )
         exact.extend(_add_nodes(evidence, records, "n", KG_DEVICE_LABEL))
-    if exact:
-        return _dedupe(exact)
 
     contains: list[dict[str, Any]] = []
     for name in lookup_names:
@@ -73,42 +81,41 @@ def find_devices(client: Any, names: list[str], *, graph_key: str = "") -> list[
             node_limit=QUERY_LIMIT,
         )
         contains.extend(_add_nodes(evidence, records, "n", KG_DEVICE_LABEL))
-    if contains:
-        return _dedupe(contains)
 
-    return _find_devices_by_fallback(client, names, graph_key=graph_key)
-
-
-def _find_devices_by_fallback(client: Any, names: list[str], *, graph_key: str) -> list[dict[str, Any]]:
-    """兜底召回：词元命中与设备名索引合并，按命中质量排序后截断。
-
-    泛词元（“间隔”“线路”）可能命中上百条，统一给 1 分会让目标被名称排序挤出候选；
-    这里按词元命中数与索引排名打分，并限制交给后续消歧/卡片的记录数。
-    """
-
-    tokens = device_recall_tokens(" ".join(names))
-    token_records = _find_devices_by_tokens(client, tokens)
+    ledger_records = _find_devices_by_ledger_candidates(client, ledger_candidates)
     index_records = _find_devices_by_index(client, names, graph_key=graph_key) if graph_key else []
+    token_records = (
+        _find_devices_by_tokens(client, device_recall_tokens(" ".join(names)))
+        if not (exact or contains or ledger_records)
+        else []
+    )
+    ranked: dict[str, tuple[float, int, dict[str, Any]]] = {}
 
-    ranked: dict[str, tuple[float, dict[str, Any]]] = {}
-    for record in token_records:
-        device_id = str(record.get("id") or "")
-        if not device_id:
-            continue
-        score = fallback_score(str(record.get("name") or ""), tokens)
-        current = ranked.get(device_id)
-        if current is None or score > current[0]:
-            ranked[device_id] = (score, record)
-    for rank, record in enumerate(index_records):
-        device_id = str(record.get("id") or "")
-        if not device_id:
-            continue
-        score = fallback_score(str(record.get("name") or ""), tokens, index_rank=rank)
-        current = ranked.get(device_id)
-        if current is None or score > current[0]:
-            ranked[device_id] = (score, record)
-    ordered = sorted(ranked.values(), key=lambda item: (-item[0], str(item[1].get("name") or "")))
-    return [record for _score, record in ordered[:DEVICE_RECALL_MAX_RECORDS]]
+    def _add(records: list[dict[str, Any]], *, base: float, score_fn=None) -> None:
+        for rank, record in enumerate(records):
+            device_id = str(record.get("id") or "")
+            if not device_id:
+                continue
+            score = score_fn(record) if score_fn is not None else base - min(rank, 30)
+            if score <= 0:
+                continue
+            current = ranked.get(device_id)
+            if current is None or score > current[0]:
+                ranked[device_id] = (score, len(ranked), record)
+
+    _add(exact, base=100.0)
+    _add(
+        ledger_records,
+        base=90.0,
+        score_fn=lambda record: _record_ledger_score(record, ledger_candidates),
+    )
+    _add(index_records, base=80.0)
+    _add(contains, base=70.0)
+    _add(token_records, base=40.0)
+    return [
+        _enrich_with_ledger(record, ledger_candidates)
+        for _score, _order, record in sorted(ranked.values(), key=lambda item: (-item[0], item[1]))
+    ][:limit]
 
 
 def _find_devices_by_tokens(client: Any, tokens: list[str]) -> list[dict[str, Any]]:
@@ -132,6 +139,22 @@ def _find_devices_by_tokens(client: Any, tokens: list[str]) -> list[dict[str, An
     return _dedupe(found)
 
 
+def _record_ledger_score(
+    record: dict[str, Any],
+    ledger_candidates: Sequence[LedgerDevice],
+) -> float:
+    """按图谱设备的名称、层级和台账 ID 取对应台账命中分。"""
+
+    properties = record.get("properties") or {}
+    matched = match_ledger_candidate(
+        name=str(record.get("name") or ""),
+        path=str(properties.get("层级路径") or ""),
+        ledger_ids=tuple(_split_ledger_ids(properties.get("台账ID列表"))),
+        candidates=ledger_candidates,
+    )
+    return matched.score if matched is not None else 0.0
+
+
 def _find_devices_by_index(client: Any, names: list[str], *, graph_key: str) -> list[dict[str, Any]]:
     """按设备名索引召回：归一化/近似匹配后按 id 取回图谱节点，保留索引排序。"""
 
@@ -145,7 +168,13 @@ def _find_devices_by_index(client: Any, names: list[str], *, graph_key: str) -> 
         return []
     ordered_ids: list[str] = []
     for name in names:
-        ordered_ids.extend(entry.device_id for entry in index.search(name))
+        ordered_ids.extend(
+            entry.device_id
+            for entry in index.search(
+                name,
+                limit=min(DEVICE_RECALL_MAX_RECORDS, DEVICE_INDEX_CANDIDATES),
+            )
+        )
     ordered_ids = list(dict.fromkeys(ordered_ids))
     if not ordered_ids:
         return []
@@ -159,6 +188,98 @@ def _find_devices_by_index(client: Any, names: list[str], *, graph_key: str) -> 
     nodes = _add_nodes(evidence, records, "n", KG_DEVICE_LABEL)
     by_id = {str(node.get("id") or ""): node for node in nodes}
     return [by_id[device_id] for device_id in ordered_ids if device_id in by_id]
+
+
+def _find_devices_by_ledger_candidates(
+    client: Any,
+    ledger_candidates: Sequence[LedgerDevice],
+) -> list[dict[str, Any]]:
+    """把台账候选映射回故障图谱设备；名称批量查询后按台账 ID 补漏。"""
+
+    if not ledger_candidates:
+        return []
+    names = list(dict.fromkeys(candidate.name for candidate in ledger_candidates if candidate.name))
+    records = _find_devices_by_names(client, names) if names else []
+    found_ids = {str(record.get("id") or "") for record in records}
+    found_names = {normalize_device_text(record.get("name")) for record in records}
+    for candidate in ledger_candidates[:DEVICE_RECALL_MAX_RECORDS]:
+        if normalize_device_text(candidate.name) in found_names:
+            continue
+        for record in _find_devices_by_ledger_id(client, candidate.device_id):
+            device_id = str(record.get("id") or "")
+            if device_id and device_id not in found_ids:
+                found_ids.add(device_id)
+                records.append(record)
+    return records
+
+
+def _find_devices_by_names(client: Any, names: list[str]) -> list[dict[str, Any]]:
+    """按台账名称批量回查故障图谱设备。"""
+
+    conditions = " OR ".join(f"coalesce(n.{prop}, '') IN $names" for prop in KG_DEVICE_NAME_PROPS)
+    records = client.run(
+        f"MATCH (n) WHERE labels(n)[0] = $label AND ({conditions}) RETURN n LIMIT $node_limit",
+        label=KG_DEVICE_LABEL,
+        names=names,
+        node_limit=QUERY_LIMIT,
+    )
+    evidence = FaultGraphEvidence()
+    return _add_nodes(evidence, records, "n", KG_DEVICE_LABEL)
+
+
+def _find_devices_by_ledger_id(client: Any, ledger_id: str) -> list[dict[str, Any]]:
+    """按台账 ID 补查故障图谱节点，兼容多 ID 文本。"""
+
+    if not ledger_id:
+        return []
+    records = client.run(
+        "MATCH (n) WHERE labels(n)[0] = $label "
+        "AND coalesce(n.台账ID列表, '') CONTAINS $ledger_id RETURN n LIMIT $node_limit",
+        label=KG_DEVICE_LABEL,
+        ledger_id=ledger_id,
+        node_limit=QUERY_LIMIT,
+    )
+    evidence = FaultGraphEvidence()
+    return _add_nodes(evidence, records, "n", KG_DEVICE_LABEL)
+
+
+def _enrich_with_ledger(
+    device: dict[str, Any],
+    ledger_candidates: Sequence[LedgerDevice],
+) -> dict[str, Any]:
+    """用同名或同台账 ID 的台账行补全设备展示与业务 ID。"""
+
+    properties = dict(device.get("properties") or {})
+    matched = match_ledger_candidate(
+        name=str(device.get("name") or ""),
+        path=str(properties.get("层级路径") or ""),
+        ledger_ids=tuple(_ledger_ids_from_properties(properties)),
+        candidates=ledger_candidates,
+    )
+    if matched is None:
+        return device
+    ledger_ids = [
+        item for item in _split_ledger_ids(properties.get("台账ID列表")) if item not in LEDGER_ID_PLACEHOLDERS
+    ]
+    ledger_ids.append(matched.device_id)
+    properties["台账ID列表"] = "、".join(dict.fromkeys(ledger_ids))
+    properties.setdefault("台账设备类型", matched.device_type)
+    properties.setdefault("电压等级", matched.voltage_level)
+    if matched.path and not properties.get("层级路径"):
+        properties["层级路径"] = " > ".join((*matched.path, matched.name))
+    return {**device, "properties": properties}
+
+
+def _ledger_ids_from_properties(properties: dict[str, Any]) -> set[str]:
+    """读取设备属性里的台账 ID 集合。"""
+
+    return set(_split_ledger_ids(properties.get("台账ID列表")))
+
+
+def _split_ledger_ids(value: Any) -> list[str]:
+    """拆分可能包含多个 ID 的台账文本。"""
+
+    return [item for item in re.split(r"[,，、;；\s]+", str(value or "")) if item]
 
 
 def _in_condition(prop: str) -> str:
@@ -212,6 +333,19 @@ def resolve_device_type(client: Any, device: dict[str, Any]) -> tuple[str | None
             condition="coalesce(a.id, '') = $device_id",
             device_id=device_id,
         )
+        if type_nodes:
+            return _unique_type(type_nodes)
+
+    ledger_type = str(properties.get("台账设备类型") or "").strip()
+    if ledger_type:
+        mapped_name = DEVICE_CLASS_TO_TYPE.get(ledger_type, ledger_type)
+        records = client.run(
+            "MATCH (t) WHERE labels(t)[0] = $label AND coalesce(t.名称, '') = $name RETURN t LIMIT $node_limit",
+            label=KG_DEVICE_TYPE_LABEL,
+            name=mapped_name,
+            node_limit=QUERY_LIMIT,
+        )
+        type_nodes = _add_nodes(device_evidence, records, "t", KG_DEVICE_TYPE_LABEL)
         if type_nodes:
             return _unique_type(type_nodes)
 

@@ -58,6 +58,7 @@ async def extract_prediction_intent(
     *,
     model_call: PredictionModelCall | None,
     previous: PredictionQuery | None = None,
+    device_override: str | None = None,
 ) -> PredictionQuery:
     """优先用大模型抽取设备信息（严格 JSON），失败/超时/非法输出时回退规则解析。
 
@@ -67,20 +68,36 @@ async def extract_prediction_intent(
 
     rule_query = rule_extract_prediction(text)
     query = rule_query
+    prompt_previous = _without_device_identity(previous) if device_override is not None else previous
     if model_call is not None:
         try:
-            raw = await model_call(build_intent_prompt(text, previous=previous))
+            raw = await model_call(build_intent_prompt(text, previous=prompt_previous))
             query = _merge_model_result(rule_query, parse_model_json(raw))
         except Exception as exc:  # noqa: BLE001 —— 模型侧任何异常都必须降级到规则解析
             logger.warning(f"设备预测维护意图识别失败，回退规则解析: {exc}")
             query = rule_query
 
     if previous is not None:
-        query = _merge_previous(query, previous)
+        query = _merge_previous(query, prompt_previous or PredictionQuery())
         query.raw_text = _combine_text(previous.raw_text, text)
     else:
         query.raw_text = (text or "").strip()
+    if device_override is not None:
+        # 卡片自由输入直接替换设备身份；保留上一轮任务问题，但不保留任何旧设备字段。
+        query.device_name = rule_query.device_name or rule_query.location_hint or _clean_optional(device_override)
+        query.device_type = rule_query.device_type
+        query.voltage_level = rule_query.voltage_level
+        query.location_hint = rule_query.location_hint
+        query.raw_text = (device_override or text or "").strip()
     return apply_input_constraints(query)
+
+
+def _without_device_identity(query: PredictionQuery | None) -> PredictionQuery | None:
+    """复制上一轮查询并清空设备身份字段，供用户改填设备时使用。"""
+
+    if query is None:
+        return None
+    return PredictionQuery(raw_text=query.raw_text)
 
 
 def apply_input_constraints(query: PredictionQuery) -> PredictionQuery:

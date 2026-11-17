@@ -21,6 +21,7 @@ import re
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from yuxi.knowledge.device_selection import DEVICE_SELECTION_MAX_CANDIDATES
 from yuxi.thinking import ThinkingStepSpec, register_thinking_steps
 
 DEVICE_PREDICTION_AGENT_SLUG = "device-prediction-agent"
@@ -90,8 +91,8 @@ STATUS_READOUT_TEMPLATE_NOTE = "状态解读由评分、等级与监测指标确
 DEVICE_CHOICE_SOURCE = "device_prediction_device_choice"
 DEVICE_QUESTION_ID = "device_prediction_device"
 DEVICE_CHOICE_QUESTION = "请选择目标设备："
-# 设备候选展示上限与一次请求内最多的引导选择轮次
-MAX_DEVICE_CANDIDATES = 8
+# 设备候选统一召回与展示上限；与设备模型选择的有界候选保持一致。
+MAX_DEVICE_CANDIDATES = DEVICE_SELECTION_MAX_CANDIDATES
 MAX_CHOICE_ROUNDS = 4
 # 卡片里代表“其他（自由输入）”的取值，视为用户没有选中任何选项
 OTHER_VALUES = frozenset({"__other__", "other", "其他"})

@@ -5,7 +5,8 @@
 （``answer``）各自拥有模块，跨模块流动的数据形状统一由 ``contracts`` 拥有。
 
 设备/场景两类引导选择走 LangGraph ``interrupt``（载荷沿用 Yuxi 既有选择卡片格式
-``source + questions[]``）：设备候选不唯一时选设备，场景候选不唯一或并列时选场景。
+``source + questions[]``）：每次请求都确认目标设备，零候选时允许自由输入；场景候选
+不唯一或并列时选场景。
 分支只从 Redis 读取；未配置、无 key、读取失败或值非法时返回固定失败文案，不让人工选择，
 也不默认任何分支。``interrupt`` 会让工具从头重放，因此中断之前的步骤必须确定性且不产生
 副作用（不写图、不写外部日志）。所有同步图查询一律放到 ``asyncio.to_thread`` 执行。
@@ -29,7 +30,13 @@ from yuxi.agents.toolkits.tugraph import TuGraphClient, TuGraphConfig, TuGraphEr
 from yuxi.agents.thinking import ThinkingEmitter
 from yuxi.config.options import fault_trace_opts
 from yuxi.knowledge.device_index import graph_key as device_graph_key
-from yuxi.knowledge.device_selection import DeviceOption, select_device
+from yuxi.knowledge.device_selection import (
+    DeviceOption,
+    build_device_choice_payload,
+    parse_device_choice,
+    select_device,
+)
+from yuxi.knowledge.fault_trace.ledger import ledger_repository
 from yuxi.knowledge.maintenance_plan.answer import produce_maintenance_plan_answer
 from yuxi.knowledge.maintenance_plan.branch import lookup_branch
 from yuxi.knowledge.maintenance_plan.contracts import (
@@ -45,7 +52,6 @@ from yuxi.knowledge.maintenance_plan.contracts import (
     MAX_CHOICE_ROUNDS,
     MAX_DEVICE_CANDIDATES,
     MAX_SCENE_CANDIDATES,
-    NO_DEVICE_MESSAGE,
     NO_PERMISSION_MESSAGE,
     NO_SCENE_MESSAGE,
     PLAN_GRAPH_NOT_CONFIGURED_MESSAGE,
@@ -92,8 +98,6 @@ MAINTENANCE_PLAN_INTENT_MAX_TOKENS = int(os.getenv("MAINTENANCE_PLAN_INTENT_MAX_
 # 最终结果按 query_text 缓存在对话上下文上（与故障溯源同款）：同一描述重复调用返回缓存，
 # 不同描述各自独立，不能共用一份结果。
 RESULT_ATTR = "_maintenance_plan_result"
-# 选择卡片里代表“其他（自由输入）”的取值，视为用户没有选中任何选项
-OTHER_VALUES = frozenset({"__other__", "other", "其他"})
 
 
 class MaintenancePlanInput(BaseModel):
@@ -140,14 +144,6 @@ async def generate_maintenance_plan(query_text: str, runtime: ToolRuntime = None
     start = time.monotonic()
     model_call = _context_model_call(context) if MAINTENANCE_PLAN_INTENT_ENABLED else None
     query = await extract_plan_intent(query_text, model_call=model_call)
-    if query.clarification_required:
-        emitter.emit(
-            "parse_task",
-            "failed",
-            content=query.clarification_message,
-            error={"code": "clarification_required", "message": query.clarification_message},
-        )
-        return query.clarification_message
     emitter.emit(
         "parse_task",
         "completed",
@@ -368,18 +364,31 @@ async def _locate_device(
     """
 
     while True:
-        candidates = await asyncio.to_thread(
-            _graph_plan().search_devices,
-            client,
-            query,
-            graph_key=graph_key,
+        recall_text = query.device_name or query.location_hint or query.raw_text
+        ledger_candidates = await ledger_repository.search_devices(
+            recall_text,
+            device_type=query.device_type,
+            voltage_level=query.voltage_level,
+            location_hint=query.location_hint,
+            limit=MAX_DEVICE_CANDIDATES,
+            minimum_score=0.0 if (query.device_name or query.location_hint or query.device_type) else 60.0,
         )
+        if query.clarification_required and not ledger_candidates:
+            candidates = []
+        else:
+            candidates = await asyncio.to_thread(
+                _graph_plan().search_devices,
+                client,
+                query,
+                graph_key=graph_key,
+                ledger_candidates=ledger_candidates,
+            )
         if not candidates:
             logger.warning(
                 f"处置方案设备召回为空: device_name={query.device_name!r} "
-                f"device_type={query.device_type!r} location={query.location_hint!r}"
+                f"device_type={query.device_type!r} location={query.location_hint!r} "
+                f"ledger_candidates={len(ledger_candidates)}"
             )
-            return NO_DEVICE_MESSAGE
         recommended_id: str | None = None
         selection: dict[str, Any] | None = None
         if len(candidates) > 1:
@@ -403,7 +412,14 @@ async def _locate_device(
         if isinstance(picked, DeviceCandidate):
             return query, picked
         if picked:
-            query = await extract_plan_intent(picked, model_call=model_call, previous=query)
+            logger.info(f"处置方案用户改填设备，清除上一轮设备身份: {picked!r}")
+            query = await extract_plan_intent(
+                picked,
+                model_call=model_call,
+                previous=query,
+                feedback=picked,
+                device_override=picked,
+            )
             continue
         if rounds[0] >= MAX_CHOICE_ROUNDS:
             return CHOICE_ABORTED_MESSAGE
@@ -477,23 +493,20 @@ def _pick_device(
             "device_selection": selection,
         },
     )
-    answer = _ask_choice(
-        _device_payload(query, candidates, recommended_id=recommended_id),
-        DEVICE_QUESTION_ID,
-        rounds,
-    )
-    if answer is CHOICE_CANCELLED:
-        return CHOICE_CANCELLED
-    if answer is None:
+    if rounds[0] >= MAX_CHOICE_ROUNDS:
         return None
-    selected, free_text = answer
-    if selected:
-        matched = next((candidate for candidate in candidates if candidate.device_id == selected), None)
+    rounds[0] += 1
+    answer = interrupt(_device_payload(query, candidates, recommended_id=recommended_id))
+    choice = parse_device_choice(answer, DEVICE_QUESTION_ID)
+    if choice.cancelled:
+        return CHOICE_CANCELLED
+    if choice.selected_id:
+        matched = next((candidate for candidate in candidates if candidate.device_id == choice.selected_id), None)
         if matched is not None:
             return matched
-    if free_text:
-        return free_text
-    return selected or None
+    if choice.free_text:
+        return choice.free_text
+    return choice.selected_id
 
 
 def _device_choice_error_code(message: str) -> str:
@@ -518,26 +531,26 @@ def _device_payload(
     “目标设备”显示成一长串路径；模型选中的候选在 label 末尾标记“（推荐）”。
     """
 
-    return {
-        "source": DEVICE_CHOICE_SOURCE,
-        "questions": [
-            {
-                "question_id": DEVICE_QUESTION_ID,
-                "question": DEVICE_CHOICE_QUESTION,
-                "options": [
-                    {
-                        "label": candidate.label() + ("（推荐）" if candidate.device_id == recommended_id else ""),
-                        "value": candidate.device_id,
-                        "description": candidate.location(),
-                    }
-                    for candidate in candidates[:MAX_DEVICE_CANDIDATES]
-                ],
-                "multi_select": False,
-                "allow_other": True,
-            }
+    payload = build_device_choice_payload(
+        source=DEVICE_CHOICE_SOURCE,
+        question_id=DEVICE_QUESTION_ID,
+        question=DEVICE_CHOICE_QUESTION if candidates else "未召回到候选设备，请直接填写正确的设备名称。",
+        options=[
+            DeviceOption(
+                device_id=candidate.device_id,
+                name=candidate.name,
+                device_type=candidate.device_type,
+                voltage_level=candidate.voltage_level,
+                path=candidate.location(),
+                category=candidate.ledger_class,
+            )
+            for candidate in candidates
         ],
-        "query": query.model_dump(),
-    }
+        recommended_id=recommended_id,
+        limit=MAX_DEVICE_CANDIDATES,
+    )
+    payload["query"] = query.model_dump()
+    return payload
 
 
 def _choose_scene(
@@ -664,7 +677,7 @@ def _parse_choice(value: Any, question_id: str) -> tuple[str | None, str | None]
 def _is_other(text: str) -> bool:
     """判断是否为“其他（自由输入）”占位取值。"""
 
-    return text.strip().lower() in OTHER_VALUES
+    return text.strip().lower() in {"__other__", "other", "其他"}
 
 
 # ---------------------------------------------------------------------------

@@ -93,7 +93,13 @@ _DEVICE_NAME_PATTERNS: tuple[tuple[re.Pattern[str], bool], ...] = (
     # 间隔类设备（如“岭开线进线间隔_1101”）：带下划线的台账命名必须整段取到，不能截成线路名。
     (re.compile(r"[\u4e00-\u9fa5]{2,12}\s*间隔\s*_\s*\d+"), True),
     # 母线是设备/部件名，不是线路名；排除“母线”避免把“主变低压侧母线”截成线路。
-    (re.compile(r"[\u4e00-\u9fa5]{2,6}(?<!母)线(?![路])"), True),
+    (
+        re.compile(
+            r"(?<![0-9])(?:(?:#\s*\d+|\d+\s*号|[一二三四五六七八九十百零]+\s*号)\s*)?"
+            r"[\u4e00-\u9fa5]{1,6}(?<!母)线(?![路])"
+        ),
+        True,
+    ),
     (re.compile(r"#\s*\d+\s*箱变\s*\d*\s*(?:变压器出线柜|馈出柜|环出柜|环进柜|出线柜|进线柜|柜)?"), False),
     (re.compile(r"箱变\s*\d+\s*(?:变压器出线柜|馈出柜|环出柜|环进柜|出线柜|进线柜|柜)"), False),
     (re.compile(r"\d+\s*SVG\s*开关", re.IGNORECASE), False),
@@ -402,6 +408,7 @@ async def extract_plan_intent(
     model_call: PlanIntentModelCall | None,
     previous: PlanQuery | None = None,
     feedback: str | None = None,
+    device_override: str | None = None,
 ) -> PlanQuery:
     """优先用大模型抽取（返回严格 JSON），失败/超时/非法 JSON 时回退 ``rule_extract``；
 
@@ -410,20 +417,42 @@ async def extract_plan_intent(
 
     rule_query = rule_extract(text)
     query = rule_query
+    prompt_previous = _without_device_identity(previous) if device_override is not None else previous
     if model_call is not None:
         try:
-            raw = await model_call(build_intent_prompt(text, previous=previous, feedback=feedback))
+            raw = await model_call(build_intent_prompt(text, previous=prompt_previous, feedback=feedback))
             query = _merge_model_result(rule_query, _parse_intent_json(raw))
         except Exception as exc:  # noqa: BLE001 —— 模型侧任何异常都必须降级到规则解析
             logger.warning(f"处置方案意图识别失败，回退规则解析: {exc}")
             query = rule_query
 
     if previous is not None:
-        query = _merge_previous(query, previous)
+        query = _merge_previous(query, prompt_previous or PlanQuery())
         query.raw_text = _combine_text(previous.raw_text, text)
     else:
         query.raw_text = (text or "").strip()
+    if device_override is not None:
+        # 设备卡片的自由输入是对目标设备的直接替换；模型只能补任务上下文，不能保留旧设备。
+        query.device_name = rule_query.device_name or rule_query.location_hint or _clean_optional(device_override)
+        query.device_type = rule_query.device_type
+        query.voltage_level = rule_query.voltage_level
+        query.location_hint = rule_query.location_hint
+        query.raw_text = (device_override or text or "").strip()
     return apply_input_constraints(query)
+
+
+def _without_device_identity(query: PlanQuery | None) -> PlanQuery | None:
+    """复制上一轮查询并清空设备身份字段，供用户改填设备时使用。"""
+
+    if query is None:
+        return None
+    return PlanQuery(
+        raw_text=query.raw_text,
+        task_type=query.task_type,
+        work_object=query.work_object,
+        maintenance_level=query.maintenance_level,
+        scene_hint=query.scene_hint,
+    )
 
 
 def build_intent_prompt(

@@ -25,6 +25,9 @@ import time
 from dataclasses import dataclass, replace
 from typing import Any
 
+import json_repair
+
+from yuxi.knowledge.fault_trace.ledger import LedgerDevice, match_ledger_candidate
 from yuxi.knowledge.maintenance_plan.contracts import (
     PERSONNEL_DATA_MISSING_NOTE,
     PERSONNEL_TEAM_MISSING_NOTE,
@@ -209,16 +212,6 @@ def _match_ledger_row(rows: list[dict[str, Any]], name: str, ancestors: list[str
     needle = _normalize_name(name)
     if not needle:
         return None
-    candidates = [row for row in rows if _normalize_name(row.get("name")) == needle]
-    if not candidates:
-        candidates = [
-            row
-            for row in rows
-            if (row_name := _normalize_name(row.get("name"))) and (needle in row_name or row_name in needle)
-        ]
-    if not candidates:
-        return None
-
     by_id = {str(row.get("id")): row for row in rows}
 
     def path_of(row: dict[str, Any]) -> list[str]:
@@ -234,11 +227,29 @@ def _match_ledger_row(rows: list[dict[str, Any]], name: str, ancestors: list[str
             names.append(str(cursor.get("name") or ""))
         return names
 
-    scored = [
-        (sum(1 for ancestor in ancestors if ancestor in path_of(row)), -len(path_of(row)), row) for row in candidates
+    exact = [row for row in rows if _normalize_name(row.get("name")) == needle]
+    if exact:
+        devices = [
+            LedgerDevice(
+                device_id=str(row.get("id")),
+                name=str(row.get("name") or ""),
+                path=tuple(reversed(path_of(row))),
+            )
+            for row in exact
+        ]
+        matched = match_ledger_candidate(
+            name=name,
+            path=" > ".join(ancestors),
+            candidates=devices,
+        )
+        return by_id.get(matched.device_id) if matched is not None else None
+
+    contained = [
+        row
+        for row in rows
+        if (row_name := _normalize_name(row.get("name"))) and (needle in row_name or row_name in needle)
     ]
-    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    return scored[0][2]
+    return contained[0] if len(contained) == 1 else None
 
 
 def _normalize_name(value: Any) -> str:
@@ -269,7 +280,12 @@ async def _read_json(bucket: str, object_name: str) -> Any:
 
         client = get_minio_client()
         raw = await client.adownload_file(bucket, object_name)
-        return json.loads(raw.decode("utf-8"))
+        text = raw.decode("utf-8")
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as exc:
+            logger.warning(f"外部数据 JSON 存在格式瑕疵，尝试修复解析（{bucket}/{object_name}）: {exc}")
+            return json_repair.loads(text)
     except Exception as exc:  # noqa: BLE001 - 外部数据不可用时降级，不阻断图谱方案
         logger.warning(f"读取处置方案外部数据失败（{bucket}/{object_name}）: {exc}")
         return None
