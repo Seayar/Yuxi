@@ -137,7 +137,7 @@ sequenceDiagram
 
 `adapt_vector_results` 把召回 chunk 转成 `SpecClauseEvidence`，同时把原始正文字段和解析正文字段一起放进 `metadata`，供校验回溯。展示正文按行挑选：命中行所在的连续内容块整块保留（表格与普通段落同等对待，避免丢掉表头、分隔行与引出语引出的条目），短于 `MAX_UNFILTERED_BODY_CHARS` 的条款不裁剪；分块渲染拼在首行的「编号 标题」在展示前去掉，避免与卡片的条款编号字段重复。原文全文始终留在 `metadata`。
 
-卡片载荷 `items` 仍只包含规范名称、标准编号、条款编号和条款正文四个字段。`answer_markdown` 在每张卡片末尾追加 `[[PDF:<原始文档地址>]]`；地址取该卡片所属知识库文件的 `minio_url`，缺失时取 `path`，供前端按该协议解析标记后请求并打开源文档。条款标题、适用范围、规范状态、替代关系与页码仍保留在证据对象中，供检索、校对和投影校验使用；相关度由 `rerank_score` 派生，引用键由 `document_id#clause_no` 生成，都不进入卡片。
+卡片载荷 `items` 仍只包含规范名称、标准编号、条款编号和条款正文四个字段。`answer_markdown` 在每张卡片末尾追加 `[[PDF:<下载地址>]]`；代码把标准号归一化成文件名，例如 `DL/T 408-2023` 映射为 `DL_T408-2023.pdf`，下载地址为 `/api/knowledge/power-spec/pdfs/DL_T408-2023.pdf`。下载路由固定读取私有 `powerspec` bucket 根目录中的同名对象，不接受任意 MinIO 路径。前端按卡片边界解析标记，点击下载时携带当前用户凭据请求原 PDF，并从 `Content-Disposition` 取得文件名。条款标题、适用范围、规范状态、替代关系与页码仍保留在证据对象中，供检索、校对和投影校验使用；相关度由 `rerank_score` 派生，引用键由 `document_id#clause_no` 生成，都不进入卡片。
 
 卡片正文保持原文的 Markdown/HTML 结构：表格、`<br>` 换行、LaTeX 和整理模型给出的换行都原样写入 `clause_body` 与 `answer_markdown`，后端只注入 `<mark>` 高亮标签，不做 HTML 转义。前端 `SearchPowerSpecTool` 与助手消息都使用公共 Markdown 渲染器展示正文，表格与单元格换行由渲染器处理，XSS 由渲染器的 DOMPurify sanitizer 拦截。
 

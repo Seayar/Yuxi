@@ -37,6 +37,7 @@ STATE_INVALID_OUTPUT = "invalid_output"
 STATE_ERROR = "error"
 
 OTHER_VALUES = frozenset({"__other__", "other", "其他"})
+SELECTED_DEVICE_UNAVAILABLE_MESSAGE = "所选设备已不在当前图谱中，请重新发起请求并选择设备"
 
 
 @dataclass(frozen=True)
@@ -65,6 +66,13 @@ class DeviceChoice:
     free_text: str | None = None
     cancelled: bool = False
     empty: bool = False
+
+
+@dataclass(frozen=True)
+class SelectedDeviceId:
+    """用户从设备卡片选中的图节点 ID，恢复时不能再当作自由文本。"""
+
+    device_id: str
 
 
 def build_device_choice_payload(

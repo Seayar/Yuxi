@@ -21,7 +21,7 @@ import re
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from yuxi.knowledge.device_selection import DEVICE_SELECTION_MAX_CANDIDATES
+from yuxi.knowledge.device_selection import DEVICE_SELECTION_MAX_CANDIDATES, SELECTED_DEVICE_UNAVAILABLE_MESSAGE
 from yuxi.thinking import ThinkingStepSpec, register_thinking_steps
 
 DEVICE_PREDICTION_AGENT_SLUG = "device-prediction-agent"
@@ -64,6 +64,7 @@ PLAIN_TOOL_MESSAGES = frozenset(
         CLARIFY_DEVICE_MESSAGE,
         CHOICE_ABORTED_MESSAGE,
         CHOICE_CANCELLED_MESSAGE,
+        SELECTED_DEVICE_UNAVAILABLE_MESSAGE,
         HEALTH_SERVICE_NOT_CONFIGURED_MESSAGE,
         HEALTH_SERVICE_UNAVAILABLE_MESSAGE,
         HEALTH_SERVICE_UNKNOWN_DEVICE_MESSAGE,
@@ -211,6 +212,7 @@ class FaultPrediction:
     degradation_trend: str
     maintenance_time: str  # 维护时机；服务未返回时按预计发生时间推导
     maintenance_time_derived: bool = False  # 维护时机是否为推导值
+    image_url: str = ""  # 服务返回的 Markdown 预测图；空值不展示
 
 
 @dataclass(frozen=True)
@@ -257,6 +259,7 @@ class PredictionReport:
     probability: str
     expected_failure_time: str
     degradation_trend: str
+    image_url: str
     fault_rate: str
     average_downtime_hours: str
     matched_phenomenon: str  # 维护知识匹配到的故障现象名称；未匹配时为空

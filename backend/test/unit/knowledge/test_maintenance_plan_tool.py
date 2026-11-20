@@ -14,6 +14,7 @@ from yuxi.knowledge.maintenance_plan import graph_plan as graph_plan_module
 from yuxi.knowledge.maintenance_plan import tool as tool_module
 from yuxi.knowledge.fault_trace.ledger import LedgerDevice
 from yuxi.knowledge.maintenance_plan.branch import BranchLookup
+from yuxi.knowledge.device_selection import SELECTED_DEVICE_UNAVAILABLE_MESSAGE, SelectedDeviceId
 from yuxi.knowledge.maintenance_plan.contracts import (
     BRANCH_UNRESOLVED_MESSAGE,
     CHOICE_ABORTED_MESSAGE,
@@ -422,7 +423,6 @@ def test_pick_device_always_asks_even_when_one_candidate(monkeypatch):
         [kiosk],
         PlanQuery(raw_text="#1开闭所检修", device_type="开闭所", location_hint="#1开闭所"),
         [0],
-        emitter=_Emitter(),
     )
 
     assert picked is kiosk
@@ -458,12 +458,75 @@ def test_pick_device_asks_with_all_candidates_and_returns_selected(monkeypatch):
         [kiosk, cabinet],
         PlanQuery(raw_text="#1开闭所检修", device_type="开闭所", location_hint="#1开闭所"),
         [0],
-        emitter=_Emitter(),
     )
 
     assert picked is cabinet
     options = recorder.payloads[0]["questions"][0]["options"]
     assert [item["value"] for item in options] == ["LGR#kbs1", "LGR#cab1"]
+
+
+def test_pick_device_marks_stale_candidate_id_as_selection_not_free_text(monkeypatch):
+    """重放后候选集变化时，旧卡片选中的图节点 ID 不能被当成设备名。"""
+
+    recorder = _InterruptRecorder([{"maintenance_plan_device": "LGR#stale-selected"}])
+    monkeypatch.setattr(tool_module, "interrupt", recorder)
+
+    picked = tool_module._pick_device(
+        [DEVICE],
+        PlanQuery(raw_text="#3开闭所 3k18 检修"),
+        [0],
+    )
+
+    assert picked == SelectedDeviceId("LGR#stale-selected")
+    assert len(recorder.payloads) == 1
+
+
+def test_locate_device_reloads_selected_id_when_candidate_set_changes(monkeypatch):
+    """候选重算丢失选中项时按节点 ID 回查，不再次弹设备卡。"""
+
+    selected = DeviceCandidate("LGR#selected", "3k19", "开关柜", "10kV", "#3开闭所 > 3k19", ledger_ids=("L2",))
+    recorder = _InterruptRecorder([{"maintenance_plan_device": selected.device_id}])
+    monkeypatch.setattr(tool_module, "interrupt", recorder)
+    monkeypatch.setattr(graph_plan_module, "search_devices", lambda *args, **kwargs: [DEVICE])
+    monkeypatch.setattr(graph_plan_module, "find_device_by_id", lambda *args, **kwargs: selected)
+    emitter = _Emitter()
+
+    query, located = asyncio.run(
+        tool_module._locate_device(
+            object(),
+            PlanQuery(raw_text="3k19 开关柜检修", device_name="3k19"),
+            model_call=None,
+            rounds=[0],
+            emitter=emitter,
+            graph_key="",
+        )
+    )
+
+    assert located is selected
+    assert query.raw_text == "3k19 开关柜检修"
+    assert len(recorder.payloads) == 1
+    assert not any(args[:2] == ("retrieve_graph", "waiting") for args, _kwargs in emitter.events)
+
+
+def test_locate_device_stale_id_missing_from_graph_fails_without_reprompt(monkeypatch):
+    recorder = _InterruptRecorder([{"maintenance_plan_device": "LGR#missing"}])
+    monkeypatch.setattr(tool_module, "interrupt", recorder)
+    monkeypatch.setattr(graph_plan_module, "search_devices", lambda *args, **kwargs: [DEVICE])
+    monkeypatch.setattr(graph_plan_module, "find_device_by_id", lambda *args, **kwargs: None)
+
+    result = asyncio.run(
+        tool_module._locate_device(
+            object(),
+            PlanQuery(raw_text="3k18 开关柜检修", device_name="3k18"),
+            model_call=None,
+            rounds=[0],
+            emitter=_Emitter(),
+            graph_key="",
+        )
+    )
+
+    assert result == SELECTED_DEVICE_UNAVAILABLE_MESSAGE
+    assert len(recorder.payloads) == 1
 
 
 def test_device_payload_puts_path_in_description():

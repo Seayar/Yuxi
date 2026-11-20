@@ -2,8 +2,8 @@
 
 对接口档：``srs/YOLO设备图片故障类型识别服务 · 接口文档V1.0.0.pdf``。
 本模块只做协议转译与失败投影：识别到故障时返回 ``fault_type``/``fault_name``，
-未识别到故障时两者为 ``None``；服务不可达、非 200、响应不合法时一律抛出
-``YoloServiceError``，绝不把失败伪装成“未识别到故障”。
+服务返回的可选 Markdown 图片保留在 ``image_url``；服务不可达、非 200、响应不合法时
+一律抛出 ``YoloServiceError``，绝不把失败伪装成“未识别到故障”。
 """
 
 from __future__ import annotations
@@ -35,6 +35,7 @@ class YoloDetectResult:
     fault: bool
     fault_type: str | None
     fault_name: str | None
+    image_url: str | None = None
 
 
 async def detect_fault_image(
@@ -88,16 +89,30 @@ def _parse_detect_payload(payload: dict[str, Any]) -> YoloDetectResult:
     fault = payload.get("fault")
     fault_type = payload.get("fault_type")
     fault_name = payload.get("fault_name")
+    image_url = payload.get("image_url")
     if not isinstance(fault, bool):
         raise YoloServiceError("故障识别服务返回缺少 fault 字段")
+    if image_url is not None and not isinstance(image_url, str):
+        raise YoloServiceError("故障识别服务返回的 image_url 不是字符串")
+    normalized_image_url = (image_url or "").strip() or None
     if not fault:
         # 未识别到故障时类别必须为空，避免把无故障图误判成带类别。
         if fault_type is not None or fault_name is not None:
             raise YoloServiceError("故障识别服务返回字段不一致")
-        return YoloDetectResult(fault=False, fault_type=None, fault_name=None)
+        return YoloDetectResult(
+            fault=False,
+            fault_type=None,
+            fault_name=None,
+            image_url=normalized_image_url,
+        )
     if not isinstance(fault_type, str) or not fault_type or not isinstance(fault_name, str) or not fault_name:
         raise YoloServiceError("故障识别服务返回缺少故障类别")
-    return YoloDetectResult(fault=True, fault_type=fault_type, fault_name=fault_name)
+    return YoloDetectResult(
+        fault=True,
+        fault_type=fault_type,
+        fault_name=fault_name,
+        image_url=normalized_image_url,
+    )
 
 
 async def _resolve_base_url() -> str | None:

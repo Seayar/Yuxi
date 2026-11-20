@@ -16,6 +16,10 @@ from yuxi.knowledge.chunking.ragflow_like.presets import get_chunk_preset_option
 from yuxi.knowledge.graphs.milvus_graph_service import GRAPH_TASK_TYPE, MilvusGraphService
 from yuxi.knowledge.read_models import KnowledgeBaseDetail
 from yuxi.knowledge.parser.capabilities import SUPPORTED_FILE_EXTENSIONS, is_supported_file_extension
+from yuxi.knowledge.power_spec.pdf_sources import (
+    POWER_SPEC_PDF_BUCKET,
+    is_power_spec_pdf_filename,
+)
 from yuxi.knowledge.runtime import knowledge_base
 from yuxi.knowledge.utils import calculate_content_hash, is_minio_url, params_for_uploaded_document, parse_minio_url
 from yuxi.knowledge.utils.mindmap_utils import (
@@ -1154,7 +1158,7 @@ async def download_document(kb_id: str, doc_id: str, current_user: User = Depend
 
         # 获取文件类型、路径和文件名
         file_type = file_meta.get("file_type", "file")
-        file_path = file_meta.get("path", "")
+        file_path = file_meta.get("minio_url") or file_meta.get("path", "")
         filename = file_meta.get("filename", "file")
 
         # URL 类型文件没有原始文件可下载
@@ -1228,6 +1232,40 @@ async def download_document(kb_id: str, doc_id: str, current_user: User = Depend
     except Exception as e:
         logger.error(f"下载文件失败: {e}, {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"下载失败: {e}")
+
+
+@knowledge.get("/power-spec/pdfs/{filename}")
+async def download_power_spec_pdf(filename: str, current_user: User = Depends(get_required_user)):
+    """下载 powerspec bucket 中按标准号命名的规范原始 PDF。"""
+
+    if not is_power_spec_pdf_filename(filename):
+        raise HTTPException(status_code=400, detail="非法的 PDF 文件名")
+
+    minio_client = get_minio_client()
+    try:
+        minio_response = await minio_client.adownload_response(
+            bucket_name=POWER_SPEC_PDF_BUCKET,
+            object_name=filename,
+        )
+    except StorageError as exc:
+        raise HTTPException(status_code=404, detail="规范 PDF 不存在") from exc
+
+    async def minio_stream():
+        try:
+            while True:
+                chunk = await asyncio.to_thread(minio_response.read, 8192)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            minio_response.close()
+            minio_response.release_conn()
+
+    return StreamingResponse(
+        minio_stream(),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @knowledge.get("/databases/{kb_id}/images/{object_path:path}")

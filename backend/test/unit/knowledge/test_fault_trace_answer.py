@@ -86,6 +86,7 @@ def _payload(
     cause_measures: dict | None = None,
     location_phenomena: list[str] | None = None,
     phenomenon_name: str | None = None,
+    image_url: str | None = None,
 ) -> dict:
     evaluations = causes or [_located_cause()]
     return build_fault_trace_payload(
@@ -110,6 +111,7 @@ def _payload(
         cause_measures=cause_measures,
         location_phenomena=location_phenomena,
         phenomenon_name=phenomenon_name,
+        image_url=image_url,
     )
 
 
@@ -179,6 +181,30 @@ def test_payload_uses_matched_phenomenon_override():
     assert "- 判定成立的故障现象：燃烧起火" in payload["answer_markdown"]
 
 
+def test_fault_image_follows_involved_devices():
+    """故障识别图片由服务原样提供，并紧跟“涉及设备”一行。"""
+
+    image_url = "![故障识别图](/api/data/image?objectName=fault-charts%2Ftree-fall.png)"
+    payload = _payload(image_url=image_url)
+    summary_section = payload["answer_markdown"].split("**② 推理过程**")[0]
+    lines = summary_section.splitlines()
+    device_line = next(index for index, line in enumerate(lines) if line.startswith("- 涉及设备："))
+
+    assert payload["report"]["summary"]["image_url"] == image_url
+    assert lines[device_line + 1] == ""
+    assert lines[device_line + 2] == image_url
+
+
+def test_empty_fault_image_is_omitted():
+    """服务未返回故障识别图片时不产生空图片行。"""
+
+    markdown = _payload(image_url="")["answer_markdown"]
+    summary_section = markdown.split("**② 推理过程**")[0]
+
+    assert "![" not in summary_section
+    assert summary_section.rstrip().endswith("- 涉及设备：3B-7Y")
+
+
 def test_payload_empty_location_phenomena_does_not_fall_back_to_first_row():
     """已命中但无成立原因时显示破折号，不能把展示表的第一个现象当成成立现象。"""
 
@@ -218,6 +244,90 @@ def test_payload_unknown_verdict_when_no_cause_established():
     assert "树木倒伏枝干压覆导线" in report["summary"]["text"]
     assert "原因待确认" not in report["summary"]["text"]
     assert "缺少实时数据" in report["location"]["reasoning"]
+
+
+def test_payload_unlocated_reasoning_lists_expressions_and_realtime_values():
+    """未定位时逐条展示判据表达式、实时值、结果和缺失原因。"""
+
+    rejected = CauseEvaluation(
+        cause_id="CA-REJECTED",
+        name="通道内树木倒伏压线",
+        status="rejected",
+        true_count=0,
+        triggers=[
+            TriggerResult(
+                "TC-LEAKAGE",
+                "泄漏电流超1mA",
+                "leakage_current > 1",
+                "false",
+                "ok",
+                {"leakage_current": 0.8},
+            ),
+            TriggerResult(
+                "TC-PROTECTION",
+                "线路保护动作",
+                "line_protection_trip == true",
+                "false",
+                "ok",
+                {"line_protection_trip": False},
+            ),
+            TriggerResult(
+                "TC-UV",
+                "紫外光子数超限",
+                "uv_photon_rate > 100",
+                "unknown",
+                "missing_key",
+                {},
+            ),
+        ],
+        missing=["uv_photon_rate"],
+    )
+
+    payload = _payload(
+        [rejected],
+        location_phenomena=[],
+        phenomenon_name="树木倒伏枝干压覆导线",
+    )
+    reasoning = payload["report"]["location"]["reasoning"]
+
+    assert "泄漏电流超1mA：leakage_current > 1（leakage_current=0.8mA；结果=false）" in reasoning
+    assert "线路保护动作：line_protection_trip == true（line_protection_trip=false；结果=false）" in reasoning
+    assert "紫外光子数超限：uv_photon_rate > 100（uv_photon_rate=缺失；结果=unknown，原因=missing_key）" in reasoning
+    assert "全部候选原因的实时判据均不成立" not in reasoning
+    assert f"- 推理依据：{reasoning}" in payload["answer_markdown"]
+
+
+def test_payload_located_reasoning_lists_rejected_candidate_criteria():
+    """已有成立原因时，仍未成立候选的表达式和实时值必须追加到推理依据。"""
+
+    rejected = CauseEvaluation(
+        cause_id="CA-LIGHTNING",
+        name="雷击烧断股",
+        status="rejected",
+        true_count=0,
+        triggers=[
+            TriggerResult(
+                "TC-LIGHTNING",
+                "线路保护动作",
+                "line_protection_trip == true",
+                "false",
+                "ok",
+                {"line_protection_trip": False},
+            )
+        ],
+    )
+
+    payload = _payload(
+        [_located_cause(), rejected],
+        location_phenomena=["树木倒伏枝干压覆导线"],
+    )
+    reasoning = payload["report"]["location"]["reasoning"]
+
+    assert "通道内树木未及时砍伐或修剪，遇大风倒伏压线" in reasoning
+    assert "未成立或待确认候选判据" in reasoning
+    assert "雷击烧断股（不成立）" in reasoning
+    assert "line_protection_trip == true（line_protection_trip=false；结果=false）" in reasoning
+    assert f"- 推理依据：{reasoning}" in payload["answer_markdown"]
 
 
 def test_payload_lists_all_established_causes():

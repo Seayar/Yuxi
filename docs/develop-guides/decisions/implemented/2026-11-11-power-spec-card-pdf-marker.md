@@ -1,5 +1,7 @@
 # 电力规范卡片的 PDF 源文档标记
 
+> 2026-11-19 更新：PDF 标记已恢复为同源鉴权下载地址，当前行为由 [电力规范卡片 PDF 原文下载](2026-11-19-power-spec-pdf-download.md) 拥有。本文保留最初的标记协议与源文档投影背景；原始 MinIO 地址不再进入卡片输出。
+
 状态：implemented
 类型：feature
 Owner：backend/package/yuxi/knowledge/power_spec/answer.py

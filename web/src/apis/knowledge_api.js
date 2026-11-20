@@ -272,6 +272,15 @@ export const documentApi = {
   },
 
   /**
+   * 下载检索结果给出的知识库原文档
+   * @param {string} url - 后端生成的知识库文档下载地址
+   * @returns {Promise} - Response对象
+   */
+  downloadDocumentByUrl: async (url) => {
+    return apiGet(url, {}, true, 'blob')
+  },
+
+  /**
    * 手动触发文档解析
    * @param {string} kbId - 知识库ID
    * @param {Array} fileIds - 文件ID列表

@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from yuxi.knowledge.power_spec.ingestion import build_clause_extraction, build_document_extraction
 from yuxi.knowledge.power_spec.ingestion import PowerSpecDocument
+from yuxi.knowledge.power_spec.pdf_sources import power_spec_pdf_download_url
 from yuxi.storage.postgres.models_knowledge import KnowledgeFile
 
 
@@ -69,31 +70,30 @@ class PowerSpecRepository:
         *,
         kb_id: str,
     ) -> dict[str, dict[str, Any]]:
-        """读取知识库中文件级电力规范派生元数据与原始文件地址。
+        """读取规范派生元数据，并按标准号映射 powerspec bucket 中的 PDF。
 
-        原始文件地址只作为 ``source_url`` 进入返回值，不写回 ``processing_params``。
+        ``source_url`` 不依赖 ``knowledge_files`` 中的 PDF 记录，也不引用 Markdown 载体。
         """
 
         result = await db.execute(
             select(
                 KnowledgeFile.file_id,
                 KnowledgeFile.processing_params,
-                KnowledgeFile.path,
-                KnowledgeFile.minio_url,
             ).where(
                 KnowledgeFile.kb_id == kb_id,
                 KnowledgeFile.is_folder.is_(False),
             )
         )
         metadata_by_file_id: dict[str, dict[str, Any]] = {}
-        for file_id, processing_params, path, minio_url in result.all():
+        for file_id, processing_params in result.all():
             if not isinstance(processing_params, dict):
                 continue
             power_spec_metadata = processing_params.get("power_spec")
             if isinstance(power_spec_metadata, dict):
                 metadata = dict(power_spec_metadata)
-                # 卡片末尾的 PDF 标记需要可请求的原始文档地址；minio_url 优先于 path。
-                metadata["source_url"] = minio_url or path
+                source_url = power_spec_pdf_download_url(str(metadata.get("standard_no") or ""))
+                if source_url:
+                    metadata["source_url"] = source_url
                 metadata_by_file_id[str(file_id)] = metadata
         return metadata_by_file_id
 

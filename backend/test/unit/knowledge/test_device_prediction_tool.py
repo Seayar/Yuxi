@@ -31,6 +31,7 @@ from yuxi.knowledge.device_prediction.contracts import (
     PredictionQuery,
 )
 from yuxi.knowledge.device_prediction.services import PredictionServiceError
+from yuxi.knowledge.device_selection import SELECTED_DEVICE_UNAVAILABLE_MESSAGE, SelectedDeviceId
 
 pytestmark = pytest.mark.unit
 
@@ -84,6 +85,7 @@ PREDICTION = FaultPrediction(
     expected_failure_time="未来 30–60 天",
     degradation_trend="负荷率连续 3 个月上升",
     maintenance_time="建议在 30 天内完成针对性检查维护",
+    image_url="![预测图](/api/data/image?objectName=prediction-charts%2Ftransformer.png)",
 )
 GUIDANCE = MaintenanceGuidance(
     fault_type="触头过热",
@@ -215,6 +217,12 @@ def test_full_flow_returns_verified_report(monkeypatch):
     assert result["report"]["device_id"] == "bb1baf15"
     assert result["report"]["health_score"] == "72"
     assert result["report"]["fault_type"] == "触头过热"
+    assert result["report"]["image_url"] == PREDICTION.image_url
+    prediction_section = result["answer_markdown"].split("## 二、故障预测")[1].split("## 三、可靠性与风险评估")[0]
+    prediction_lines = prediction_section.splitlines()
+    trend_line = prediction_lines.index("- 退化趋势：负荷率连续 3 个月上升")
+    assert prediction_lines[trend_line + 1] == ""
+    assert prediction_lines[trend_line + 2] == PREDICTION.image_url
     assert "## 四、维护计划建议" in result["answer_markdown"]
     assert [step["title"] for step in result["thinking_steps"]] == [
         "加载设备档案",
@@ -419,7 +427,6 @@ def test_health_service_failure_skips_prediction_step(monkeypatch):
     assert _run(monkeypatch) == HEALTH_SERVICE_UNAVAILABLE_MESSAGE
     assert emitters[0].events == [
         ("load_device", "started"),
-        ("load_device", "waiting"),
         ("load_device", "completed"),
         ("health_assessment", "started"),
         ("fault_prediction", "started"),
@@ -568,3 +575,68 @@ def test_model_selection_marks_recommended_candidate(monkeypatch):
     options = recorder.payloads[0]["questions"][0]["options"]
     assert options[0]["value"] == other.device_id
     assert options[0]["label"].endswith("（推荐）")
+
+
+def test_pick_device_marks_stale_candidate_id_as_selection_not_free_text(monkeypatch):
+    recorder = _InterruptRecorder([{"device_prediction_device": "LGR#stale-selected"}])
+    monkeypatch.setattr(tool_module, "interrupt", recorder)
+
+    picked = tool_module._pick_device(
+        [DEVICE],
+        PredictionQuery(raw_text="评估1号主变健康状态", device_name="1号主变"),
+        [0],
+    )
+
+    assert picked == SelectedDeviceId("LGR#stale-selected")
+    assert len(recorder.payloads) == 1
+
+
+def test_locate_device_reloads_selected_id_when_candidate_set_changes(monkeypatch):
+    selected = DeviceCandidate(
+        "LGR#selected",
+        "2号主变",
+        device_type="变压器",
+        voltage_level="110kV",
+        path="变电设施 > 35kV#1变电站 > 2号主变",
+        ledger_ids=("selected-ledger",),
+    )
+    recorder = _InterruptRecorder([{"device_prediction_device": selected.device_id}])
+    monkeypatch.setattr(tool_module, "interrupt", recorder)
+    monkeypatch.setattr(graph_module, "search_devices", lambda *args, **kwargs: [DEVICE])
+    monkeypatch.setattr(graph_module, "find_device_by_id", lambda *args, **kwargs: selected)
+    emitter = _Emitter()
+
+    query, located = asyncio.run(
+        tool_module._locate_device(
+            object(),
+            PredictionQuery(raw_text="评估2号主变健康状态", device_name="2号主变"),
+            model_call=None,
+            emitter=emitter,
+            graph_key="",
+        )
+    )
+
+    assert located is selected
+    assert query.raw_text == "评估2号主变健康状态"
+    assert len(recorder.payloads) == 1
+    assert ("load_device", "waiting") not in emitter.events
+
+
+def test_locate_device_stale_id_missing_from_graph_fails_without_reprompt(monkeypatch):
+    recorder = _InterruptRecorder([{"device_prediction_device": "LGR#missing"}])
+    monkeypatch.setattr(tool_module, "interrupt", recorder)
+    monkeypatch.setattr(graph_module, "search_devices", lambda *args, **kwargs: [DEVICE])
+    monkeypatch.setattr(graph_module, "find_device_by_id", lambda *args, **kwargs: None)
+
+    result = asyncio.run(
+        tool_module._locate_device(
+            object(),
+            PredictionQuery(raw_text="评估1号主变健康状态", device_name="1号主变"),
+            model_call=None,
+            emitter=_Emitter(),
+            graph_key="",
+        )
+    )
+
+    assert result == SELECTED_DEVICE_UNAVAILABLE_MESSAGE
+    assert len(recorder.payloads) == 1

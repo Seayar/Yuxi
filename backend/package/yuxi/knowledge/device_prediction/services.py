@@ -183,6 +183,9 @@ def _parse_fault_prediction(payload: dict[str, Any]) -> FaultPrediction:
     degradation_trend = _text(body.get("degradation_trend"))
     if not (fault_type and probability and expected_failure_time and degradation_trend):
         raise PredictionServiceError("invalid", PREDICTION_SERVICE_INVALID_MESSAGE)
+    image_url = body.get("image_url")
+    if image_url is not None and not isinstance(image_url, str):
+        raise PredictionServiceError("invalid", PREDICTION_SERVICE_INVALID_MESSAGE)
 
     maintenance_time = _text(body.get("maintenance_time"))
     return FaultPrediction(
@@ -192,6 +195,7 @@ def _parse_fault_prediction(payload: dict[str, Any]) -> FaultPrediction:
         degradation_trend=degradation_trend,
         maintenance_time=maintenance_time or derive_maintenance_time(expected_failure_time),
         maintenance_time_derived=not maintenance_time,
+        image_url=image_url.strip() if image_url else "",
     )
 
 

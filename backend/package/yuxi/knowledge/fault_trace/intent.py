@@ -16,13 +16,27 @@ from yuxi.knowledge.fault_trace.contracts import (
     DEVICE_NOT_FOUND_MESSAGE,
     FaultTraceQuery,
 )
+from yuxi.knowledge.device_mentions import extract_line_tower_mention, prefer_rule_device_name
 from yuxi.utils import logger
 
 # ---------------------------------------------------------------------------
 # 规则解析
 # ---------------------------------------------------------------------------
 
-_DEVICE_TYPES = ("变压器", "开关柜", "断路器", "隔离开关", "电缆", "配电柜", "互感器", "避雷器", "母线", "线路")
+_DEVICE_TYPES = (
+    "变压器",
+    "开关柜",
+    "断路器",
+    "隔离开关",
+    "电缆",
+    "配电柜",
+    "互感器",
+    "避雷器",
+    "母线",
+    "杆塔",
+    "架空线路",
+    "线路",
+)
 _VOLTAGE_PATTERN = re.compile(r"(?P<value>\d+(?:\.\d+)?)\s*[kKＫｋ][vVＶｖ]")
 _LOCATION_PATTERN = re.compile(
     r"(?:\d+(?:\.\d+)?\s*[kKＫｋ][vVＶｖ]\s*)?"
@@ -109,13 +123,30 @@ def parse_fault_trace_query(query: str) -> FaultTraceQuery:
     if not normalized_query:
         raise ValueError("故障描述不能为空")
 
+    line_tower = extract_line_tower_mention(normalized_query)
     device_name_match = _DEVICE_NAME_PATTERN.search(normalized_query)
-    device_name = device_name_match.group("name").replace(" ", "") if device_name_match else None
-    device_type = next((item for item in _DEVICE_TYPES if item in normalized_query), None)
+    device_name = (
+        line_tower.device_name
+        if line_tower is not None
+        else device_name_match.group("name").replace(" ", "")
+        if device_name_match
+        else None
+    )
+    device_type = (
+        line_tower.device_type
+        if line_tower is not None and line_tower.device_type
+        else next((item for item in _DEVICE_TYPES if item in normalized_query), None)
+    )
     voltage_match = _VOLTAGE_PATTERN.search(normalized_query)
     voltage_level = f"{voltage_match.group('value')}kV" if voltage_match else None
     location_match = _LOCATION_PATTERN.search(normalized_query)
-    location_hint = location_match.group(0).replace(" ", "") if location_match else None
+    location_hint = (
+        line_tower.line_name
+        if line_tower is not None
+        else location_match.group(0).replace(" ", "")
+        if location_match
+        else None
+    )
     phenomena = [term for term in _PHENOMENON_TERMS if term in normalized_query]
 
     return FaultTraceQuery(
@@ -216,14 +247,16 @@ async def extract_fault_trace_intent(
 def _merge_rule_fallback(query: FaultTraceQuery, query_text: str) -> None:
     """模型漏识别设备/现象时用规则结果补齐，避免确认卡片与恢复重放结果漂移。"""
 
-    if query.has_specific_device() and query.phenomena:
-        return
     fallback = parse_fault_trace_query(query_text)
-    if not (query.device_name and query.device_name.strip()):
-        query.device_name = fallback.device_name or query.device_name
+    preferred = prefer_rule_device_name(fallback.device_name, query.device_name)
+    if fallback.device_name and (
+        not query.has_specific_device() or query.device_name in _DEVICE_TYPES or preferred == fallback.device_name
+    ):
+        query.device_name = fallback.device_name
+        query.device_type = fallback.device_type or query.device_type
+        query.voltage_level = fallback.voltage_level or query.voltage_level
+        query.location_hint = fallback.location_hint or query.location_hint
     query.device_type = query.device_type or fallback.device_type
-    query.voltage_level = query.voltage_level or fallback.voltage_level
-    query.location_hint = query.location_hint or fallback.location_hint
     if not query.phenomena:
         query.phenomena = fallback.phenomena
 
@@ -356,6 +389,9 @@ INTENT_PROMPT = """你是配电网故障原因溯源系统的意图识别器。
 }
 要求：
 - 设备名称必须是具体设备（如“1号主变”），用户只写“变压器”这类类型词时 device_name 为 null。
+- 线路名与杆塔编号同时出现时，device_name 保留杆塔编号及后缀，线路名填 location_hint；
+  例如“联络二线CN13杆塔”应提取为 CN13杆塔 与 联络二线。
+- “DN67C相”应作为具体设备名 DN67C相 保留，并把 C相 写入故障现象或部件描述，不能只返回“杆塔”“线路”类型。
 - 图片识别结果中的故障类别（如“绝缘子破损”）应并入 phenomena。
 - 只输出 JSON，不要输出其他解释。
 """

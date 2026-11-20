@@ -257,6 +257,7 @@ def assemble_report(
         probability=prediction.probability,
         expected_failure_time=prediction.expected_failure_time,
         degradation_trend=prediction.degradation_trend,
+        image_url=prediction.image_url,
         fault_rate=health.fault_rate,
         average_downtime_hours=health.average_downtime_hours,
         matched_phenomenon=guidance.fault_type,
@@ -318,6 +319,10 @@ def build_report_markdown(report: PredictionReport) -> str:
         f"- 发生概率：{report.probability}",
         f"- 预计发生时间：{report.expected_failure_time}",
         f"- 退化趋势：{report.degradation_trend}",
+    ]
+    if report.image_url:
+        lines += ["", report.image_url]
+    lines += [
         "",
         "## 三、可靠性与风险评估",
         "",
@@ -435,6 +440,7 @@ def verify_report(report: PredictionReport, evidence: PredictionEvidence) -> boo
             "expected_failure_time": prediction.expected_failure_time,
             "degradation_trend": prediction.degradation_trend,
             "maintenance_time": prediction.maintenance_time,
+            "image_url": prediction.image_url,
         }
         actual = {
             "device_id": report.device_id,
@@ -447,6 +453,7 @@ def verify_report(report: PredictionReport, evidence: PredictionEvidence) -> boo
             "expected_failure_time": report.expected_failure_time,
             "degradation_trend": report.degradation_trend,
             "maintenance_time": report.maintenance_time,
+            "image_url": report.image_url,
         }
         mismatched = [key for key, value in expected.items() if actual[key] != value]
         if mismatched:

@@ -55,6 +55,35 @@ def test_rule_parse_extracts_station_location_for_ledger_disambiguation():
     assert query.location_hint == "35kV#1变电站"
 
 
+@pytest.mark.parametrize(
+    ("text", "device_name", "line_name", "device_type"),
+    [
+        ("评估联络二线CN13杆塔异常", "CN13杆塔", "联络二线", "杆塔"),
+        ("评估银开线YN3杆塔异常", "YN3杆塔", "银开线", "杆塔"),
+        ("开一线 BN91 杆塔异常", "BN91杆塔", "开一线", "杆塔"),
+        ("35kV联络一线DN67C相异常", "DN67C相", "联络一线", None),
+    ],
+)
+def test_rule_parse_preserves_line_tower_codes(text, device_name, line_name, device_type):
+    query = parse_fault_trace_query(text)
+
+    assert query.device_name == device_name
+    assert query.location_hint == line_name
+    assert query.device_type == device_type
+
+
+@pytest.mark.asyncio
+async def test_model_type_only_cannot_override_line_tower_code():
+    query = await extract_fault_trace_intent(
+        "联络二线CN13杆塔异常",
+        image_result=None,
+        model_call=_FakeModelCall(_intent_json(device_name="杆塔", device_type="杆塔", phenomena=["异常"])),
+    )
+
+    assert query.device_name == "CN13杆塔"
+    assert query.location_hint == "联络二线"
+
+
 @pytest.mark.asyncio
 async def test_model_extraction_merges_image_result():
     query = await extract_fault_trace_intent(

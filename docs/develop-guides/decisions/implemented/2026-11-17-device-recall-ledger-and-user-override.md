@@ -48,3 +48,5 @@ Owner：backend/package/yuxi/knowledge/device_selection.py
 - 相关单元测试集合：三个工具、台账、图谱适配器、真实 LangGraph 重放与发布门共 `201 passed`；全量后端 `test/unit -m "not slow"` 为 `3206 passed, 54 skipped, 4 failed`。4 个失败是既有 `test_power_spec_formatting.py` PDF marker 断言，单独复现且不经过本次设备识别链路。
 - 真实只读探针：台账修复解析 3173 行，图谱名称索引 3002 台；`110kV银开线` 返回 `银开线` 及近似线路，`#1开闭所检修` 返回 `#1开闭所` 及其下级候选，`1号主变` 返回三个不同层级变电站下的 `#1主变压器`，`岭开线进线间隔_1101` 首候选正确。
 - 后端相关文件 `ruff check` 与 `ruff format --check` 通过；工程契约检查及 62 个自测通过；docs 构建通过。
+
+后续修正：设备卡片恢复改为按图节点 ID 直查，设备确认不再发送 `waiting` 思考事件，线路杆塔编号由共享规则优先保留。见 [设备确认按图节点恢复，并优先保留线路杆塔编号](./2026-11-18-device-confirmation-replay-and-tower-codes.md)。

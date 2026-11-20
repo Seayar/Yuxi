@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from yuxi.knowledge.device_selection import DEVICE_SELECTION_MAX_CANDIDATES
+from yuxi.knowledge.device_selection import DEVICE_SELECTION_MAX_CANDIDATES, SELECTED_DEVICE_UNAVAILABLE_MESSAGE
 from yuxi.thinking import ThinkingStepSpec, register_thinking_steps
 
 MAINTENANCE_PLAN_AGENT_SLUG = "maintenance-plan-agent"
@@ -46,6 +46,7 @@ PLAIN_TOOL_MESSAGES = frozenset(
         CLARIFY_DEVICE_MESSAGE,
         CHOICE_ABORTED_MESSAGE,
         CHOICE_CANCELLED_MESSAGE,
+        SELECTED_DEVICE_UNAVAILABLE_MESSAGE,
         BRANCH_UNRESOLVED_MESSAGE,
         NO_PERMISSION_MESSAGE,
     }

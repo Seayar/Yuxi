@@ -12,10 +12,13 @@
 
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { message } from 'ant-design-vue'
 import { useThemeStore } from '@/stores/theme'
 import { useUserStore } from '@/stores/user'
 import { renderMarkdown } from '@/utils/markdown_preview'
 import { HTML_PREVIEW_MAX_HEIGHT, HTML_PREVIEW_MIN_HEIGHT } from '@/utils/htmlPreviewRenderer'
+import { downloadKnowledgeDocument } from '@/utils/knowledge_download'
+import { isKnowledgeDocumentDownloadUrl } from '@/utils/powerSpecPdf'
 import 'katex/dist/katex.min.css'
 const props = defineProps({
   content: {
@@ -404,6 +407,18 @@ watch(
 const handleMarkdownAction = async (e) => {
   const target = e.target instanceof Element ? e.target : e.target?.parentElement
   if (!target) return
+
+  const downloadLink = target.closest('a[href]')
+  if (downloadLink && isKnowledgeDocumentDownloadUrl(downloadLink.getAttribute('href'))) {
+    e.preventDefault()
+    try {
+      await downloadKnowledgeDocument(downloadLink.getAttribute('href'))
+    } catch (error) {
+      console.error('下载知识库原文档失败:', error)
+      message.error(error?.message || '下载 PDF 原文失败')
+    }
+    return
+  }
 
   const codeCopyBtn = target.closest('.markdown-code-copy-btn')
   if (codeCopyBtn) {

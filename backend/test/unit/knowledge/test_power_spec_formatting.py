@@ -86,10 +86,10 @@ def test_render_srs_cards_keeps_clause_body_label_out_of_previous_item():
 
 
 def test_render_srs_cards_appends_pdf_marker_to_each_card():
-    """每张卡片末尾只带自己的原始文档地址，前端据此请求并打开 PDF。"""
+    """每张卡片末尾只带自己的原文档下载地址，前端据此下载 PDF。"""
 
-    first_url = "http://minio:9000/knowledgebases/kb-1/upload/DL_T_572.pdf"
-    second_url = "http://minio:9000/knowledgebases/kb-1/upload/DL_T_596.pdf"
+    first_url = "/api/knowledge/databases/kb-1/documents/file-1/download"
+    second_url = "/api/knowledge/databases/kb-1/documents/file-2/download"
     markdown = format_power_spec_results(
         "巡检",
         [
@@ -111,7 +111,10 @@ def test_render_srs_cards_omits_pdf_marker_without_source_url():
 
 
 def test_render_srs_cards_omits_pdf_marker_that_breaks_marker_boundary():
-    for source_url in ("http://minio/kb/doc]]pdf", "http://minio/kb/doc\npdf"):
+    for source_url in (
+        "/api/knowledge/databases/kb-1/documents/file-1/download]]pdf",
+        "/api/knowledge/databases/kb-1/documents/file-1/download\npdf",
+    ):
         markdown = format_power_spec_results("巡检", [_evidence(source_url=source_url)])["answer_markdown"]
 
         assert "[[PDF:" not in markdown
@@ -128,7 +131,7 @@ def test_render_srs_cards_omits_pdf_marker_for_non_requestable_url():
 
 
 def test_render_srs_cards_allows_relative_pdf_url():
-    source_url = "/minio/knowledgebases/kb-1/upload/DL_T_572.pdf"
+    source_url = "/api/knowledge/databases/kb-1/documents/file-1/download"
     markdown = format_power_spec_results("巡检", [_evidence(source_url=source_url)])["answer_markdown"]
 
     assert f"[[PDF:{source_url}]]" in markdown
@@ -170,11 +173,16 @@ def test_apply_organized_clauses_uses_model_values_but_keeps_code_format():
 
 
 def test_apply_organized_clauses_appends_each_card_own_pdf_marker():
-    first_url = "http://minio:9000/knowledgebases/kb-1/upload/DL_T_572.pdf"
-    second_url = "http://minio:9000/knowledgebases/kb-1/upload/DL_T_596.pdf"
+    first_url = "/api/knowledge/databases/kb-1/documents/file-1/download"
+    second_url = "/api/knowledge/databases/kb-1/documents/file-2/download"
     evidence = [
         _evidence(source_url=first_url),
-        _evidence(document_id="doc-2", clause_no="9.8", clause_title="负荷开关", source_url=second_url),
+        _evidence(
+            document_id="doc-2",
+            clause_no="9.8",
+            clause_title="负荷开关",
+            source_url=second_url,
+        ),
     ]
 
     result = apply_organized_clauses(
@@ -276,10 +284,15 @@ def test_apply_organized_clauses_forces_missing_graph_card_first():
 def test_apply_organized_clauses_appends_pdf_marker_to_pinned_graph_card():
     """图谱卡由代码补卡，PDF 标记也必须跟随它而不是模型选择的卡片。"""
 
-    graph_url = "http://minio:9000/knowledgebases/kb-1/upload/DL/T_393.pdf"
-    other_url = "http://minio:9000/knowledgebases/kb-1/upload/DL_T_596.pdf"
+    graph_url = "/api/knowledge/databases/kb-1/documents/graph-file/download"
+    other_url = "/api/knowledge/databases/kb-1/documents/other-file/download"
     graph = _graph_evidence(source_url=graph_url)
-    other = _evidence(document_id="doc-2", clause_no="9.8", clause_title="负荷开关", source_url=other_url)
+    other = _evidence(
+        document_id="doc-2",
+        clause_no="9.8",
+        clause_title="负荷开关",
+        source_url=other_url,
+    )
 
     result = apply_organized_clauses("巡检", [other, graph], [_organized("doc-2#9.8", "模型整理的其它条款")])
 

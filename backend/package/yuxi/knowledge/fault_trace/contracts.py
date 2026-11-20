@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from yuxi.knowledge.device_selection import DEVICE_SELECTION_MAX_CANDIDATES
+from yuxi.knowledge.device_selection import DEVICE_SELECTION_MAX_CANDIDATES, SELECTED_DEVICE_UNAVAILABLE_MESSAGE
 from yuxi.thinking import ThinkingStepSpec, register_thinking_steps
 
 FAULT_TRACE_THINKING_STEPS = (
@@ -61,6 +61,7 @@ PLAIN_TOOL_MESSAGES = frozenset(
         CLARIFY_PHENOMENON_MISSING_MESSAGE,
         INTENT_CANCELLED_MESSAGE,
         INTENT_ATTEMPTS_EXHAUSTED_MESSAGE,
+        SELECTED_DEVICE_UNAVAILABLE_MESSAGE,
     }
 )
 

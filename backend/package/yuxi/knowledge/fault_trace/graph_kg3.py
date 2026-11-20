@@ -118,6 +118,28 @@ def find_devices(
     ][:limit]
 
 
+def find_device_by_id(
+    client: Any,
+    device_id: str,
+    *,
+    ledger_candidates: Sequence[LedgerDevice] = (),
+) -> dict[str, Any] | None:
+    """按用户选中的图节点 ID 回读设备，避免恢复时依赖候选顺序。"""
+
+    clean_id = str(device_id or "").strip()
+    if not clean_id:
+        return None
+    records = client.run(
+        "MATCH (n) WHERE labels(n)[0] = $label AND coalesce(n.id, '') = $device_id RETURN n LIMIT $node_limit",
+        label=KG_DEVICE_LABEL,
+        device_id=clean_id,
+        node_limit=1,
+    )
+    evidence = FaultGraphEvidence()
+    devices = _add_nodes(evidence, records, "n", KG_DEVICE_LABEL)
+    return _enrich_with_ledger(devices[0], ledger_candidates) if devices else None
+
+
 def _find_devices_by_tokens(client: Any, tokens: list[str]) -> list[dict[str, Any]]:
     """按名称词元召回：名称里出现任一高区分度词元即视为候选。"""
 

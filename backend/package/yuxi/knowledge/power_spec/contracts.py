@@ -73,7 +73,7 @@ class SpecClauseEvidence(BaseModel):
     rerank_score: float | None = None
     match_score: float | None = None
     source_file: str | None = None
-    # 卡片末尾 PDF 标记使用的原始文档地址，由检索层从 knowledge_files 解析。
+    # 卡片末尾 PDF 标记使用的同源下载地址，由检索层从 knowledge_files 投影。
     source_url: str | None = None
     source_page: int | None = Field(default=None, ge=1)
     source_page_ref: str | None = None

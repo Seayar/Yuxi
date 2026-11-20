@@ -89,24 +89,44 @@ async def test_repository_rejects_missing_or_wrong_knowledge_file(document):
 
 
 @pytest.mark.asyncio
-async def test_repository_returns_source_url_for_card_pdf_marker():
-    """检索层需要原始文档地址；地址只进入返回值，不写回持久化元数据。"""
+async def test_repository_maps_standard_no_to_powerspec_pdf():
+    """条款载体只提供标准号，PDF 下载地址由标准号确定性生成。"""
 
-    power_spec_metadata = {
-        "standard_no": "DL/T 572-2021",
-        "clauses": [{"clause_no": "6.2.1", "clause_title": "变压器巡检周期", "clause_body": "有人值班变电站每日巡视。"}],
-    }
-    path_url = "http://minio:9000/knowledgebases/kb-1/upload/DL_T_572.pdf"
-    minio_url = "http://public.example/minio/knowledgebases/kb-1/upload/DL_T_596.pdf"
     session = FakeRowsSession(
         [
-            ("file-1", {"power_spec": power_spec_metadata}, path_url, None),
-            ("file-2", {"power_spec": power_spec_metadata}, path_url, minio_url),
+            (
+                "md-408",
+                {
+                    "power_spec": {
+                        "standard_no": "DL/T 408-2023",
+                        "clauses": [{"clause_no": "6.2.1", "clause_body": "正文"}],
+                    }
+                },
+            ),
+            (
+                "md-6451",
+                {
+                    "power_spec": {
+                        "standard_no": "GB/T 6451-2023",
+                        "clauses": [{"clause_no": "4.1", "clause_body": "正文"}],
+                    }
+                },
+            ),
         ]
     )
 
-    metadata = await PowerSpecRepository().list_power_spec_extractions(session, kb_id="kb-1")
+    metadata = await PowerSpecRepository().list_power_spec_extractions(session, kb_id="kb-main")
 
-    assert metadata["file-1"]["source_url"] == path_url
-    assert metadata["file-2"]["source_url"] == minio_url
-    assert "source_url" not in power_spec_metadata
+    assert metadata["md-408"]["source_url"] == "/api/knowledge/power-spec/pdfs/DL_T408-2023.pdf"
+    assert metadata["md-6451"]["source_url"] == "/api/knowledge/power-spec/pdfs/GB_T6451-2023.pdf"
+
+
+@pytest.mark.asyncio
+async def test_repository_omits_pdf_link_without_standard_no():
+    """缺少标准号时不生成无法定位对象的下载地址。"""
+
+    session = FakeRowsSession([("md-empty", {"power_spec": {"clauses": []}})])
+
+    metadata = await PowerSpecRepository().list_power_spec_extractions(session, kb_id="kb-main")
+
+    assert "source_url" not in metadata["md-empty"]

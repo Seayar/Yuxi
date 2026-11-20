@@ -28,6 +28,18 @@
           <div class="rc-body">
             <MarkdownPreview :content="card.clause_body" compact />
           </div>
+
+          <div v-if="pdfUrls[index]" class="rc-footer">
+            <button
+              type="button"
+              class="rc-download"
+              :disabled="downloadingIndex !== null"
+              @click.stop="downloadPdf(pdfUrls[index], index, card)"
+            >
+              <Download :size="14" aria-hidden="true" />
+              <span>{{ downloadingIndex === index ? '下载中…' : '下载 PDF 原文' }}</span>
+            </button>
+          </div>
         </article>
       </div>
     </template>
@@ -35,9 +47,13 @@
 </template>
 
 <script setup>
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
+import { message } from 'ant-design-vue'
+import { Download } from '@lucide/vue'
 import BaseToolCall from '../BaseToolCall.vue'
 import MarkdownPreview from '@/components/common/MarkdownPreview.vue'
+import { downloadKnowledgeDocument } from '@/utils/knowledge_download'
+import { extractPowerSpecPdfUrls, powerSpecPdfUrlForStandardNo } from '@/utils/powerSpecPdf'
 
 const props = defineProps({
   toolCall: {
@@ -94,6 +110,29 @@ const cards = computed(() => {
   const items = parsed.value.spec_results
   return Array.isArray(items) ? items : []
 })
+
+const pdfUrls = computed(() => {
+  const markerUrls = extractPowerSpecPdfUrls(parsed.value.answer_markdown)
+  return cards.value.map(
+    (card, index) => markerUrls[index] || powerSpecPdfUrlForStandardNo(card.standard_no)
+  )
+})
+const downloadingIndex = ref(null)
+
+const downloadPdf = async (url, index, card) => {
+  if (!url || downloadingIndex.value !== null) return
+
+  downloadingIndex.value = index
+  try {
+    const fallbackFilename = `${card.standard_no || card.standard_name || '规范原文'}.pdf`
+    await downloadKnowledgeDocument(url, fallbackFilename)
+  } catch (error) {
+    console.error('下载规范 PDF 失败:', error)
+    message.error(error?.message || '下载 PDF 原文失败')
+  } finally {
+    downloadingIndex.value = null
+  }
+}
 
 const summaryText = computed(() => {
   const plan = parsed.value.intent_plan
@@ -216,6 +255,35 @@ const summary = computed(() => ({
         background: #fff3b0;
         padding: 0 2px;
         border-radius: 2px;
+      }
+    }
+
+    .rc-footer {
+      display: flex;
+      justify-content: flex-end;
+      padding: 0 14px 10px;
+    }
+
+    .rc-download {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 5px 9px;
+      border: 1px solid var(--gray-150);
+      border-radius: 6px;
+      background: var(--gray-0);
+      color: var(--text-secondary);
+      font-size: 12px;
+      cursor: pointer;
+
+      &:hover:not(:disabled) {
+        border-color: var(--primary);
+        color: var(--primary);
+      }
+
+      &:disabled {
+        cursor: wait;
+        opacity: 0.7;
       }
     }
   }

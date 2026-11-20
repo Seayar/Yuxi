@@ -16,6 +16,7 @@ from yuxi.knowledge.fault_trace.contracts import (
     MAX_REPORT_DEVICES,
     MAX_REPORT_PATHS,
     REPORT_SCHEMA_VERSION,
+    REALTIME_ATTRIBUTE_UNITS,
     CauseEvaluation,
     FaultTraceQuery,
 )
@@ -24,6 +25,7 @@ from yuxi.knowledge.fault_trace.rules import (
     located_causes,
     missing_attributes,
     overall_verdict,
+    referenced_attributes,
     trigger_summary,
 )
 
@@ -47,6 +49,7 @@ def build_fault_trace_payload(
     location_phenomena: list[str] | None = None,
     phenomenon_name: str | None = None,
     located_override: list[CauseEvaluation] | None = None,
+    image_url: str | None = None,
 ) -> dict[str, Any]:
     """装配五段式报告与发布 Markdown；模型文本通过参数注入，失败时用模板回退。
 
@@ -61,6 +64,15 @@ def build_fault_trace_payload(
     verdict = overall_verdict(causes)
     missing = missing_attributes(causes)
     location_missing = located.missing if located is not None else missing
+    reasoning_text = (location_reasoning or "").strip() or _location_reasoning(
+        located_all,
+        verdict,
+        causes,
+        location_missing,
+        scoped=located_override is not None,
+    )
+    if located_all:
+        reasoning_text = _append_failed_candidate_details(reasoning_text, causes, located_all)
     resolved_phenomenon = phenomenon_name or (
         location_phenomena[0] if location_phenomena else _matched_phenomenon_name(reasoning_rows)
     )
@@ -70,6 +82,7 @@ def build_fault_trace_payload(
         "device_names": [str(device.get("name") or "")],
         "phenomenon": resolved_phenomenon,
         "image_used": image_used,
+        "image_url": str(image_url or "").strip() or None,
     }
     location = {
         "cause_id": located.cause_id if located else None,
@@ -90,14 +103,7 @@ def build_fault_trace_payload(
             else supporting_phenomena(reasoning_rows, located_all)
         ),
         "rule": location_rule(located),
-        "reasoning": (location_reasoning or "").strip()
-        or _location_reasoning(
-            located_all,
-            verdict,
-            causes,
-            location_missing,
-            scoped=located_override is not None,
-        ),
+        "reasoning": reasoning_text,
         "evidence": _location_evidence(located, causes),
         "missing_data": location_missing,
     }
@@ -184,9 +190,10 @@ def build_fault_answer_markdown(report: dict[str, Any]) -> str:
         "**① 故障摘要**",
         f"- 故障现象简述：{summary.get('text') or '—'}",
         f"- 涉及设备：{'、'.join(summary.get('device_names') or ['—'])}",
-        "",
-        "**② 推理过程**",
     ]
+    if summary.get("image_url"):
+        lines += ["", str(summary["image_url"])]
+    lines += ["", "**② 推理过程**"]
     lines.extend(_reasoning_table(report.get("reasoning") or []))
     lines.append("")
     lines.append("**③ 原因定位**")
@@ -347,12 +354,71 @@ def _location_reasoning(
         if missing:
             text += f" 仍缺少实时数据：{'、'.join(missing)}。"
         return text
-    if verdict == "unknown":
-        detail = f"缺少实时数据：{'、'.join(missing)}。" if missing else "缺少可求值的实时判据。"
-        return f"候选原因均未能判定成立或排除，{detail}"
     if not causes:
         return "命中的故障现象下没有可判定的原因。" if scoped else "图谱未返回可判定的故障原因。"
-    return "全部候选原因的实时判据均不成立。"
+    lead = (
+        "候选原因仍有判据待确认，缺少实时数据"
+        if verdict == "unknown"
+        else "各候选原因未同时满足全部触发条件"
+    )
+    return f"{lead}。实时判据：{_failed_cause_details(causes)}。"
+
+
+def _failed_cause_details(causes: list[CauseEvaluation]) -> str:
+    """逐原因投影未定位场景下的表达式、实时值与求值结果。"""
+
+    details: list[str] = []
+    for cause in causes:
+        trigger_details = [_trigger_evaluation_detail(trigger) for trigger in cause.triggers]
+        if not trigger_details:
+            trigger_details = ["无触发条件"]
+        status = {"rejected": "不成立", "unknown": "待确认"}.get(cause.status, cause.status)
+        details.append(f"{cause.name}（{status}）：{'；'.join(trigger_details)}")
+    return "；".join(details)
+
+
+def _append_failed_candidate_details(
+    reasoning: str,
+    causes: list[CauseEvaluation],
+    located: list[CauseEvaluation],
+) -> str:
+    """在已定位推理后追加范围内未成立或待确认候选的完整判据。"""
+
+    located_ids = {cause.cause_id for cause in located}
+    failed = [cause for cause in causes if cause.cause_id not in located_ids]
+    if not failed:
+        return reasoning
+    separator = " " if reasoning else ""
+    return f"{reasoning}{separator}未成立或待确认候选判据：{_failed_cause_details(failed)}。"
+
+
+def _trigger_evaluation_detail(trigger: Any) -> str:
+    """渲染单条判据的表达式、引用值、求值结果与缺失原因。"""
+
+    if trigger.qualitative or not trigger.expression:
+        return f"{trigger.name}（无表达式，无法求值）"
+    attributes = referenced_attributes(trigger.expression)
+    values = [
+        _display_runtime_attribute(attribute, (trigger.values or {}).get(attribute))
+        for attribute in attributes
+    ]
+    reason = "" if trigger.reason in {"ok", "qualitative_condition"} else f"，原因={trigger.reason}"
+    return (
+        f"{trigger.name}：{trigger.expression}"
+        f"（{'，'.join(values) or '无可用实时值'}；结果={trigger.result}{reason}）"
+    )
+
+
+def _display_runtime_attribute(attribute: str, value: Any) -> str:
+    if value is None:
+        return f"{attribute}=缺失"
+    return f"{attribute}={_display_runtime_value(value)}{REALTIME_ATTRIBUTE_UNITS.get(attribute, '')}"
+
+
+def _display_runtime_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
 
 
 def _location_evidence(

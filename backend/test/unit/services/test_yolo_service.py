@@ -16,6 +16,7 @@ pytestmark = pytest.mark.unit
 
 DETECT_URL = "http://yolo.local/api/fault/detect"
 IMAGE_BYTES = b"\x89PNG\r\n\x1a\nfake-image-payload"
+IMAGE_MARKDOWN = "![故障识别图](/api/data/image?objectName=fault-charts%2Finsulator.png)"
 
 
 class _FakeOption:
@@ -33,8 +34,21 @@ def _use_config(monkeypatch: pytest.MonkeyPatch, *, server_url: str | None = "ht
     monkeypatch.setattr(yolo_service, "fault_image_opts", _FakeOption(value))
 
 
-def _detect_body(*, fault: bool, fault_type: str | None = None, fault_name: str | None = None) -> bytes:
-    payload = {"code": 200, "message": "success", "fault": fault, "fault_type": fault_type, "fault_name": fault_name}
+def _detect_body(
+    *,
+    fault: bool,
+    fault_type: str | None = None,
+    fault_name: str | None = None,
+    image_url: object = None,
+) -> bytes:
+    payload = {
+        "code": 200,
+        "message": "success",
+        "fault": fault,
+        "fault_type": fault_type,
+        "fault_name": fault_name,
+        "image_url": image_url,
+    }
     return json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
 
@@ -51,7 +65,12 @@ async def test_detect_fault_returns_typed_result(monkeypatch: pytest.MonkeyPatch
     _use_config(monkeypatch)
     httpx_mock.add_response(
         url=DETECT_URL,
-        content=_detect_body(fault=True, fault_type="insulator_damage", fault_name="绝缘子破损"),
+        content=_detect_body(
+            fault=True,
+            fault_type="insulator_damage",
+            fault_name="绝缘子破损",
+            image_url=IMAGE_MARKDOWN,
+        ),
     )
 
     result = await _detect()
@@ -59,6 +78,7 @@ async def test_detect_fault_returns_typed_result(monkeypatch: pytest.MonkeyPatch
     assert result.fault is True
     assert result.fault_type == "insulator_damage"
     assert result.fault_name == "绝缘子破损"
+    assert result.image_url == IMAGE_MARKDOWN
     request = httpx_mock.get_request()
     assert request.method == "POST"
     assert b"fault.png" in request.content
@@ -73,6 +93,7 @@ async def test_detect_no_fault_returns_null_categories(monkeypatch: pytest.Monke
     assert result.fault is False
     assert result.fault_type is None
     assert result.fault_name is None
+    assert result.image_url is None
 
 
 @pytest.mark.parametrize(
@@ -83,6 +104,12 @@ async def test_detect_no_fault_returns_null_categories(monkeypatch: pytest.Monke
         _detect_body(fault=False, fault_type="fire", fault_name="冒烟/着火"),  # fault:false 却带类别
         json.dumps({"code": 200, "message": "success"}).encode(),  # 缺 fault
         json.dumps({"fault": "yes"}).encode(),  # fault 非 bool
+        _detect_body(
+            fault=True,
+            fault_type="fire",
+            fault_name="冒烟/着火",
+            image_url={"url": "/api/data/image"},
+        ),  # image_url 非字符串
     ],
 )
 async def test_detect_rejects_inconsistent_payload(monkeypatch: pytest.MonkeyPatch, httpx_mock, body: bytes):

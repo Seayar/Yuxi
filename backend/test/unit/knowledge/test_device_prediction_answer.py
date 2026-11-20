@@ -60,6 +60,7 @@ PREDICTION = FaultPrediction(
     expected_failure_time="未来 30–60 天",
     degradation_trend="负荷率连续 3 个月上升，近 30 天最高达 78%",
     maintenance_time="建议在 30 天内完成针对性检查维护",
+    image_url="![预测图](/api/data/image?objectName=prediction-charts%2Ftransformer.png)",
 )
 GUIDANCE = MaintenanceGuidance(
     fault_type="触头过热",
@@ -110,6 +111,7 @@ def test_verified_report_covers_all_required_fields():
     assert payload["report"]["fault_rate"] == "0.8 次/年"
     assert payload["report"]["average_downtime_hours"] == "6.5 小时/次"
     assert payload["report"]["maintenance_time"] == "建议在 30 天内完成针对性检查维护"
+    assert payload["report"]["image_url"] == PREDICTION.image_url
     assert payload["report"]["matched_phenomenon"] == "触头过热"
     assert payload["report"]["resources"] == ["红外热像仪"]
     assert payload["report"]["cautions"] == ["停电范围提前报备"]
@@ -124,12 +126,27 @@ def test_verified_report_covers_all_required_fields():
     assert "预测故障类型：触头过热 / 冷却效能下降" in markdown
     assert "发生概率：67%" in markdown
     assert "预计发生时间：未来 30–60 天" in markdown
+    prediction_section = markdown.split("## 二、故障预测")[1].split("## 三、可靠性与风险评估")[0]
+    trend_line = prediction_section.splitlines().index("- 退化趋势：负荷率连续 3 个月上升，近 30 天最高达 78%")
+    assert prediction_section.splitlines()[trend_line + 1] == ""
+    assert prediction_section.splitlines()[trend_line + 2] == PREDICTION.image_url
     assert "| 绕组温度 | 85 | ℃ | 30% | -8 分 |" in markdown
     assert "| 维护时机 | 建议在 30 天内完成针对性检查维护 |" in markdown
     assert "| 匹配故障现象 | 触头过热 |" in markdown
     assert "| 所需资源 | 1. 红外热像仪 |" in markdown
     assert "| 注意事项 | 1. 停电范围提前报备 |" in markdown
     assert "维护内容" not in markdown
+
+
+def test_empty_prediction_image_is_omitted():
+    """服务未返回预测图时不插入空图片或占位文本。"""
+
+    prediction = replace(PREDICTION, image_url="")
+    markdown = _payload(_evidence(prediction=prediction))["answer_markdown"]
+    prediction_section = markdown.split("## 二、故障预测")[1].split("## 三、可靠性与风险评估")[0]
+
+    assert "![" not in prediction_section
+    assert prediction_section.rstrip().endswith("- 退化趋势：负荷率连续 3 个月上升，近 30 天最高达 78%")
 
 
 def test_missing_optional_parts_are_marked_not_invented():
@@ -366,6 +383,7 @@ def test_template_readout_is_recorded_in_data_notes():
         ({"average_downtime_hours": "99 小时/次"}, "平均停运时间"),
         ({"expected_failure_time": "未来 999 天"}, "预计发生时间"),
         ({"degradation_trend": "编造趋势 999"}, "退化趋势"),
+        ({"image_url": "![预测图](/api/data/image?objectName=prediction-charts%2Ftampered.png)"}, "预测图"),
         ({"maintenance_time": "编造维护时机 999"}, "维护时机"),
         ({"status_readout": "健康评分 99 分，运行良好"}, "状态解读"),
     ],

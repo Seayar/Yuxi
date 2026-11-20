@@ -163,6 +163,32 @@ def search_devices(
     return typed[:limit]
 
 
+def find_device_by_id(
+    client: TuGraphClient,
+    device_id: str,
+    *,
+    query: PredictionQuery,
+    ledger_candidates: Sequence[LedgerDevice] = (),
+) -> DeviceCandidate | None:
+    """按用户选中的图节点 ID 回读设备，避免恢复时依赖重新召回结果。"""
+
+    clean_id = str(device_id or "").strip()
+    if not clean_id:
+        return None
+    records = _query_devices_by_ids(client, ids=[clean_id])
+    if not records:
+        return None
+    props = records[0].get("n") or records[0].get("a") or {}
+    candidate = _build_candidate(props, query=query, keywords=_device_keywords(query))
+    candidate = _enrich_with_ledger(candidate, list(ledger_candidates))
+    device_type = _query_device_types(client, device_ids=[candidate.device_id]).get(candidate.device_id)
+    return replace(
+        candidate,
+        device_type=device_type or candidate.device_type,
+        score=max(candidate.score, NAME_EXACT_SCORE),
+    )
+
+
 async def resolve_device_id(candidate: DeviceCandidate) -> tuple[str, str] | None:
     """解析预测服务使用的设备 ID，返回 ``(设备ID, 来源)``；取不到时返回 None。
 

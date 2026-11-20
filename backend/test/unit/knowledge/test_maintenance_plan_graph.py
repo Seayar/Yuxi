@@ -14,6 +14,7 @@ from yuxi.knowledge.maintenance_plan.contracts import (
 from yuxi.knowledge.device_index import reset_device_name_index
 from yuxi.knowledge.maintenance_plan.graph_plan import (
     collect_scene_evidence,
+    find_device_by_id,
     find_scenes,
     plan_graph_ready,
     rank_scenes,
@@ -58,6 +59,8 @@ class FakeClient:
 
     def run(self, cypher: str, **params):
         self.queries.append((cypher, params))
+        if "IN $device_ids" in cypher and params.get("rel") is None:
+            return [{"n": DEVICE_3K18}]
         if "CONTAINS $kw" in cypher:
             return [{"n": DEVICE_3K18}, {"n": DEVICE_UNTYPED}]
         rel = params.get("rel")
@@ -77,14 +80,48 @@ class FakeClient:
         if rel == "需要安全措施":
             return [
                 {"b": {"id": "SAFE1", "名称": "个人防护", "具体内容": "安全帽", "是否通用": "是", "适用分支值": ""}},
-                {"b": {"id": "SAFE2", "名称": "分支1措施", "具体内容": "站内围栏", "是否通用": "否", "适用分支值": "分支1"}},
-                {"b": {"id": "SAFE3", "名称": "分支2措施", "具体内容": "箱变围栏", "是否通用": "否", "适用分支值": "分支2"}},
+                {
+                    "b": {
+                        "id": "SAFE2",
+                        "名称": "分支1措施",
+                        "具体内容": "站内围栏",
+                        "是否通用": "否",
+                        "适用分支值": "分支1",
+                    }
+                },
+                {
+                    "b": {
+                        "id": "SAFE3",
+                        "名称": "分支2措施",
+                        "具体内容": "箱变围栏",
+                        "是否通用": "否",
+                        "适用分支值": "分支2",
+                    }
+                },
             ]
         if rel == "需要资源":
             return [
                 {"b": {"id": "RES1", "名称": "吊车", "数量": 2, "计量单位": "台", "是否通用": "是", "适用分支值": ""}},
-                {"b": {"id": "RES2", "名称": "绝缘隔板", "数量": 0, "数量要求": "4 块／1 套", "是否通用": "否", "适用分支值": "分支1"}},
-                {"b": {"id": "RES3", "名称": "箱变专用工具", "数量": 1, "计量单位": "套", "是否通用": "否", "适用分支值": "分支2"}},
+                {
+                    "b": {
+                        "id": "RES2",
+                        "名称": "绝缘隔板",
+                        "数量": 0,
+                        "数量要求": "4 块／1 套",
+                        "是否通用": "否",
+                        "适用分支值": "分支1",
+                    }
+                },
+                {
+                    "b": {
+                        "id": "RES3",
+                        "名称": "箱变专用工具",
+                        "数量": 1,
+                        "计量单位": "套",
+                        "是否通用": "否",
+                        "适用分支值": "分支2",
+                    }
+                },
             ]
         if rel == "需要人员":
             return [
@@ -103,6 +140,18 @@ def test_search_devices_resolves_type_and_drops_untyped_nodes():
     assert [item.name for item in candidates] == ["3k18"]
     assert candidates[0].device_type == "开关柜"
     assert candidates[0].ledger_ids == ("L1", "L2")
+
+
+def test_find_device_by_id_returns_selected_candidate():
+    device = find_device_by_id(
+        FakeClient(),
+        "LGR#3k18",
+        query=PlanQuery(raw_text="3k18 开关柜整柜更换", device_name="3k18"),
+    )
+
+    assert device is not None
+    assert device.device_id == "LGR#3k18"
+    assert device.device_type == "开关柜"
 
 
 def test_search_devices_by_device_type_uses_a_key_result():
@@ -322,7 +371,9 @@ def test_rank_scenes_prefers_name_match_and_filters_level():
 
     assert ranked[0].scene_id == "A"
     assert ranked[0].score > ranked[1].score
-    assert all(scene.level == "A级" for scene in rank_scenes(scenes, PlanQuery(raw_text="整柜更换", maintenance_level="A")))
+    assert all(
+        scene.level == "A级" for scene in rank_scenes(scenes, PlanQuery(raw_text="整柜更换", maintenance_level="A"))
+    )
 
 
 def test_collect_scene_evidence_filters_branch_and_sorts_steps():

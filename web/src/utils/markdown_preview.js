@@ -9,6 +9,7 @@ import { normalizeCodeLanguage } from './file_preview.js'
 import { renderSvgBlocks } from './svgRenderer.js'
 import { renderHtmlPreviewBlocks } from './htmlPreviewRenderer.js'
 import { createMarkdownRenderCache } from './markdownRenderCache.js'
+import { replacePowerSpecPdfMarkers } from './powerSpecPdf.js'
 
 const markdownKatexPlugin = markdownItKatex.default || markdownItKatex
 const FRONTMATTER_MARKER = '---'
@@ -208,7 +209,9 @@ const getRenderer = async (theme, needsHighlight) => {
 
 export const renderMarkdown = async (content, { theme = 'github-light' } = {}) => {
   try {
-    const normalizedContent = normalizeHtmlTagQuotes(normalizeLegacyMinioPublicUrls(content))
+    const normalizedContent = replacePowerSpecPdfMarkers(
+      normalizeHtmlTagQuotes(normalizeLegacyMinioPublicUrls(content))
+    )
     const htmlPreviewContent = renderHtmlPreviewBlocks(normalizedContent, {
       sanitizeHtml: sanitizeHtmlPreviewSrcdoc
     })

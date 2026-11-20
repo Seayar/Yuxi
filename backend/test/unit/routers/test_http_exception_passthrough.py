@@ -145,6 +145,51 @@ async def test_document_download_preserves_inner_http_exception(monkeypatch):
     assert caught.value is error
 
 
+@pytest.mark.asyncio
+async def test_document_download_prefers_minio_url_over_path(monkeypatch):
+    """文件记录同时有 path 和 minio_url 时，下载必须读取真正的 MinIO 对象。"""
+
+    monkeypatch.setattr(knowledge_router, "_ensure_database_supports_documents", AsyncMock())
+    monkeypatch.setattr(
+        knowledge_router.knowledge_base,
+        "get_file_basic_info",
+        AsyncMock(
+            return_value={
+                "meta": {
+                    "path": "/legacy/local/path.pdf",
+                    "minio_url": "http://minio:9000/knowledgebases/kb-1/upload/DL_T_572.pdf",
+                    "filename": "DL_T_572.pdf",
+                }
+            }
+        ),
+    )
+    monkeypatch.setattr(knowledge_router, "is_minio_url", lambda _path: True)
+    monkeypatch.setattr(
+        knowledge_router,
+        "parse_minio_url",
+        lambda _path: ("knowledgebases", "kb-1/upload/DL_T_572.pdf"),
+    )
+    minio_response = SimpleNamespace(
+        read=Mock(return_value=b""),
+        close=Mock(),
+        release_conn=Mock(),
+    )
+    client = SimpleNamespace(adownload_response=AsyncMock(return_value=minio_response))
+    monkeypatch.setattr(knowledge_router, "get_minio_client", lambda: client)
+
+    response = await knowledge_router.download_document(
+        "kb-1",
+        "file-1",
+        current_user=SimpleNamespace(uid="user-1"),
+    )
+
+    client.adownload_response.assert_awaited_once_with(
+        bucket_name="knowledgebases",
+        object_name="kb-1/upload/DL_T_572.pdf",
+    )
+    assert response.headers["content-disposition"] == 'attachment; filename="DL_T_572.pdf"'
+
+
 @pytest.mark.parametrize(
     ("error", "status_code", "detail"),
     [

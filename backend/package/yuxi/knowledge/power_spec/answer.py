@@ -184,7 +184,7 @@ SRS_CARD_FIELDS: tuple[tuple[str, str], ...] = (
     ("clause_no", "条款编号"),
     ("clause_body", "条款正文"),
 )
-# 前端按该标记在每张卡片末尾定位原始 PDF；URL 来自知识库文件的 MinIO 地址。
+# 前端按该标记在每张卡片末尾定位原始 PDF；URL 是知识库原文件的同源鉴权下载地址。
 PDF_MARKER = "[[PDF:{url}]]"
 
 
@@ -620,12 +620,8 @@ def render_srs_cards(items: Sequence[dict], source_urls: Sequence[str | None] = 
                 lines.extend([f"- **{label}**", "", str(value or "未提供"), ""])
                 continue
             lines.append(f"- **{label}**：{value if value else '未提供'}")
-        # 第三方测评项目暂时不需要体现PDF原文索引。
-        # todo: PDF 的 URL 现在显示 localhost，前端页面解析调用该地址会 404；后续由前台拼服务器地址，
-        # 此处只返回服务器 IP 和端口后的静态文件地址即可。
-        # todo: 此外，顾客需求需要的是PDF原文档，后续需要建立一套PDF映射静态地址
-        # marker = _pdf_marker(source_urls[index - 1] if index <= len(source_urls) else None)
-        marker = ""
+        # 标记使用知识库原文件的同源下载地址；浏览器不需要也不应访问 MinIO 内网地址。
+        marker = _pdf_marker(source_urls[index - 1] if index <= len(source_urls) else None)
         if marker:
             lines.extend([marker, ""])
         else:
@@ -634,7 +630,7 @@ def render_srs_cards(items: Sequence[dict], source_urls: Sequence[str | None] = 
 
 
 def _pdf_marker(source_url: str | None) -> str:
-    """返回卡片末尾的 PDF 标记；没有地址、地址不是可请求 URL 或会破坏标记边界时返回空串。"""
+    """返回卡片末尾的 PDF 下载标记；地址不可请求或会破坏标记边界时返回空串。"""
 
     url = str(source_url or "").strip()
     if not url:

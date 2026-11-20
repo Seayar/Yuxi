@@ -17,6 +17,7 @@ from yuxi.knowledge.device_prediction.contracts import (
     CLARIFY_DEVICE_MESSAGE,
     PredictionQuery,
 )
+from yuxi.knowledge.device_mentions import prefer_rule_device_name
 from yuxi.knowledge.maintenance_plan.intent import normalize_device_type, rule_extract
 from yuxi.knowledge.power_spec.model_output import parse_model_json
 from yuxi.utils import logger
@@ -141,9 +142,7 @@ def build_intent_prompt(text: str, *, previous: PredictionQuery | None = None) -
 def _merge_model_result(rule: PredictionQuery, payload: dict[str, Any]) -> PredictionQuery:
     """合并模型与规则：原文已识别到具体编号时以规则结果为准，避免模型把部件并入设备名。"""
 
-    device_name = _clean_optional(payload.get("device_name")) or rule.device_name
-    if device_name and rule.device_name and _squeeze(rule.device_name) in _squeeze(device_name):
-        device_name = rule.device_name
+    device_name = prefer_rule_device_name(rule.device_name, _clean_optional(payload.get("device_name")))
     return PredictionQuery(
         raw_text=rule.raw_text,
         device_name=device_name,
@@ -201,12 +200,6 @@ def _clean_optional(value: Any) -> str | None:
     return text
 
 
-def _squeeze(text: str) -> str:
-    """去掉空白并忽略大小写，用于判断模型结果是否包含原文指称。"""
-
-    return "".join(str(text or "").split()).casefold()
-
-
 def context_model_call(
     context: Any, *, max_tokens: int = DEVICE_PREDICTION_INTENT_MAX_TOKENS
 ) -> PredictionModelCall | None:
@@ -251,6 +244,9 @@ INTENT_PROMPT = """你是电力设备预测维护系统的设备识别器。
 }
 要求：
 - 设备名称必须来自用户原话，不要改写成台账名称，也不要把设备类型当作设备名称。
+- 线路名与杆塔编号同时出现时，杆塔编号及后缀属于 device_name，线路名属于 location_hint；
+  例如“联络二线CN13杆塔”应提取为 CN13杆塔 与 联络二线。
+- “DN67C相”应作为具体设备名 DN67C相 保留，同时把 C相 作为相别上下文，不能让“杆塔”或“线路”类型词覆盖具体编号。
 - 无法确定的字段一律填 null，不要编造。
 - 用户只问了健康状态、故障预测或维护计划时，同样只提取设备信息。
 - 只输出 JSON，不要输出其他解释。

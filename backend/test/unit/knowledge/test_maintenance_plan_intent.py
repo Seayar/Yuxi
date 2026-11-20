@@ -177,6 +177,36 @@ def test_ledger_patrol_tower_with_letter_prefix():
     assert query.device_type == "杆塔"
 
 
+@pytest.mark.parametrize(
+    ("text", "device_name", "line_name", "device_type", "work_object"),
+    [
+        ("评估联络二线CN13杆塔状态", "CN13杆塔", "联络二线", "杆塔", None),
+        ("评估银开线YN3杆塔状态", "YN3杆塔", "银开线", "杆塔", None),
+        ("开一线 BN91 杆塔检修，需登杆检查绝缘子与紧固螺栓的方案", "BN91杆塔", "开一线", "杆塔", "绝缘子"),
+        ("35kV联络一线DN67C相异常，请分析原因", "DN67C相", "联络一线", None, "C相"),
+    ],
+)
+def test_line_tower_codes_are_preserved(text, device_name, line_name, device_type, work_object):
+    query = rule_extract(text)
+
+    assert query.device_name == device_name
+    assert query.location_hint == line_name
+    assert query.device_type == device_type
+    assert query.work_object == work_object
+
+
+def test_model_type_only_cannot_override_line_tower_code():
+    query = _run(
+        extract_plan_intent(
+            "评估联络二线CN13杆塔状态",
+            model_call=_model_call({"device_name": "杆塔", "device_type": "杆塔"}),
+        )
+    )
+
+    assert query.device_name == "CN13杆塔"
+    assert query.location_hint == "联络二线"
+
+
 def test_ledger_spaces_inside_description_are_tolerated():
     query = rule_extract("更换 #3 开闭所 3k18 断路器")
 
@@ -275,7 +305,13 @@ def test_normalize_transformer_aliases(raw, expected):
 
 @pytest.mark.parametrize(
     ("raw", "expected"),
-    [("箱变", "箱式变电站"), ("箱式变电站", "箱式变电站"), ("开关", "断路器"), ("开关柜", "开关柜"), ("馈出柜", "开关柜")],
+    [
+        ("箱变", "箱式变电站"),
+        ("箱式变电站", "箱式变电站"),
+        ("开关", "断路器"),
+        ("开关柜", "开关柜"),
+        ("馈出柜", "开关柜"),
+    ],
 )
 def test_normalize_box_and_switch_aliases(raw, expected):
     assert normalize_device_type(raw) == expected
@@ -443,7 +479,9 @@ def test_model_result_wins_over_rule():
 
 
 def test_model_null_fields_fall_back_to_rule():
-    payload = dict.fromkeys(("task_type", "device_name", "device_type", "voltage_level", "work_object", "location_hint"))
+    payload = dict.fromkeys(
+        ("task_type", "device_name", "device_type", "voltage_level", "work_object", "location_hint")
+    )
 
     query = _run(extract_plan_intent("更换#3开闭所3k18断路器", model_call=_model_call(payload)))
 
@@ -541,10 +579,12 @@ def test_missing_model_call_uses_rule():
 def test_model_expanded_name_preserves_explicit_device_identifier(model_name):
     """真实模型把部件并入设备名时保留原文编号，避免唯一设备多弹确认。"""
 
-    query = _run(extract_plan_intent(
-        "更换#3开闭所3k18断路器",
-        model_call=_model_call({"task_type": "更换", "device_name": model_name, "location_hint": "#3开闭所"}),
-    ))
+    query = _run(
+        extract_plan_intent(
+            "更换#3开闭所3k18断路器",
+            model_call=_model_call({"task_type": "更换", "device_name": model_name, "location_hint": "#3开闭所"}),
+        )
+    )
     assert query.device_name == "3k18"
     assert query.work_object == "断路器"
     assert query.location_hint == "#3开闭所"
@@ -661,7 +701,13 @@ def test_extract_device_only_does_not_clarify():
 
 
 def test_intent_module_exposes_required_api():
-    for name in ("extract_plan_intent", "rule_extract", "missing_fields", "apply_input_constraints", "normalize_device_type"):
+    for name in (
+        "extract_plan_intent",
+        "rule_extract",
+        "missing_fields",
+        "apply_input_constraints",
+        "normalize_device_type",
+    ):
         assert callable(getattr(intent, name))
 
 

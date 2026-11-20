@@ -61,6 +61,7 @@ PREDICTION_PAYLOAD = {
     "expected_failure_time": "未来 30–60 天",
     "degradation_trend": "负荷率连续 3 个月上升，近 30 天最高达 78%",
     "maintenance_time": "建议在 30 天内完成针对性检查维护",
+    "image_url": "![预测图](/api/data/image?objectName=prediction-charts%2Ftransformer.png)",
 }
 
 
@@ -147,6 +148,7 @@ def test_fault_prediction_is_parsed_and_device_id_is_url_encoded(monkeypatch):
     assert prediction.probability == "67%"
     assert prediction.maintenance_time == "建议在 30 天内完成针对性检查维护"
     assert prediction.maintenance_time_derived is False
+    assert prediction.image_url == PREDICTION_PAYLOAD["image_url"]
 
 
 def test_health_endpoint_path_and_base_url(monkeypatch):
@@ -201,6 +203,19 @@ def test_missing_maintenance_time_is_derived_and_marked(monkeypatch):
 
     assert prediction.maintenance_time_derived is True
     assert prediction.maintenance_time == "建议在 30 天内完成（预测故障发生在未来 30–60 天）"
+
+
+def test_non_string_image_url_is_invalid(monkeypatch):
+    """图片字段出现但不是字符串时按响应不合法处理，不能把对象字符串化进正文。"""
+
+    payload = dict(PREDICTION_PAYLOAD)
+    payload["image_url"] = {"url": "/api/data/image"}
+    _install(monkeypatch, response=_FakeResponse(payload=payload))
+
+    error = _raise(services.fetch_fault_prediction("bb1baf15"))
+
+    assert error.code == "invalid"
+    assert error.message == PREDICTION_SERVICE_INVALID_MESSAGE
 
 
 def test_not_configured_base_url_is_reported(monkeypatch):

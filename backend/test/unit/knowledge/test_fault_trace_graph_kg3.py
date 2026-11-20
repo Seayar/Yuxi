@@ -7,6 +7,7 @@ from yuxi.knowledge.device_index import reset_device_name_index
 from yuxi.knowledge.fault_trace.ledger import LedgerDevice
 from yuxi.knowledge.fault_trace.graph_kg3 import (
     collect_kg3_evidence,
+    find_device_by_id,
     find_devices,
     resolve_device_type,
 )
@@ -70,6 +71,19 @@ def test_find_devices_prefers_exact_name():
 
     assert [device["name"] for device in devices] == ["3B-7Y"]
     assert any("coalesce(n.名称, '') = $name" in cypher for cypher, _ in client.queries)
+
+
+def test_find_device_by_id_returns_selected_graph_node():
+    def responder(cypher: str, params: dict):
+        if "coalesce(n.id, '') = $device_id" in cypher:
+            return [{"n": DEVICE}] if params.get("device_id") == DEVICE["id"] else []
+        return []
+
+    device = find_device_by_id(_FakeClient(responder), DEVICE["id"])
+
+    assert device is not None
+    assert device["id"] == DEVICE["id"]
+    assert device["name"] == "3B-7Y"
 
 
 def test_find_devices_falls_back_to_contains():

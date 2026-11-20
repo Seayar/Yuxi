@@ -24,6 +24,11 @@ from yuxi.knowledge.maintenance_plan.contracts import (
     TASK_TYPES,
     PlanQuery,
 )
+from yuxi.knowledge.device_mentions import (
+    extract_line_tower_mention,
+    prefer_rule_device_name,
+    strip_request_prefix,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -230,14 +235,23 @@ def rule_extract(text: str) -> PlanQuery:
     """纯规则抽取：任务类型关键词、电压等级、设备类型关键词、位置线索、设备名称片段。"""
 
     normalized = (text or "").strip()
+    line_tower = extract_line_tower_mention(normalized)
     return PlanQuery(
         raw_text=normalized,
         task_type=_match_task_type(normalized),
-        device_name=_match_device_name(normalized),
-        device_type=_match_device_type(normalized),
+        device_name=line_tower.device_name if line_tower is not None else _match_device_name(normalized),
+        device_type=(
+            line_tower.device_type
+            if line_tower is not None and line_tower.device_type
+            else _match_device_type(normalized)
+        ),
         voltage_level=_match_voltage(normalized),
-        work_object=_match_work_object(normalized),
-        location_hint=_match_location(normalized),
+        work_object=(
+            line_tower.work_object
+            if line_tower is not None and line_tower.work_object
+            else _match_work_object(normalized)
+        ),
+        location_hint=line_tower.line_name if line_tower is not None else _match_location(normalized),
         maintenance_level=_match_maintenance_level(normalized),
     )
 
@@ -292,7 +306,9 @@ def _match_device_name(text: str) -> str | None:
         if not match:
             continue
         squeezed = _squeeze(match.group(0))
-        matches.append(_strip_location_prefix(squeezed) if strip_location else squeezed)
+        if strip_location:
+            squeezed = strip_request_prefix(_strip_location_prefix(squeezed))
+        matches.append(squeezed)
     matches = [item for item in matches if item]
     return max(matches, key=len) if matches else None
 
@@ -494,9 +510,9 @@ def _merge_model_result(rule: PlanQuery, payload: dict[str, Any]) -> PlanQuery:
     if task_type not in TASK_TYPES:
         task_type = None
 
-    device_name = _clean_optional(payload.get("device_name")) or rule.device_name
-    if device_name and rule.device_name and _squeeze(rule.device_name).casefold() in _squeeze(device_name).casefold():
-        # 模型可能抽成“3k18断路器”；原文已识别到编号时，部件仍由 work_object 承载。
+    model_device_name = _clean_optional(payload.get("device_name"))
+    device_name = prefer_rule_device_name(rule.device_name, model_device_name)
+    if model_device_name and normalize_device_type(model_device_name) in DEVICE_TYPES and rule.device_name:
         device_name = rule.device_name
 
     return PlanQuery(
@@ -650,6 +666,9 @@ INTENT_PROMPT = """你是配电网运维任务处置方案生成系统的意图�
 }
 要求：
 - 设备名称必须是用户原话里的具体设备指称，不要改写成台账名称，也不要把设备类型当作设备名称。
+- 线路名与杆塔编号同时出现时，杆塔编号及“杆塔”后缀属于 device_name，线路名属于 location_hint；
+  例如“联络二线CN13杆塔”应提取为 device_name=CN13杆塔、location_hint=联络二线。
+- “DN67C相”应作为具体设备名 DN67C相 保留，同时把 C相 作为相别上下文，不能让“杆塔”或“线路”类型词覆盖具体编号。
 - 无法确定的字段一律填 null，不要编造。
 - 只输出 JSON，不要输出其他解释。
 """

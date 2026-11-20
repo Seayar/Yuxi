@@ -109,6 +109,19 @@ def test_exact_name_ranks_first_and_duplicates_collapse():
     assert candidates[0].ledger_ids == ("L1", "L2")
 
 
+def test_find_device_by_id_returns_selected_candidate():
+    client = _FakeClient(
+        devices=[{"id": "D1", "名称": "3k18", "层级路径": "#3开闭所 > 3k18", "电压等级": "10kV"}],
+        types=[{"a": {"id": "D1"}, "b": {"名称": "开关柜"}}],
+    )
+
+    device = graph_module.find_device_by_id(client, "D1", query=_query(device_name="3k18"))
+
+    assert device is not None
+    assert device.device_id == "D1"
+    assert device.device_type == "开关柜"
+
+
 def test_type_and_voltage_only_recall_by_type_edge():
     """只给设备类型时仍能召回设备，并按类型匹配加分。"""
 

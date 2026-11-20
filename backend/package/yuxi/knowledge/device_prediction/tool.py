@@ -30,6 +30,8 @@ from yuxi.config.options import fault_trace_opts
 from yuxi.knowledge.device_index import graph_key as device_graph_key
 from yuxi.knowledge.device_selection import (
     DeviceOption,
+    SELECTED_DEVICE_UNAVAILABLE_MESSAGE,
+    SelectedDeviceId,
     build_device_choice_payload,
     parse_device_choice,
     select_device,
@@ -360,11 +362,28 @@ async def _locate_device(
             )
         if recommended_id:
             candidates = _promote_candidate(candidates, recommended_id)
-        picked = _pick_device(candidates, query, rounds, emitter=emitter, selection=selection)
+        picked = _pick_device(candidates, query, rounds, selection=selection)
         if picked is CHOICE_CANCELLED:
             return CHOICE_CANCELLED_MESSAGE
         if isinstance(picked, DeviceCandidate):
             return query, picked
+        if isinstance(picked, SelectedDeviceId):
+            selected = await asyncio.to_thread(
+                kg5.find_device_by_id,
+                client,
+                picked.device_id,
+                query=query,
+                ledger_candidates=ledger_candidates,
+            )
+            if selected is None:
+                emitter.emit(
+                    "load_device",
+                    "failed",
+                    content=SELECTED_DEVICE_UNAVAILABLE_MESSAGE,
+                    error={"code": "selected_device_unavailable", "message": SELECTED_DEVICE_UNAVAILABLE_MESSAGE},
+                )
+                return SELECTED_DEVICE_UNAVAILABLE_MESSAGE
+            return query, selected
         if picked:
             logger.info(f"设备预测用户改填设备，清除上一轮设备身份: {picked!r}")
             query = await extract_prediction_intent(
@@ -426,21 +445,10 @@ def _pick_device(
     query: PredictionQuery,
     rounds: list[int],
     *,
-    emitter: ThinkingEmitter,
     selection: dict[str, Any] | None = None,
-) -> DeviceCandidate | str | None | _ChoiceCancelled:
+) -> DeviceCandidate | SelectedDeviceId | str | None | _ChoiceCancelled:
     """每次都让用户确认设备；零候选也发卡片允许直接填写新设备名。"""
 
-    emitter.emit(
-        "load_device",
-        "waiting",
-        content="等待用户选择目标设备。",
-        data={
-            "source": DEVICE_CHOICE_SOURCE,
-            "candidate_count": len(candidates),
-            "device_selection": selection,
-        },
-    )
     if rounds[0] >= MAX_CHOICE_ROUNDS:
         return None
     rounds[0] += 1
@@ -452,6 +460,7 @@ def _pick_device(
         matched = next((candidate for candidate in candidates if candidate.device_id == choice.selected_id), None)
         if matched is not None:
             return matched
+        return SelectedDeviceId(choice.selected_id)
     if choice.free_text:
         return choice.free_text
     return choice.selected_id
@@ -464,6 +473,8 @@ def _device_choice_error_code(message: str) -> str:
         return "device_choice_cancelled"
     if message == CHOICE_ABORTED_MESSAGE:
         return "choice_aborted"
+    if message == SELECTED_DEVICE_UNAVAILABLE_MESSAGE:
+        return "selected_device_unavailable"
     return "device_not_found"
 
 

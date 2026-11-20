@@ -32,6 +32,32 @@ def test_rule_extract_keeps_user_device_reference():
     assert query.device_type == "变压器"
 
 
+@pytest.mark.parametrize(
+    ("text", "device_name", "location_hint"),
+    [
+        ("评估联络二线CN13杆塔状态", "CN13杆塔", "联络二线"),
+        ("评估银开线YN3杆塔状态", "YN3杆塔", "银开线"),
+        ("开一线 BN91 杆塔检修", "BN91杆塔", "开一线"),
+        ("35kV联络一线DN67C相异常", "DN67C相", "联络一线"),
+    ],
+)
+def test_rule_extract_preserves_line_tower_code(text, device_name, location_hint):
+    query = intent.rule_extract_prediction(text)
+
+    assert query.device_name == device_name
+    assert query.location_hint == location_hint
+
+
+def test_model_type_only_cannot_override_line_tower_code():
+    async def model_call(prompt: str) -> str:
+        return '{"device_name": "杆塔", "device_type": "杆塔"}'
+
+    query = _extract("评估联络二线CN13杆塔状态", model=model_call)
+
+    assert query.device_name == "CN13杆塔"
+    assert query.location_hint == "联络二线"
+
+
 def test_type_only_question_does_not_clarify():
     """只说设备类型时按类型召回候选，不进入反问。"""
 

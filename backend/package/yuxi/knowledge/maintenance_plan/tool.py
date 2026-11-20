@@ -32,6 +32,8 @@ from yuxi.config.options import fault_trace_opts
 from yuxi.knowledge.device_index import graph_key as device_graph_key
 from yuxi.knowledge.device_selection import (
     DeviceOption,
+    SELECTED_DEVICE_UNAVAILABLE_MESSAGE,
+    SelectedDeviceId,
     build_device_choice_payload,
     parse_device_choice,
     select_device,
@@ -403,7 +405,6 @@ async def _locate_device(
             candidates,
             query,
             rounds,
-            emitter=emitter,
             recommended_id=recommended_id,
             selection=selection,
         )
@@ -411,6 +412,23 @@ async def _locate_device(
             return CHOICE_CANCELLED_MESSAGE
         if isinstance(picked, DeviceCandidate):
             return query, picked
+        if isinstance(picked, SelectedDeviceId):
+            selected = await asyncio.to_thread(
+                _graph_plan().find_device_by_id,
+                client,
+                picked.device_id,
+                query=query,
+                ledger_candidates=ledger_candidates,
+            )
+            if selected is None:
+                emitter.emit(
+                    "retrieve_graph",
+                    "failed",
+                    content=SELECTED_DEVICE_UNAVAILABLE_MESSAGE,
+                    error={"code": "selected_device_unavailable", "message": SELECTED_DEVICE_UNAVAILABLE_MESSAGE},
+                )
+                return SELECTED_DEVICE_UNAVAILABLE_MESSAGE
+            return query, selected
         if picked:
             logger.info(f"处置方案用户改填设备，清除上一轮设备身份: {picked!r}")
             query = await extract_plan_intent(
@@ -473,26 +491,15 @@ def _pick_device(
     query: PlanQuery,
     rounds: list[int],
     *,
-    emitter: ThinkingEmitter,
     recommended_id: str | None = None,
     selection: dict[str, Any] | None = None,
-) -> DeviceCandidate | str | None | _ChoiceCancelled:
+) -> DeviceCandidate | SelectedDeviceId | str | None | _ChoiceCancelled:
     """每次都由用户确认目标设备，唯一候选或名称正好命中也不自动采用。
 
     图谱里存在同名/同前缀设备，自动确认一旦选错，后续场景、分支和人员都会按错误设备生成，
     用户很难从结果里发现。卡片允许用户改选候选或自行填写设备名。
     """
 
-    emitter.emit(
-        "retrieve_graph",
-        "waiting",
-        content="等待用户选择目标设备。",
-        data={
-            "source": DEVICE_CHOICE_SOURCE,
-            "candidate_count": len(candidates),
-            "device_selection": selection,
-        },
-    )
     if rounds[0] >= MAX_CHOICE_ROUNDS:
         return None
     rounds[0] += 1
@@ -504,6 +511,7 @@ def _pick_device(
         matched = next((candidate for candidate in candidates if candidate.device_id == choice.selected_id), None)
         if matched is not None:
             return matched
+        return SelectedDeviceId(choice.selected_id)
     if choice.free_text:
         return choice.free_text
     return choice.selected_id
@@ -516,6 +524,8 @@ def _device_choice_error_code(message: str) -> str:
         return "device_choice_cancelled"
     if message == CHOICE_ABORTED_MESSAGE:
         return "choice_aborted"
+    if message == SELECTED_DEVICE_UNAVAILABLE_MESSAGE:
+        return "selected_device_unavailable"
     return "device_not_found"
 
 

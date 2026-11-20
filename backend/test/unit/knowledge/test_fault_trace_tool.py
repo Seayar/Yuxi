@@ -26,6 +26,7 @@ from yuxi.knowledge.fault_trace.contracts import (
     FaultTraceQuery,
     RealtimeValue,
 )
+from yuxi.knowledge.device_selection import SELECTED_DEVICE_UNAVAILABLE_MESSAGE, SelectedDeviceId
 from yuxi.knowledge.fault_trace.graph import FaultGraphEvidence
 from yuxi.agents.toolkits.tugraph import TuGraphConfig, TuGraphError
 from yuxi.knowledge.fault_trace.images import DeviceImage
@@ -473,6 +474,23 @@ async def test_trace_fault_reasoning_keeps_only_yolo_phenomenon(monkeypatch):
     reasoning_markdown = result["answer_markdown"].split("**② 推理过程**")[1].split("**③ 原因定位**")[0]
     assert "燃烧起火" in reasoning_markdown
     assert "冒烟异常" not in reasoning_markdown
+
+
+def test_match_phenomena_yolo_requires_exact_single_name():
+    """YOLO 名称必须与一个图谱现象完全一致，不能靠部分字符串命中多个节点。"""
+
+    phenomena = [
+        {"id": "PH-SMOKE", "name": "冒烟异常"},
+        {"id": "PH-SMOKE-ALARM", "name": "冒烟报警"},
+        {"id": "PH-FIRE", "name": "燃烧起火"},
+    ]
+    query = FaultTraceQuery(device_name="3B-7Y", voltage_level="10kV")
+
+    assert workflow_module._match_phenomena(phenomena, query, {"fault_name": "冒烟"}) == []
+    assert [
+        node["name"]
+        for node in workflow_module._match_phenomena(phenomena, query, {"fault_name": "冒烟异常"})
+    ] == ["冒烟异常"]
 
 
 @pytest.mark.asyncio
@@ -1118,14 +1136,7 @@ async def test_trace_fault_confirms_after_device_validation(monkeypatch):
     )
 
     parse_states = [event["thinking"]["state"] for event in events if event["thinking"]["step_id"] == "parse_fault"]
-    assert parse_states == ["started", "waiting", "completed"]
-    waiting = next(
-        event["thinking"]["data"]
-        for event in events
-        if event["thinking"]["step_id"] == "parse_fault" and event["thinking"]["state"] == "waiting"
-    )
-    assert waiting["reason"] == "device_confirmation"
-    assert waiting["candidates"][0]["device_id"] == "LGR#3b7y"
+    assert parse_states == ["started", "completed"]
     assert [step["step_id"] for step in result["thinking_steps"]] == [
         "parse_fault",
         "match_causal_chain",
@@ -1149,7 +1160,12 @@ async def test_trace_fault_ignores_image_json_in_user_text(monkeypatch):
         )
 
     async def fake_detect(**_kwargs):
-        return YoloDetectResult(fault=True, fault_type="foreign_object", fault_name="异物搭挂")
+        return YoloDetectResult(
+            fault=True,
+            fault_type="foreign_object",
+            fault_name="异物搭挂",
+            image_url="![故障识别图](/api/data/image?objectName=fault-charts%2Fforeign-object.png)",
+        )
 
     monkeypatch.setattr(workflow_module, "resolve_device_image", fake_image)
     monkeypatch.setattr(workflow_module, "detect_fault_image", fake_detect)
@@ -1182,7 +1198,12 @@ async def test_trace_fault_loads_device_image_and_detects(monkeypatch):
         )
 
     async def fake_detect(**_kwargs):
-        return YoloDetectResult(fault=True, fault_type="foreign_object", fault_name="异物搭挂")
+        return YoloDetectResult(
+            fault=True,
+            fault_type="foreign_object",
+            fault_name="异物搭挂",
+            image_url="![故障识别图](/api/data/image?objectName=fault-charts%2Fforeign-object.png)",
+        )
 
     monkeypatch.setattr(workflow_module, "extract_fault_trace_intent", fake_extract)
     monkeypatch.setattr(workflow_module, "resolve_device_image", fake_image)
@@ -1196,6 +1217,13 @@ async def test_trace_fault_loads_device_image_and_detects(monkeypatch):
     assert image["object_key"] == "device-images/3B-7Y.jpg"
     assert image["yolo"]["fault_name"] == "异物搭挂"
     assert result["thinking_steps"][0]["data"]["phenomena"] == []
+    assert result["report"]["summary"]["image_url"] == (
+        "![故障识别图](/api/data/image?objectName=fault-charts%2Fforeign-object.png)"
+    )
+    summary_lines = result["answer_markdown"].split("**② 推理过程**")[0].splitlines()
+    device_line = next(index for index, line in enumerate(summary_lines) if line.startswith("- 涉及设备："))
+    assert summary_lines[device_line + 1] == ""
+    assert summary_lines[device_line + 2] == result["report"]["summary"]["image_url"]
 
 
 @pytest.mark.asyncio
@@ -1371,6 +1399,81 @@ async def test_trace_fault_device_confirmation_value_is_candidate_id(monkeypatch
     assert asked[0]["questions"][0]["options"][0]["value"] == "LGR#3b7y"
 
 
+@pytest.mark.asyncio
+async def test_prepare_device_reloads_selected_id_when_candidate_set_changes(monkeypatch):
+    """重放后召回集变化时，卡片选中的图节点 ID 直接回查，不再触发二次识别。"""
+
+    _patch_success(monkeypatch)
+    selected = {
+        **DEVICE,
+        "id": "LGR#selected",
+        "name": "3B-7Z",
+        "properties": {**DEVICE["properties"], "名称": "3B-7Z", "台账ID列表": "selected-ledger"},
+    }
+    payloads: list[dict] = []
+
+    def confirming(payload):
+        payloads.append(payload)
+        return {payload["questions"][0]["question_id"]: selected["id"]}
+
+    monkeypatch.setattr(workflow_module, "interrupt", confirming)
+    monkeypatch.setattr(workflow_module, "find_devices", lambda *args, **kwargs: [DEVICE])
+    monkeypatch.setattr(workflow_module, "find_device_by_id", lambda *args, **kwargs: selected)
+
+    prepared = await workflow_module._prepare_device(
+        object(),
+        query_text="3B-7Z 通道内树木倒伏压覆导线",
+        image_payload=None,
+        context=SimpleNamespace(model=None, skills=["fault-trace"]),
+        emitter=SimpleNamespace(emit=lambda *args, **kwargs: None),
+    )
+
+    assert prepared.device["id"] == selected["id"]
+    assert len(payloads) == 1
+
+
+@pytest.mark.asyncio
+async def test_prepare_device_stale_id_missing_from_graph_fails_without_reprompt(monkeypatch):
+    _patch_success(monkeypatch)
+    payloads: list[dict] = []
+
+    def confirming(payload):
+        payloads.append(payload)
+        return {payload["questions"][0]["question_id"]: "LGR#missing"}
+
+    monkeypatch.setattr(workflow_module, "interrupt", confirming)
+    monkeypatch.setattr(workflow_module, "find_devices", lambda *args, **kwargs: [DEVICE])
+    monkeypatch.setattr(workflow_module, "find_device_by_id", lambda *args, **kwargs: None)
+
+    result = await workflow_module._prepare_device(
+        object(),
+        query_text="3B-7Y 通道内树木倒伏压覆导线",
+        image_payload=None,
+        context=SimpleNamespace(model=None, skills=["fault-trace"]),
+        emitter=SimpleNamespace(emit=lambda *args, **kwargs: None),
+    )
+
+    assert result == SELECTED_DEVICE_UNAVAILABLE_MESSAGE
+    assert len(payloads) == 1
+
+
+def test_confirm_device_marks_stale_candidate_id_as_selection(monkeypatch):
+    monkeypatch.setattr(
+        workflow_module,
+        "interrupt",
+        lambda _payload: {"fault_trace_device_select": "LGR#stale-selected"},
+    )
+
+    picked = workflow_module._confirm_device(
+        [DEVICE],
+        FaultTraceQuery(device_name="3B-7Y", phenomena=["树木倒伏枝干压覆导线"]),
+        recommended_id=None,
+        selection=None,
+    )
+
+    assert picked == SelectedDeviceId("LGR#stale-selected")
+
+
 class _ReplayState(TypedDict, total=False):
     query: str
     result: dict[str, Any]
@@ -1445,3 +1548,65 @@ async def test_trace_fault_reexecutes_user_replacement_through_real_graph_replay
     assert "3B-7Z" not in final["result"]["answer_markdown"]
     assert "3B-7Z" not in final["result"]["thinking_steps"][0]["data"]["summary"]
     assert "3B-7Z" not in final["result"]["report"]["location"]["reasoning"]
+
+
+@pytest.mark.asyncio
+async def test_trace_fault_real_replay_uses_selected_graph_id_when_recall_changes(monkeypatch):
+    """真实工具重放时召回集可变化，但首张卡选中的 ID 必须直接恢复为该设备。"""
+
+    _patch_success(monkeypatch)
+    monkeypatch.setattr(workflow_module, "interrupt", interrupt)
+    other = {
+        **DEVICE,
+        "id": "LGR#other",
+        "name": "3B-7Z",
+        "properties": {**DEVICE["properties"], "名称": "3B-7Z", "台账ID列表": "other"},
+    }
+    find_calls = 0
+    direct_lookups: list[str] = []
+
+    async def fake_extract(*_args, **_kwargs):
+        return FaultTraceQuery(
+            device_name="3B-7Y",
+            voltage_level="10kV",
+            phenomena=["树木倒伏枝干压覆导线"],
+        )
+
+    def changing_find(_client, _names, **_kwargs):
+        nonlocal find_calls
+        find_calls += 1
+        return [other, DEVICE] if find_calls == 1 else [other]
+
+    def direct_lookup(_client, device_id, **_kwargs):
+        direct_lookups.append(device_id)
+        return DEVICE if device_id == DEVICE["id"] else None
+
+    monkeypatch.setattr(workflow_module, "extract_fault_trace_intent", fake_extract)
+    monkeypatch.setattr(workflow_module, "find_devices", changing_find)
+    monkeypatch.setattr(workflow_module, "find_device_by_id", direct_lookup)
+
+    async def run_tool(state: _ReplayState):
+        runtime = SimpleNamespace(
+            context=SimpleNamespace(model=None, skills=["fault-trace"]),
+            tool_call_id="stable-selection-replay",
+            state={},
+        )
+        return {"result": await FAULT_FN(query_text=state["query"], runtime=runtime)}
+
+    builder = StateGraph(_ReplayState)
+    builder.add_node("trace", run_tool)
+    builder.add_edge(START, "trace")
+    builder.add_edge("trace", END)
+    graph = builder.compile(checkpointer=InMemorySaver())
+    config = {"configurable": {"thread_id": "fault-stable-selection-replay"}}
+
+    first = await graph.ainvoke({"query": "3B-7Y 树木倒伏枝干压覆导线"}, config=config)
+    question = first["__interrupt__"][0].value["questions"][0]
+    final = await graph.ainvoke(
+        Command(resume={question["question_id"]: DEVICE["id"]}),
+        config=config,
+    )
+
+    assert "__interrupt__" not in final
+    assert direct_lookups == [DEVICE["id"]]
+    assert final["result"]["thinking_steps"][0]["data"]["device"]["graph_id"] == DEVICE["id"]

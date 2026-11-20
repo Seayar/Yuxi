@@ -24,6 +24,8 @@ from yuxi.agents.thinking import ThinkingEmitter
 from yuxi.knowledge.device_index import graph_key as device_graph_key
 from yuxi.knowledge.device_selection import (
     DeviceOption,
+    SELECTED_DEVICE_UNAVAILABLE_MESSAGE,
+    SelectedDeviceId,
     build_device_choice_payload,
     parse_device_choice,
     promote_option,
@@ -66,6 +68,7 @@ from yuxi.agents.toolkits.tugraph import (
 from yuxi.knowledge.fault_trace.graph_kg3 import (
     collect_kg3_evidence,
     device_ancestors,
+    find_device_by_id,
     find_devices,
     resolve_device_type,
 )
@@ -452,6 +455,7 @@ async def _generate_report(state: FaultTraceState) -> dict[str, Any]:
         location_phenomena=state.supporting if state.matched_phenomena else None,
         phenomenon_name=summary_phenomenon,
         located_override=state.located_all if state.matched_phenomena else None,
+        image_url=str((state.image_payload or {}).get("image_url") or "").strip() or None,
     )
     state.emitter.emit(
         "generate_report",
@@ -528,9 +532,8 @@ def _confirm_device(
     query: FaultTraceQuery,
     *,
     recommended_id: str | None,
-    emitter: ThinkingEmitter,
     selection: dict[str, Any] | None,
-) -> dict[str, Any] | str | None | _ChoiceCancelled:
+) -> dict[str, Any] | SelectedDeviceId | str | None | _ChoiceCancelled:
     """始终让用户确认设备；零候选时保留自由输入入口。"""
 
     options = promote_option(_device_options(devices), recommended_id)
@@ -559,26 +562,6 @@ def _confirm_device(
         "voltage_level": query.voltage_level,
         "phenomena": list(query.phenomena),
     }
-    emitter.emit(
-        "parse_fault",
-        "waiting",
-        content="等待用户确认目标设备。",
-        data={
-            "reason": "device_confirmation",
-            "candidate_count": len(options),
-            "candidates": [
-                {
-                    "device_id": option.device_id,
-                    "name": option.name,
-                    "device_type": option.device_type,
-                    "voltage_level": option.voltage_level,
-                    "path": option.path,
-                }
-                for option in options
-            ],
-            "device_selection": selection,
-        },
-    )
     choice = parse_device_choice(interrupt(payload), FAULT_QUESTION_ID_CANDIDATE)
     if choice.cancelled:
         return CHOICE_CANCELLED
@@ -586,6 +569,7 @@ def _confirm_device(
         device = next((item for item in devices if str(item.get("id") or "") == choice.selected_id), None)
         if device is not None:
             return device
+        return SelectedDeviceId(choice.selected_id)
     if choice.free_text:
         return choice.free_text
     return choice.selected_id
@@ -765,11 +749,18 @@ def _match_phenomena(
 
     image_name = str((image_payload or {}).get("fault_name") or "").strip()
     if image_name:
-        by_image = _phenomena_containing(phenomena, [image_name])
-        if by_image:
-            return by_image
+        by_image = _phenomenon_named(phenomena, image_name)
+        if by_image is not None:
+            return [by_image]
     text_phenomena = [item.strip() for item in query.phenomena if item.strip()]
     return _phenomena_containing(phenomena, text_phenomena)
+
+
+def _phenomenon_named(phenomena: list[dict[str, Any]], name: str) -> dict[str, Any] | None:
+    """按名称精确返回单个图谱现象；YOLO 结果不与多个现象建立对应。"""
+
+    expected = str(name or "").strip()
+    return next((node for node in phenomena if str(node.get("name") or "").strip() == expected), None)
 
 
 def _phenomena_containing(phenomena: list[dict[str, Any]], texts: list[str]) -> list[dict[str, Any]]:
@@ -1004,12 +995,36 @@ async def _prepare_device(
             devices,
             query,
             recommended_id=recommended_id,
-            emitter=emitter,
             selection=selection,
         )
         if picked_device is CHOICE_CANCELLED:
             return INTENT_CANCELLED_MESSAGE
-        if isinstance(picked_device, dict):
+        if isinstance(picked_device, SelectedDeviceId):
+            try:
+                device = await asyncio.to_thread(
+                    find_device_by_id,
+                    client,
+                    picked_device.device_id,
+                    ledger_candidates=ledger_candidates,
+                )
+            except TuGraphError as exc:
+                logger.warning(f"故障溯源按选中设备 ID 回查失败: {exc}")
+                emitter.emit(
+                    "parse_fault",
+                    "failed",
+                    content=FAULT_GRAPH_UNAVAILABLE_MESSAGE,
+                    error={"code": "graph_unavailable", "message": FAULT_GRAPH_UNAVAILABLE_MESSAGE},
+                )
+                return FAULT_GRAPH_UNAVAILABLE_MESSAGE
+            if device is None:
+                emitter.emit(
+                    "parse_fault",
+                    "failed",
+                    content=SELECTED_DEVICE_UNAVAILABLE_MESSAGE,
+                    error={"code": "selected_device_unavailable", "message": SELECTED_DEVICE_UNAVAILABLE_MESSAGE},
+                )
+                return SELECTED_DEVICE_UNAVAILABLE_MESSAGE
+        elif isinstance(picked_device, dict):
             device = picked_device
         elif picked_device:
             logger.info(f"故障溯源用户改填设备，清除上一轮设备身份: {picked_device!r}")
@@ -1083,7 +1098,12 @@ async def _detect_uploaded_image(runtime: ToolRuntime | None) -> tuple[dict[str,
         logger.warning(f"上传图片识别失败: {exc}")
         return None, "yolo_unavailable", True
     return (
-        {"fault": result.fault, "fault_type": result.fault_type, "fault_name": result.fault_name},
+        {
+            "fault": result.fault,
+            "fault_type": result.fault_type,
+            "fault_name": result.fault_name,
+            "image_url": result.image_url,
+        },
         None,
         True,
     )
@@ -1115,7 +1135,12 @@ async def _resolve_ledger_image(
         logger.warning(f"设备图片识别失败: {exc}")
         return None, image.object_key, "yolo_unavailable"
     return (
-        {"fault": result.fault, "fault_type": result.fault_type, "fault_name": result.fault_name},
+        {
+            "fault": result.fault,
+            "fault_type": result.fault_type,
+            "fault_name": result.fault_name,
+            "image_url": result.image_url,
+        },
         image.object_key,
         None,
     )

@@ -183,6 +183,34 @@ def search_devices(
     return typed[:limit]
 
 
+def find_device_by_id(
+    client: TuGraphClient,
+    device_id: str,
+    *,
+    query: PlanQuery,
+    ledger_candidates: Sequence[LedgerDevice] = (),
+) -> DeviceCandidate | None:
+    """按用户选中的图节点 ID 回读并补全设备，避免恢复时重算候选集。"""
+
+    clean_id = str(device_id or "").strip()
+    if not clean_id:
+        return None
+    records = _query_devices_by_ids(client, ids=[clean_id])
+    if not records:
+        return None
+    props = records[0].get("n") or records[0].get("a") or {}
+    candidate = _build_candidate(props, query=query, keywords=_device_keywords(query))
+    candidate = _enrich_with_ledger(candidate, list(ledger_candidates))
+    device_type = (
+        _query_device_types(client, device_ids=[candidate.device_id]).get(candidate.device_id)
+        or DEVICE_TYPE_FALLBACKS.get(candidate.ledger_class or "")
+        or normalize_device_type(candidate.device_type)
+    )
+    if not device_type:
+        return None
+    return replace(candidate, device_type=device_type, score=max(candidate.score, NAME_EXACT_SCORE))
+
+
 def _recall_devices_by_fallback(
     client: TuGraphClient,
     query: PlanQuery,
